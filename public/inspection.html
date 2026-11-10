@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>巡堂记录 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 巡堂记录：列表页（沿用统一页面卡片模板 / 统一导航栏） */
+    .insp-filters { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .insp-filters label { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-light); }
+    .insp-filters select, .insp-filters input[type="date"], .insp-filters input[type="text"] {
+      font-size: 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+      background: #fff; font-family: inherit; color: var(--text);
+    }
+    .insp-filters input[type="text"] { min-width: 200px; }
+    .insp-summary { display: flex; gap: 12px; flex-wrap: wrap; margin-left: auto; font-size: 13px; color: var(--text-light); }
+    .insp-summary b { font-size: 15px; }
+
+    .insp-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .insp-table th {
+      background: var(--bg); color: var(--text-light); font-weight: 600; font-size: 13px;
+      text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    .insp-table td { padding: 12px 14px; border-bottom: 1px solid #F0F2F5; vertical-align: middle; }
+    .insp-table tbody tr:hover { background: #FAFCFE; }
+    .insp-table tbody tr:last-child td { border-bottom: none; }
+    .insp-date { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .insp-desc { max-width: 460px; }
+    .insp-desc .dt { color: var(--text-light); font-size: 12px; margin-top: 3px; }
+
+    /* 状态标签：待处理=红 / 处理中=橙 / 已解决=绿 */
+    .st { display: inline-block; padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .st.pending { background: #FFF1F0; color: #CF1322; border: 1px solid #FFCCC7; }
+    .st.processing { background: #FFF7E6; color: #AD6800; border: 1px solid #FFE58F; }
+    .st.resolved { background: #F6FFED; color: #237804; border: 1px solid #B7EB8F; }
+    .prio { font-size: 12px; color: var(--text-light); }
+    .prio.urgent { color: #CF1322; font-weight: 700; }
+
+    .insp-thumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .insp-thumb {
+      width: 44px; height: 44px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border);
+      cursor: zoom-in; background: #f5f7fa;
+    }
+    .insp-thumb-more { font-size: 12px; color: var(--text-light); }
+    .insp-nophoto { color: var(--text-light); font-size: 13px; }
+
+    .btn-text { background: none; border: none; font-size: 13px; cursor: pointer; padding: 4px 8px; border-radius: 6px; color: var(--primary); font-weight: 600; }
+    .btn-text:hover { background: var(--primary-light); }
+    /* 删除按钮（仅管理员）：红色文字 + 悬停浅红底 */
+    .btn-text.del { color: var(--danger); }
+    .btn-text.del:hover { background: #FFF1F0; }
+
+    .insp-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+    .insp-pager .range { font-size: 13px; color: var(--text-light); }
+    .insp-pager .pages { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+    .empty-tip { padding: 30px; text-align: center; color: var(--text-light); font-size: 14px; }
+
+    /* 照片放大（灯箱） */
+    .insp-lightbox { position: fixed; inset: 0; background: rgba(17, 24, 39, .82); z-index: 80; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .insp-lightbox img { max-width: 92vw; max-height: 86vh; border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,.5); background: #fff; }
+    .insp-lightbox .lb-close { position: absolute; top: 18px; right: 24px; color: #fff; font-size: 22px; cursor: pointer; background: rgba(255,255,255,.14); border: none; width: 42px; height: 42px; border-radius: 50%; }
+    .insp-lightbox .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); color: #fff; font-size: 28px; cursor: pointer; background: rgba(255,255,255,.14); border: none; width: 48px; height: 48px; border-radius: 50%; }
+    .insp-lightbox .lb-prev { left: 20px; }
+    .insp-lightbox .lb-next { right: 20px; }
+    .insp-lightbox .lb-caption { position: absolute; bottom: 20px; left: 0; right: 0; text-align: center; color: #e5e7eb; font-size: 13px; }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头：返回(左) · 标题居中 · 功能按钮(右) -->
+      <div class="page-head">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+        <h2 class="page-title">📋 巡堂记录</h2>
+        <div class="action-bar">
+          <button id="btnNewIssue" class="btn btn-primary">＋ 记录问题</button>
+        </div>
+      </div>
+
+      <!-- 筛选栏 -->
+      <div class="insp-filters filter-bar">
+        <label>状态
+          <select id="fStatus"><option value="">全部</option></select>
+        </label>
+        <label>年级
+          <select id="fGrade"><option value="">全部年级</option></select>
+        </label>
+        <label>班级
+          <select id="fClass" disabled><option value="">请先选择年级</option></select>
+        </label>
+        <label>日期 <input type="date" id="fDate"></label>
+        <label>搜索 <input type="text" id="fKeyword" placeholder="问题描述 / 班级 / 记录人"></label>
+        <button id="btnSearch" class="btn btn-secondary">查询</button>
+        <button id="btnReset" class="btn btn-secondary">重置</button>
+        <span class="insp-summary" id="inspSummary"></span>
+      </div>
+
+      <!-- 列表 -->
+      <div class="plan-table-wrap">
+        <table class="insp-table">
+          <thead>
+            <tr>
+              <th style="width:110px">日期</th>
+              <th style="width:120px">班级</th>
+              <th>问题描述</th>
+              <th style="width:170px">照片</th>
+              <th style="width:110px">状态</th>
+              <th style="width:140px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="issueBody"></tbody>
+        </table>
+      </div>
+      <div id="issueEmpty" class="empty-tip hidden">暂无巡堂记录</div>
+      <div id="issueError" class="empty-tip hidden"></div>
+
+      <!-- 分页 -->
+      <div class="insp-pager">
+        <span class="range" id="rangeInfo">显示 0-0 条，共 0 条</span>
+        <span class="pages">
+          <button id="btnPrev" class="btn btn-secondary btn-sm">上一页</button>
+          <span id="pageInfo">第 1 / 1 页</span>
+          <button id="btnNext" class="btn btn-secondary btn-sm">下一页</button>
+        </span>
+      </div>
+    </section>
+  </div>
+
+  <!-- 照片灯箱 -->
+  <div id="lightbox" class="insp-lightbox hidden">
+    <button class="lb-close" id="lbClose">✕</button>
+    <button class="lb-nav lb-prev" id="lbPrev">‹</button>
+    <img id="lbImg" alt="照片">
+    <button class="lb-nav lb-next" id="lbNext">›</button>
+    <div class="lb-caption" id="lbCaption"></div>
+  </div>
+
+  <!-- 删除确认弹窗（仅管理员可见入口；删除不可恢复，需二次确认） -->
+  <div id="delModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3>删除巡堂记录</h3>
+      <p class="confirm-message" id="delMessage">确定要删除这条巡堂记录吗？删除后不可恢复。</p>
+      <div class="modal-actions">
+        <button id="delCancel" class="btn btn-secondary">取消</button>
+        <button id="delOk" class="btn btn-danger">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/inspection-common.js?v=3.12.0"></script>
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/inspection.js?v=3.14.0"></script>
+</body>
+</html>

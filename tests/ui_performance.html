@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：班长端点名带学科 + 点赞 + 课堂表现页（学科老师/班主任/管理员；班长不可查看）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_performance.html public/_ui_performance.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiPf --virtual-time-budget=180000 --dump-dom `
+         "http://localhost:3000/_ui_performance.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_performance.html
+  夹具：临时年级 + 1 班（3 学生）+ 班长/物理任课老师/语文班主任/学生账号；结束自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1220px; height: 760px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>随机点名（学科）+ 点赞 + 课堂表现（角色范围）</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const pathOf = () => { try { return fr.contentWindow.location.pathname; } catch (_) { return '?'; } };
+function setVal(sel, val) {
+  const d = F(); const e = d && d.querySelector(sel); if (!e) return false;
+  e.value = val;
+  e.dispatchEvent(new fr.contentWindow.Event('change', { bubbles: true }));
+  return true;
+}
+async function loadPage(url) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q('h1'), 20000);
+  await sleep(700);
+}
+async function clickStart() {
+  const ok = await until(() => Q('#rcStart') && Q('#rcStart').disabled === false && !Q('#rcName').classList.contains('rolling'), 25000);
+  if (!ok) throw new Error('开始点名按钮长时间不可用');
+  Q('#rcStart').click();
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '表现UI年级' + stamp, CLASS = '表现UI班' + stamp;
+const MON = 'pfui_mon_' + stamp, SUBJ = 'pfui_subj_' + stamp, HEAD = 'pfui_head_' + stamp, STU = 'pfui_stu_' + stamp;
+const created = { gradeId: null, classId: null, userIds: [], studentIds: [] };
+const NAMES = ['表现同学甲', '表现同学乙', '表现同学丙'];
+
+async function loginAs(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'PFU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    let r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '表现UI班长', classId: created.classId } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: SUBJ, password: '123456', role: 'teacher', realName: '物理UI老师', subject: '物理', profileLocked: true, teachingClasses: [{ classId: created.classId, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: HEAD, password: '123456', role: 'teacher', realName: '语文UI班主任', subject: '语文', profileLocked: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: STU, password: '123456', role: 'student', realName: '表现UI学生', classId: created.classId } });
+    created.userIds.push(r.data.user.id);
+    for (let i = 0; i < NAMES.length; i += 1) {
+      await japi('/api/students', { method: 'POST', body: { studentNo: 'PFU' + stamp + '0' + (i + 1), name: NAMES[i], classId: created.classId, status: '在读' } });
+    }
+    const list = (await japi('/api/students?classId=' + created.classId + '&status=' + encodeURIComponent('在读'))).data.students || [];
+    list.forEach((s) => created.studentIds.push(s.id));
+    check('0) 夹具就绪（1 班 3 学生 + 班长/物理老师/语文班主任/学生）', list.length === 3 && created.userIds.length === 4, list.length);
+
+    // ---------- A) 班长端：点名带学科 + 点赞 ----------
+    await loginAs(MON);
+    await loadPage('/random-call?rollFast=1');
+    check('A) 点名页打开', pathOf() === '/random-call');
+    await until(() => Qa('#rcSubject option').length > 0 && Q('#rcClass').value !== '', 12000);
+    check('A) 出现「学科」下拉（≥10 个学科）', Qa('#rcSubject option').length >= 10, Qa('#rcSubject option').length);
+    check('A) 学科默认值 = 本班班主任所教学科（语文）', Q('#rcSubject').value === '语文', Q('#rcSubject').value);
+    check('A) 学科下拉可手动切换', setVal('#rcSubject', '物理') && Q('#rcSubject').value === '物理');
+    check('A) 点名前不显示点赞按钮', hidden('#rcLike'));
+    await clickStart();
+    const got = await until(() => Q('#rcName').classList.contains('done') && NAMES.includes(txt('#rcName')), 25000);
+    check('A) 点名成功并显示学生', got, txt('#rcName'));
+    check('A) 点名后显示「👍 点赞」按钮与计数区', !hidden('#rcLike') && !hidden('#rcLikeInfo'), { like: hidden('#rcLike'), info: txt('#rcLikeInfo') });
+    check('A) 点赞计数初始为 0 赞', /累计 0 赞/.test(txt('#rcLikeInfo')), txt('#rcLikeInfo'));
+    const pickedName = txt('#rcName');
+    Q('#rcLike').click();
+    const liked = await until(() => /累计 1 赞/.test(txt('#rcLikeInfo')), 12000);
+    check('A) 点「点赞」→ 该生本学科累计 1 赞', liked, txt('#rcLikeInfo'));
+    Q('#rcLike').click();
+    check('A) 再点一次 → 累计 2 赞', await until(() => /累计 2 赞/.test(txt('#rcLikeInfo')), 12000), txt('#rcLikeInfo'));
+    const recRows = () => Qa('#rcRecBody tr').map((tr) => tr.textContent.replace(/\s+/g, ' ').trim());
+    check('A) 记录表新增 1 条且含学科「物理」与操作人',
+      recRows().length >= 1 && recRows()[0].includes('物理') && recRows()[0].includes(pickedName) && recRows()[0].includes('表现UI班长'),
+      recRows().slice(0, 2));
+    check('A) 记录表头含「学科」列',
+      Qa('table.rc-table thead th').map((th) => th.textContent.trim()).includes('学科'),
+      Qa('table.rc-table thead th').map((th) => th.textContent.trim()));
+    // 学科筛选：切到语文 → 无记录（本次只点了物理）
+    setVal('#rcRecSubject', '语文');
+    await sleep(800);
+    check('A) 记录学科筛选（语文）→ 无记录', /暂无点名记录/.test(txt('#rcRecBody')), txt('#rcRecBody').slice(0, 60));
+    setVal('#rcRecSubject', '物理');
+    await sleep(800);
+    check('A) 记录学科筛选（物理）→ 有记录', !/暂无点名记录/.test(txt('#rcRecBody')), txt('#rcRecBody').slice(0, 60));
+
+    // ---------- A2) 点赞按钮对 任课老师 / 班主任 / 管理员 同样可见可用 ----------
+    // （修复前：canLike 仅班长 → 教师/管理员看不到按钮、接口 403）
+    const likeCheck = async (user, label, subjectWant) => {
+      await loginAs(user);
+      await loadPage('/random-call?rollFast=1');
+      await until(() => Qa('#rcSubject option').length > 0 && Q('#rcClass').value !== '', 15000);
+      // 管理员能看到全部班级 → 显式切到夹具班级（避免点到真实班级的学生）
+      setVal('#rcClass', String(created.classId));
+      await sleep(600);
+      const cfg = await japi('/api/rollcall/classes');
+      check(`A2) [${label}] 接口 canLike = true`, cfg.data && cfg.data.canLike === true, cfg.data && cfg.data.canLike);
+      check(`A2) [${label}] 点名前不显示点赞按钮`, hidden('#rcLike'));
+      if (subjectWant) setVal('#rcSubject', subjectWant);
+      await clickStart();
+      const got = await until(() => Q('#rcName').classList.contains('done') && NAMES.includes(txt('#rcName')), 25000);
+      check(`A2) [${label}] 点名成功`, got, txt('#rcName'));
+      check(`A2) [${label}] 点名后出现「👍 点赞」按钮与计数区`,
+        !hidden('#rcLike') && !hidden('#rcLikeInfo'), { like: hidden('#rcLike'), info: txt('#rcLikeInfo') });
+      const before = Number((txt('#rcLikeInfo').match(/累计 (\d+) 赞/) || [])[1] || 0);
+      Q('#rcLike').click();
+      const ok = await until(() => Number((txt('#rcLikeInfo').match(/累计 (\d+) 赞/) || [])[1] || 0) === before + 1, 12000);
+      check(`A2) [${label}] 点「点赞」→ 累计 ${before} → ${before + 1} 赞`, ok, txt('#rcLikeInfo'));
+    };
+    await likeCheck(SUBJ, '任课老师', '物理');
+    await likeCheck(HEAD, '班主任', '语文');
+    await likeCheck('admin', '管理员', '物理');
+    // 学生：无点名页访问权，点赞接口也拒绝（接口层面校验）
+    await loginAs(STU);
+    const stuCfg = await japi('/api/rollcall/classes');
+    check('A2) [学生] /api/rollcall/classes → 403（无点名页权限）', stuCfg.status === 403, stuCfg.status);
+    const stuLike = await japi('/api/rollcall/likes', { method: 'POST', body: { studentId: created.studentIds[0], subject: '物理' } });
+    check('A2) [学生] 直接调点赞接口 → 403（学生不可点赞）', stuLike.status === 403, stuLike.status);
+    const stuPage = await fetch('/random-call', { credentials: 'same-origin', redirect: 'follow' });
+    check('A2) [学生] 访问点名页 → 被挡回签到台', new URL(stuPage.url).pathname === '/dashboard', new URL(stuPage.url).pathname);
+
+    // ---------- B) 学科老师（物理）：课堂表现只看本学科 ----------
+    await loginAs(SUBJ);
+    await loadPage('/performance');
+    check('B) 学科老师可打开课堂表现页', pathOf() === '/performance');
+    await until(() => txt('#pfScope').length > 0 && !/加载/.test(txt('#pfRecBody')), 15000);
+    check('B) 范围标注 = 本学科', txt('#pfScope').indexOf('本学科') >= 0, txt('#pfScope'));
+    check('B) 学科下拉被锁定为物理', Q('#pfSubject').value === '物理' && Q('#pfSubject').disabled === true,
+      { v: Q('#pfSubject').value, d: Q('#pfSubject').disabled });
+    const recBodyB = txt('#pfRecBody');
+    const recBodyC0 = txt('#pfRecBody');
+    check('B) 点名记录只显示物理（本学科范围内，条数 ≥ 1 且不含语文）',
+      /共 \d+ 条/.test(txt('#pfRecCount')) && recBodyC0.includes('物理') && !recBodyC0.includes('语文'),
+      { count: txt('#pfRecCount'), body: recBodyC0.slice(0, 80) });
+    check('B) 点赞排名显示该生 2 赞', /表现同学/.test(txt('#pfLikeBody')) && /2/.test(txt('#pfLikeBody')), txt('#pfLikeBody').slice(0, 80));
+    check('B) 导出按钮可见', !hidden('#pfExportRec') && !hidden('#pfExportLike'));
+    const expB = await fetch('/api/performance/export?type=records', { credentials: 'same-origin' });
+    check('B) 学科老师导出接口返回 xlsx', expB.status === 200 && (expB.headers.get('content-type') || '').includes('spreadsheet'), expB.status);
+
+    // ---------- C) 班主任（语文）：本班全部学科 ----------
+    await loginAs(HEAD);
+    await loadPage('/performance');
+    await until(() => txt('#pfScope').length > 0, 12000);
+    check('C) 班主任范围标注 = 本班全部学科', txt('#pfScope').indexOf('本班全部学科') >= 0, txt('#pfScope'));
+    check('C) 班主任学科下拉可选（不锁定）', Q('#pfSubject').disabled === false);
+    await until(() => /物理/.test(txt('#pfRecBody')), 12000);
+    check('C) 班主任看到本班全部学科记录（含物理）', /物理/.test(txt('#pfRecBody')), txt('#pfRecBody').slice(0, 80));
+    setVal('#pfSubject', '语文');
+    await sleep(900);
+    check('C) 班主任按学科筛选（语文）→ 只显示语文记录（不含物理）',
+      !/没有点名记录/.test(txt('#pfRecBody')) && /语文/.test(txt('#pfRecBody')) && !/物理/.test(txt('#pfRecBody')),
+      txt('#pfRecBody').slice(0, 70));
+    setVal('#pfSubject', '数学');
+    await sleep(900);
+    check('C) 班主任按学科筛选（数学，无人点名）→ 无记录', /没有点名记录/.test(txt('#pfRecBody')), txt('#pfRecBody').slice(0, 60));
+    setVal('#pfSubject', '');
+    await sleep(900);
+    check('C) 切回全部学科 → 又有记录', !/没有点名记录/.test(txt('#pfRecBody')), txt('#pfRecBody').slice(0, 60));
+    check('C) 班主任导出按钮可见', !hidden('#pfExportRec'));
+    // 时间快筛
+    Q('#pfQuick').querySelector('button[data-period="week"]').click();
+    await sleep(900);
+    check('C) 本周筛选后仍有记录（今天点的）', !/没有点名记录/.test(txt('#pfRecBody')), txt('#pfRecBody').slice(0, 60));
+
+    // ---------- D) 班长：不看课堂表现（只有 签到操作/叫号提醒/随机点名） ----------
+    await loginAs(MON);
+    const monPerf = await fetch('/performance', { credentials: 'same-origin', redirect: 'follow' });
+    const monPerfHtml = monPerf.status === 200 ? await monPerf.text() : '';
+    check('D) 班长访问 /performance → 被重定向回签到操作台',
+      new URL(monPerf.url).pathname === '/dashboard' || monPerfHtml.includes('id="navbarMenus"'),
+      { url: monPerf.url, status: monPerf.status });
+    const expMon = await fetch('/api/performance/export?type=records', { credentials: 'same-origin', redirect: 'manual' });
+    check('D) 班长调用课堂表现导出接口 → 403', expMon.status === 403 || expMon.type === 'opaqueredirect', expMon.status);
+    const recMon = await fetch('/api/performance/records', { credentials: 'same-origin' });
+    check('D) 班长调用课堂表现接口 → 403', recMon.status === 403, recMon.status);
+    // 班长仍可用：随机点名页
+    await loadPage('/random-call');
+    check('D) 班长仍可打开随机点名页', pathOf() === '/random-call', pathOf());
+
+    // ---------- E) 学生不可访问 ----------
+    await loginAs(STU);
+    const stuRes = await fetch('/performance', { credentials: 'same-origin', redirect: 'manual' });
+    check('E) 学生访问 /performance 被重定向', stuRes.status === 302 || stuRes.type === 'opaqueredirect', stuRes.status);
+
+    // ---------- 清理 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    for (const id of created.studentIds) await japi('/api/students/' + id, { method: 'DELETE' });
+    for (const id of created.userIds) await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: id, classes: [] } });
+    for (const id of created.userIds) await japi('/api/users/' + id, { method: 'DELETE' });
+    const delClass = await japi('/api/classes/' + created.classId, { method: 'DELETE' });
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    check('清理：临时班级/账号已删除', delClass.status < 300, delClass.data);
+    const leftUsers = await japi('/api/users');
+    check('清理：临时账号已不存在', !(leftUsers.data.users || []).some((u) => [MON, SUBJ, HEAD, STU].includes(u.username)));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

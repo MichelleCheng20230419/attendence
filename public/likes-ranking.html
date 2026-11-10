@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>点赞排行榜 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 页头与统一卡片样式由 style.css 提供（.page-head / .back-link / .page-card） */
+    .lr-filters { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .lr-filters label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); }
+    .lr-filters select {
+      font-size: 14px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 10px; background: #fff; outline: none;
+    }
+    .lr-scope { margin-left: auto; font-size: 13px; color: var(--text-light); }
+    .lr-scope b { color: var(--primary); }
+    .lr-count { font-size: 13px; color: var(--text-light); }
+    /* 学期设置提示（「本学期」口径来自 系统管理 → 学年管理 → 学期设置） */
+    .lr-term-hint {
+      margin-top: 12px; border-radius: 8px; padding: 10px 14px; font-size: 13px; line-height: 1.7;
+      background: #EFF5FF; border: 1px solid #C9DCFF; color: #1B4E9B;
+    }
+    .lr-term-hint.warn { background: #FFF8E6; border-color: #FFE0A3; color: #A9700B; }
+    .lr-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .lr-table th {
+      background: var(--bg); color: var(--text-light); font-weight: 600; font-size: 13px;
+      text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    .lr-table td { padding: 12px 14px; border-bottom: 1px solid #F0F2F5; vertical-align: middle; }
+    .lr-table tbody tr:hover { background: #FAFCFE; }
+    .lr-table tbody tr:last-child td { border-bottom: none; }
+    .lr-rank { font-weight: 700; color: var(--text-light); }
+    .lr-rank.top { color: #B8860B; }
+    .lr-name { font-weight: 600; color: var(--text); }
+    .lr-likes { font-size: 16px; font-weight: 800; color: var(--primary); }
+    .lr-empty { padding: 40px 0; text-align: center; color: var(--text-light); font-size: 14px; }
+    .lr-readonly { font-size: 12px; color: var(--text-light); }
+    @media (max-width: 600px) {
+      .lr-table th, .lr-table td { padding: 10px 10px; font-size: 13px; }
+      .lr-scope { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头：返回(左) · 标题居中 -->
+      <div class="page-head">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+        <h2 class="page-title">👍 点赞排行榜</h2>
+        <div class="action-bar"></div>
+      </div>
+
+      <!-- 筛选：学科 / 时间 -->
+      <div class="lr-filters filter-bar">
+        <label>学科
+          <select id="lrSubject"><option value="">全部学科</option></select>
+        </label>
+        <label>时间
+          <select id="lrPeriod">
+            <option value="week">本周</option>
+            <option value="month" selected>本月</option>
+            <option value="term">本学期</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+        <span class="lr-scope">可查看范围：<b id="lrScope">—</b><span class="lr-readonly" id="lrReadonly"></span></span>
+      </div>
+
+      <!-- 学期设置提示：仅"本学期"时显示 -->
+      <div id="lrTermHint" class="lr-term-hint hidden"></div>
+
+      <!-- 排行榜 -->
+      <div class="plan-table-wrap" style="margin-top:14px">
+        <table class="lr-table">
+          <thead>
+            <tr>
+              <th style="width:90px">排名</th>
+              <th>学生姓名</th>
+              <th style="width:180px">学号</th>
+              <th style="width:140px">点赞次数</th>
+            </tr>
+          </thead>
+          <tbody id="lrBody"></tbody>
+        </table>
+        <div id="lrEmpty" class="lr-empty hidden">该条件下暂无点赞数据</div>
+      </div>
+
+      <div class="lr-count" id="lrCount" style="margin-top:12px">—</div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="likes-ranking.js?v=1.0.0"></script>
+</body>
+</html>

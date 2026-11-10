@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：班级管理页「归档 / 取消归档 / 两步删除（含彻底删除确认）」
+  验证点（P0 第 2 步 · 删除安全网的界面侧）：
+    ① 活跃班级行有「归档」按钮；归档需确认；确认后行显示「已归档」+「取消归档」
+    ② 归档后该班从签到班级列表消失（数据保留：学生/考勤不动），班级管理页仍可见
+    ③ 「取消归档」后恢复为活跃，重新出现在签到班级列表
+    ④ 班内还有在读学生时点「删除」→ 第一次确认 → 被后端拦截 → 弹出「彻底删除（不可恢复）」二次确认
+    ⑤ 二次确认后班级被彻底删除（含学生），列表里不再出现
+    ⑥ 清理：夹具班级/学生/年级全部清除
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_class_delete_flow -AdminPw <管理员密码>
+    （脚本会把驱动里的 admin 密码替换为实际值；用后自动清理 public/_*.html）
+  夹具：临时年级 + 2 班 + 2 学生（管理员会话）；测完自愈式清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1400px; height: 900px; }
+</style>
+</head>
+<body>
+<h3>班级管理：归档 / 取消归档 / 两步彻底删除</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+async function loadPage(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 20000);
+  await sleep(900);
+}
+const rowOf = (name) => Qa('#classList tr').find((tr) => tr.textContent.includes(name)) || null;
+const btnIn = (tr, act) => (tr ? tr.querySelector(`[data-act="${act}"]`) : null);
+const clickOk = () => { const b = Q('#confirmOk'); if (b) b.click(); return !!b; };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '删除流程年级' + stamp;
+const CLA = '删除流程甲班' + stamp, CLB = '删除流程乙班' + stamp;
+const created = { gradeId: null, classA: null, classB: null, students: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const list = (await japi('/api/classes?includeArchived=1')).data.classes || [];
+  for (const c of list.filter((x) => /^删除流程/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) {
+      await japi('/api/students/' + s.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^删除流程年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'DL', academicYear: year } })).data.id;
+    created.classA = (await japi('/api/classes', { method: 'POST', body: { className: CLA, gradeName: GRADE, academicYear: year } })).data.id;
+    created.classB = (await japi('/api/classes', { method: 'POST', body: { className: CLB, gradeName: GRADE, academicYear: year } })).data.id;
+    for (const [no, nm, cid] of [['DL' + stamp + '01', '删除流程生一', created.classA], ['DL' + stamp + '02', '删除流程生二', created.classB]]) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: no, name: nm, classId: cid } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    check('0) 夹具就绪（1 年级 + 2 班 + 2 学生）',
+      !!created.gradeId && !!created.classA && !!created.classB && created.students.filter(Boolean).length === 2, created);
+
+    // ---------- A) 页面与按钮 ----------
+    log('\n— A) 班级管理页：行内操作按钮 —');
+    await loadPage('/admin/class-management', '#classList');
+    await until(() => rowOf(CLA), 15000);
+    let rowA = rowOf(CLA);
+    check('A) 活跃班级行有「归档」与「删除」按钮',
+      !!btnIn(rowA, 'carchive') && !!btnIn(rowA, 'cdel') && !btnIn(rowA, 'cunarchive'),
+      rowA ? rowA.textContent.replace(/\s+/g, ' ').trim() : null);
+
+    // ---------- B) 归档 ----------
+    log('\n— B) 归档（软删除：数据保留） —');
+    btnIn(rowOf(CLA), 'carchive').click();
+    await until(() => !hidden('#confirmModal') && /归档班级/.test(txt('#confirmTitle')), 5000);
+    check('B) 点「归档」弹出确认框（标题=归档班级，说明数据保留）',
+      /归档班级/.test(txt('#confirmTitle')) && /保留/.test(txt('#confirmMessage')),
+      { title: txt('#confirmTitle'), msg: txt('#confirmMessage') });
+    clickOk();
+    await until(() => {
+      const r = rowOf(CLA);
+      return r && /已归档/.test(r.textContent) && btnIn(r, 'cunarchive');
+    }, 10000);
+    rowA = rowOf(CLA);
+    check('B) 确认后行显示「已归档」+「取消归档」按钮',
+      !!rowA && /已归档/.test(rowA.textContent) && !!btnIn(rowA, 'cunarchive') && !btnIn(rowA, 'carchive'),
+      rowA ? rowA.textContent.replace(/\s+/g, ' ').trim() : null);
+    const manageA = ((await japi('/api/classes/manage')).data.classes || []).find((c) => c.id === created.classA);
+    check('B) 后端状态 = archived 且学生仍在（数据保留）',
+      !!manageA && manageA.status === 'archived' && manageA.student_count === 1, manageA);
+    const signListA = ((await japi('/api/classes')).data.classes || []).some((c) => c.id === created.classA);
+    check('B) 归档后从签到班级列表消失（前端下拉不再出现）', signListA === false, signListA);
+
+    // ---------- C) 取消归档 ----------
+    log('\n— C) 取消归档 —');
+    btnIn(rowOf(CLA), 'cunarchive').click();
+    await until(() => !hidden('#confirmModal') && /取消归档/.test(txt('#confirmTitle')), 5000);
+    check('C) 点「取消归档」弹出确认框', /取消归档/.test(txt('#confirmTitle')), txt('#confirmTitle'));
+    clickOk();
+    await until(() => {
+      const r = rowOf(CLA);
+      return r && /活跃/.test(r.textContent) && btnIn(r, 'carchive');
+    }, 10000);
+    rowA = rowOf(CLA);
+    check('C) 恢复后行显示「活跃」+「归档」按钮',
+      !!rowA && /活跃/.test(rowA.textContent) && !!btnIn(rowA, 'carchive'), rowA ? rowA.textContent.replace(/\s+/g, ' ').trim() : null);
+    check('C) 恢复后重新出现在签到班级列表',
+      ((await japi('/api/classes')).data.classes || []).some((c) => c.id === created.classA));
+
+    // ---------- D) 两步删除 ----------
+    log('\n— D) 删除：先拦截，再二次确认彻底删除 —');
+    btnIn(rowOf(CLA), 'cdel').click();
+    await until(() => !hidden('#confirmModal') && /删除班级/.test(txt('#confirmTitle')), 5000);
+    check('D) 点「删除」第一次确认框提示不可恢复、建议归档',
+      /删除班级/.test(txt('#confirmTitle')) && /归档/.test(txt('#confirmMessage')),
+      { title: txt('#confirmTitle'), msg: txt('#confirmMessage') });
+    clickOk();
+    // 后端拦截（有在读学生）→ 前端自动弹出第二次确认
+    const gotSecond = await until(() => !hidden('#confirmModal') && /彻底删除/.test(txt('#confirmTitle')), 10000);
+    check('D) 班内有在读学生 → 被后端拦截并弹出「彻底删除」二次确认',
+      gotSecond, { title: txt('#confirmTitle'), msg: txt('#confirmMessage') });
+    if (gotSecond) {
+      check('D) 二次确认文案包含在读学生数与「归档」建议',
+        /在读学生/.test(txt('#confirmMessage')) && /归档/.test(txt('#confirmMessage')),
+        txt('#confirmMessage'));
+      check('D) 二次确认前班级仍在（拦截有效，数据未丢）',
+        ((await japi('/api/classes/manage')).data.classes || []).some((c) => c.id === created.classA));
+      clickOk();
+      const gone = await until(() => !rowOf(CLA), 10000);
+      check('D) 二次确认后班级从列表消失', gone, !!rowOf(CLA));
+      const manageAfter = ((await japi('/api/classes/manage')).data.classes || []).some((c) => c.id === created.classA);
+      check('D) 后端班级已删除，且其学生一并清理（彻底删除）',
+        manageAfter === false && ((await japi('/api/students?classId=' + created.classA)).data.students || []).length === 0);
+      const toast = txt('#toast');
+      check('D) 提示包含清理学生数（删除结果可追溯）', /学生/.test(toast) || /删除/.test(toast), toast);
+    }
+
+    // ---------- E) 另一个班不受影响 ----------
+    log('\n— E) 其它班级不受影响 —');
+    check('E) 乙班仍在班级管理列表（删除/归档只影响目标班）',
+      ((await japi('/api/classes/manage')).data.classes || []).some((c) => c.id === created.classB));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const left = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^删除流程/.test(c.className));
+    const leftStu = [];
+    for (const c of left) leftStu.push(...(((await japi('/api/students?classId=' + c.id)).data.students) || []));
+    check('清理：夹具班级/学生/年级全部清除', left.length === 0 && leftStu.length === 0, { classes: left.length, students: leftStu.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

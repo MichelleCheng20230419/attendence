@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：巡堂「问题详情页」布局与留白优化
+  验证点：
+    □ 信息区域字段行距舒适（line-height 1.8；标签浅灰 13px；值深色 14px；字段行之间留白均匀）
+    □ 照片缩略图放大为 120×90 且可点击放大（灯箱）
+    □ 反馈记录独立卡片（圆角 8px / 浅灰底 / 内边距 ≥16px），反馈之间间距 12px
+    □ 反馈卡显示：反馈时间 / 反馈人 / 是否解决 / 解决方案
+    □ 添加反馈表单字段间距 16px、「是否解决」宽 200px、解决方案文本域高 120px、提交按钮右对齐
+    □ 区块间距：信息卡 → 反馈记录 → 添加反馈 均为 24px；卡片内边距 24px；页面内容不贴边
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_detail_layout.html public/_ui_detail_layout.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiDetail --virtual-time-budget=300000 --dump-dom `
+         "http://localhost:3000/_ui_detail_layout.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_detail_layout.html
+  夹具：临时年级 + 1 班 + 1 教师（巡堂全权）+ 1 小组 + 1 条带 2 张照片的问题 + 2 条反馈
+       自愈式清理（外层脚本按 ISSUES= 清理问题），并断言真实数据未变
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>问题详情页布局与留白</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr" style="width:1500px;height:1100px"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(p, { method = 'GET', body } = {}) {
+  const res = await fetch(p, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const csEl = (e, p) => (e ? W().getComputedStyle(e).getPropertyValue(p).trim() : null);
+const px = (v) => parseFloat(v) || 0;
+const rect = (e) => e.getBoundingClientRect();
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+function rgb(v) { const m = String(v).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/); return m ? m.slice(1).map(Number) : null; }
+function isLightGray(v) { const c = rgb(v); if (!c) return false; return c[0] >= 235 && c[0] <= 252 && Math.abs(c[0] - c[1]) <= 6 && Math.abs(c[1] - c[2]) <= 8; }
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '详情UI年级' + stamp, CLASS = '详情UI班' + stamp;
+const T1 = 'dt_tea_' + stamp, G1 = '详情巡堂组' + stamp;
+const created = { gradeId: null, classId: null, groupId: null, userIds: [], issueIds: [] };
+let realBefore = null;
+
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+function pngBlob() {
+  const bin = atob(PNG_B64); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: 'image/png' });
+}
+async function snapshot() {
+  const u = (await japi('/api/users')).data, g = (await japi('/api/groups')).data, c = (await japi('/api/classes')).data;
+  return { users: ((u && u.users) || []).length, groups: ((g && g.groups) || []).length, classes: ((c && c.classes) || []).length };
+}
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const g of ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('详情巡堂组' + stamp + '$').test(x.name))) {
+    await japi('/api/groups/' + g.id, { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^dt_tea_/.test(x.username))) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^详情UI班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^详情UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshot();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'DT', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const r = await japi('/api/users', {
+      method: 'POST',
+      body: {
+        username: T1, password: '123456', role: 'teacher', realName: '详情测试老师', classId: created.classId,
+        mustChangePassword: false, profileLocked: true, subject: '数学',
+        teachingClasses: [{ classId: created.classId, roleInClass: 'subject_teacher' }],
+      },
+    });
+    created.userIds.push(r.data.user.id);
+    const g = await japi('/api/groups', {
+      method: 'POST',
+      body: { name: G1, description: '详情页布局用例', permissions: { pages: ['inspection'], actions: ['view', 'create_issue', 'add_feedback', 'upload_photo'] } },
+    });
+    created.groupId = g.data.group.id;
+    await japi('/api/groups/' + created.groupId + '/members', { method: 'PUT', body: { userIds: created.userIds } });
+    // 问题（2 张照片）
+    const fd = new FormData();
+    fd.append('description', '[详情用例' + stamp + '] 教室卫生较差，桌椅摆放不整齐，地面有纸屑未清理');
+    fd.append('classId', String(created.classId));
+    fd.append('category', 'hygiene');
+    fd.append('priority', 'urgent');
+    fd.append('photos', pngBlob(), 'p1.png');
+    fd.append('photos', pngBlob(), 'p2.png');
+    const res = await fetch('/api/inspection/issues', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const data = await res.json();
+    const issueId = data.issue.id;
+    created.issueIds.push(issueId);
+    await japi('/api/inspection/issues/' + issueId + '/feedbacks', { method: 'POST', body: { feedbackStatus: 'processing', solution: '已通知班主任整改，预计明天完成' } });
+    await japi('/api/inspection/issues/' + issueId + '/feedbacks', { method: 'POST', body: { feedbackStatus: 'resolved', solution: '班主任已组织学生打扫，教室恢复整洁' } });
+    check('0) 夹具就绪（1 条带 2 张照片的问题 + 2 条反馈）', !!issueId && data.photos.length === 2, { id: issueId, photos: data.photos.length });
+
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: T1, password: '123456' } });
+    fr.src = '/inspection/detail?id=' + issueId;
+    await until(() => F() && F().readyState === 'complete' && Q('#fbList') && Qa('#fbList .fb-item').length === 2, 25000);
+    await sleep(900);
+
+    // ---------- A) 信息区域 ----------
+    log('\n— A) 信息区域 —');
+    const card = Q('#issueCard');
+    check('A) 信息卡内边距 = 24px', csEl(card, 'padding') === '24px', csEl(card, 'padding'));
+    const rows = Qa('.info-row');
+    check('A) 字段行 line-height = 1.8（行距舒适）',
+      rows.every((r) => Math.abs(px(csEl(r, 'line-height')) - px(csEl(r, 'font-size')) * 1.8) <= 0.6),
+      { lh: [...new Set(rows.map((r) => csEl(r, 'line-height')))], fs: [...new Set(rows.map((r) => csEl(r, 'font-size')))] });
+    const labels = Qa('.info-row .k'), values = Qa('.info-row .v');
+    // 浅灰说明色 = 全站 --text-light（#8A94A6 类），不是"接近白"的灰
+    const lightTextRgb = (() => {
+      const hex = W().getComputedStyle(F().documentElement).getPropertyValue('--text-light').trim().replace('#', '');
+      const n = parseInt(hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex, 16);
+      return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+    })();
+    check('A) 字段标签：13px + 浅灰色（全站 --text-light）',
+      labels.every((l) => csEl(l, 'font-size') === '13px' && rgb(csEl(l, 'color')).join(',') === lightTextRgb),
+      { fs: csEl(labels[0], 'font-size'), color: csEl(labels[0], 'color'), want: lightTextRgb });
+    check('A) 字段值：14px + 深色（正文色 rgb(51,51,51)）',
+      values.every((v) => csEl(v, 'font-size') === '14px' && rgb(csEl(v, 'color')).join(',') === '51,51,51'),
+      { fs: csEl(values[0], 'font-size'), color: csEl(values[0], 'color') });
+    const rowGaps = [];
+    for (let i = 1; i < rows.length; i++) rowGaps.push(Math.round(rect(rows[i]).top - rect(rows[i - 1]).bottom));
+    check('A) 字段行之间留白均匀（6px，无 0 间距）',
+      rowGaps.every((g) => g === rowGaps[0]) && rowGaps[0] >= 4, rowGaps);
+    check('A) 字段标签列宽统一（88px，值列左对齐）',
+      new Set(labels.map((l) => Math.round(rect(l).width))).size === 1 &&
+      new Set(values.map((v) => Math.round(rect(v).left))).size === 1,
+      { labelW: [...new Set(labels.map((l) => Math.round(rect(l).width)))], valueLeft: [...new Set(values.map((v) => Math.round(rect(v).left)))] });
+
+    // ---------- B) 照片缩略图 ----------
+    log('\n— B) 照片缩略图 —');
+    const imgs = Qa('#dPhotos img');
+    check('B) 照片缩略图 2 张，尺寸 120×90',
+      imgs.length === 2 && imgs.every((i) => Math.round(rect(i).width) === 120 && Math.round(rect(i).height) === 90),
+      imgs.map((i) => [Math.round(rect(i).width), Math.round(rect(i).height)]));
+    check('B) 缩略图圆角 8px、object-fit: cover（不拉伸变形）',
+      imgs.every((i) => csEl(i, 'border-radius') === '8px' && csEl(i, 'object-fit') === 'cover'),
+      { r: csEl(imgs[0], 'border-radius'), fit: csEl(imgs[0], 'object-fit') });
+    check('B) 缩略图之间间距 12px',
+      Math.round(rect(imgs[1]).left - rect(imgs[0]).right) === 12,
+      Math.round(rect(imgs[1]).left - rect(imgs[0]).right));
+    check('B) 缩略图为可点击（cursor: zoom-in）', imgs.every((i) => csEl(i, 'cursor') === 'zoom-in'));
+    imgs[0].click();
+    await sleep(300);
+    const lb = Q('#lightbox');
+    check('B) 点缩略图 → 灯箱放大显示同一张图（尺寸明显大于缩略图）',
+      lb && !lb.classList.contains('hidden') && Q('#lbImg').getAttribute('src') === imgs[0].getAttribute('src') &&
+      rect(Q('#lbImg')).width > 120,
+      { open: lb && !lb.classList.contains('hidden'), w: Math.round(rect(Q('#lbImg')).width || 0) });
+    Q('#lbClose').click();
+    await sleep(200);
+    check('B) 关闭灯箱', hidden('#lightbox'));
+
+    // ---------- C) 反馈记录区 ----------
+    log('\n— C) 反馈记录区 —');
+    const fbList = Q('#fbList');
+    const secTitle = Qa('.section-title')[0];
+    const cardBottom = rect(card).bottom;
+    const titleTop = rect(secTitle).top;
+    check('C) 信息卡 → 反馈记录 间距 = 24px',
+      Math.round(titleTop - cardBottom) === 24, Math.round(titleTop - cardBottom));
+    const items = Qa('.fb-item');
+    check('C) 反馈为独立卡片：圆角 8px + 浅灰底（非纯白）+ 内边距 ≥ 16px',
+      items.length === 2 && items.every((i) => csEl(i, 'border-radius') === '8px' && isLightGray(csEl(i, 'background-color')) && px(csEl(i, 'padding-top')) >= 16),
+      items.map((i) => ({ r: csEl(i, 'border-radius'), bg: csEl(i, 'background-color'), pad: csEl(i, 'padding-top') })));
+    check('C) 反馈之间间距 = 12px',
+      Math.round(rect(items[1]).top - rect(items[0]).bottom) === 12,
+      Math.round(rect(items[1]).top - rect(items[0]).bottom));
+    const allFbText = items.map((i) => i.textContent.replace(/\s+/g, ' ')).join(' | ');
+    check('C) 反馈卡显示：反馈人 + 反馈时间 + 是否解决 + 解决方案',
+      items.every((i) => !!i.querySelector('.fb-head b') && (i.querySelector('.fb-head b').textContent || '').trim().length >= 2 &&
+        !!i.querySelector('.fb-time') && !!i.querySelector('.st') && !!i.querySelector('.fb-sol')) &&
+      /是否解决/.test(allFbText) && /已通知班主任整改/.test(allFbText) && /教室恢复整洁/.test(allFbText),
+      allFbText.slice(0, 140));
+    check('C) 反馈时间格式 = YYYY-MM-DD HH:MM', /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(txt('.fb-time')), txt('.fb-time'));
+    check('C) 反馈方案行距舒适（line-height ≥ 1.7）',
+      items.every((i) => px(csEl(i.querySelector('.fb-sol'), 'line-height')) >= 22),
+      items.map((i) => csEl(i.querySelector('.fb-sol'), 'line-height')));
+
+    // ---------- D) 添加反馈区 ----------
+    log('\n— D) 添加反馈区 —');
+    const formSec = Q('.fb-form').closest('.fb-section');
+    const listBottom = rect(fbList).bottom;
+    const formTitleTop = rect(formSec.querySelector('.section-title')).top;
+    check('D) 反馈记录 → 添加反馈 间距 = 24px',
+      Math.round(formTitleTop - listBottom) === 24, Math.round(formTitleTop - listBottom));
+    const form = Q('#fbForm');
+    check('D) 表单卡片内边距 20~24px', px(csEl(form, 'padding-top')) >= 20, csEl(form, 'padding'));
+    const formRows = Qa('#fbForm .form-row');
+    const rowGap = Math.round(rect(formRows[1]).top - rect(formRows[0]).bottom);
+    check('D) 表单字段之间间距 = 16px', rowGap === 16, rowGap);
+    const sel = Q('#fbStatus');
+    check('D) 「是否解决」下拉宽度 = 200px', Math.round(rect(sel).width) === 200, Math.round(rect(sel).width));
+    const ta = Q('#fbSolution');
+    check('D) 「解决方案」文本域高度 = 120px', Math.round(rect(ta).height) === 120, Math.round(rect(ta).height));
+    check('D) 文本域宽度撑满表单内容区', Math.abs(rect(ta).width - (rect(form).width - 2 * px(csEl(form, 'padding-left')) - 2 * px(csEl(form, 'border-left-width')))) <= 2,
+      { ta: Math.round(rect(ta).width), formInner: Math.round(rect(form).width - 2 * px(csEl(form, 'padding-left'))) });
+    const btn = Q('#btnSubmitFb');
+    const formInnerRight = rect(form).right - px(csEl(form, 'padding-right')) - px(csEl(form, 'border-right-width'));
+    check('D) 提交按钮右对齐（按钮右边缘 = 表单内容区右边缘 ±2px）',
+      Math.abs(formInnerRight - rect(btn).right) <= 2, { btnRight: Math.round(rect(btn).right), innerRight: Math.round(formInnerRight) });
+    check('D) 提交按钮与文本域之间留白 ≥ 16px',
+      Math.round(rect(btn).top - rect(ta).bottom) >= 16, Math.round(rect(btn).top - rect(ta).bottom));
+
+    // ---------- E) 整体留白与层级 ----------
+    log('\n— E) 整体留白 —');
+    const pageCard = Q('.container > .page-card');
+    check('E) 页面内容仍在统一白色卡片内（内边距 24px）',
+      !!pageCard && csEl(pageCard, 'padding') === '24px', pageCard && csEl(pageCard, 'padding'));
+    const cardInnerLeft = rect(pageCard).left + px(csEl(pageCard, 'padding-left'));
+    check('E) 各区块钱与卡片内容区左对齐（不贴边、不内缩）',
+      [card, formSec].every((el) => Math.abs(rect(el).left - cardInnerLeft) <= 1) &&
+      Math.abs(rect(card).left - cardInnerLeft) <= 1,
+      { info: Math.round(rect(card).left), inner: Math.round(cardInnerLeft) });
+    check('E) 三个区块（信息卡 / 反馈记录 / 添加反馈）横向等宽',
+      new Set([card, fbList, form].map((el) => Math.round(rect(el).width))).size === 1,
+      [card, fbList, form].map((el) => Math.round(rect(el).width)));
+    check('E) 页面无横向溢出、内容不超出卡片右边缘',
+      (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })() &&
+      rect(form).right <= rect(pageCard).right - px(csEl(pageCard, 'padding-right')) + 1,
+      (() => { const de = F().documentElement; return { sw: de.scrollWidth, cw: de.clientWidth }; })());
+    const secGaps = [
+      Math.round(rect(Qa('.section-title')[0]).top - rect(card).bottom),
+      Math.round(rect(Qa('.section-title')[1]).top - rect(fbList).bottom),
+    ];
+    check('E) 区块间距统一为 24px', secGaps.every((g) => g === 24), secGaps);
+    check('E) 无权限提示/错误框默认隐藏（布局不被占位）', hidden('#denyTip') || !Q('#denyTip'), hidden('#errBox') || !Q('#errBox'));
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftGroups = ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('详情巡堂组' + stamp + '$').test(x.name));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^dt_tea_/.test(u.username));
+    check('清理：夹具小组/账号已删除', leftGroups.length === 0 && leftUsers.length === 0, { g: leftGroups.length, u: leftUsers.length });
+    const after = await snapshot();
+    check('清理：真实用户/小组/班级数量未变', JSON.stringify(realBefore) === JSON.stringify(after), { before: realBefore, after });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  log('ISSUES=' + created.issueIds.join(','));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

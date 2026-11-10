@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：角色菜单矩阵 + 页面路由保护 + API 角色校验
+  角色：管理员 / 班主任 / 任课老师 / 班长 / 学生
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_menu_roles.html public/_ui_menu_roles.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiMenuRoles --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_menu_roles.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_menu_roles.html
+  夹具：临时年级 + 2 个班（本科/他班）+ 班主任/任课老师/班长/学生账号；测完清理（自愈式）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -14000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>角色菜单矩阵 / 路由保护 / API 校验</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data, loc: res.headers.get('location') || '' };
+}
+// 页面访问：跟随跳转，用最终 URL 判定是否被守卫拦下（redirect:'manual' 下浏览器不暴露 Location）
+async function page(path) {
+  const res = await fetch(path, { credentials: 'same-origin', redirect: 'follow' });
+  const html = res.status === 200 ? await res.text() : '';
+  return { status: res.status, url: new URL(res.url).pathname, html };
+}
+// 目标页面特征（用于确认"落脚页"确实是对应页面）
+const PAGE_MARK = {
+  '/dashboard': 'id="navbarHost"', '/performance': '课堂表现', '/attendance-analysis': '考勤分析',
+  '/students': '学生管理', '/random-call': '随机点名', '/announcements': '叫号管理',
+  '/homework': '作业统计', '/homework-manage': '作业管理', '/admin/account-management': '账号管理',
+  '/admin/grade-management': '年级管理', '/admin/class-management': '班级管理',
+  '/admin/academic-year-management': '学年管理', '/admin/student-transfer': '学生异动', '/attendance/makeup': '补签',
+  '/login': 'login',
+};
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#navbarMenus') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(700);
+}
+// 顶层一级菜单（可见）
+const topMenus = () => Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item')
+  .filter((b) => visible('#' + b.id)).map((b) => b.id);
+// 某个下拉内可见条目
+const itemsOf = (menuId) => Qa('#' + menuId + ' .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '菜单年级' + stamp, CLASS_A = '菜单甲班' + stamp, CLASS_B = '菜单乙班' + stamp;
+const HEAD = 'mr_head_' + stamp, SUBJ = 'mr_subj_' + stamp, MON = 'mr_mon_' + stamp, STU = 'mr_stu_' + stamp;
+const created = { gradeId: null, classIds: [], userIds: [], studentIds: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^菜单[甲乙]班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^mr_/.test(x.username))) {
+      await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+      await japi('/api/users/' + u.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^菜单年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'MR', academicYear: year } })).data.id;
+    const mkClass = async (name) => (await japi('/api/classes', { method: 'POST', body: { className: name, gradeName: GRADE, academicYear: year } })).data.id;
+    const ca = await mkClass(CLASS_A);
+    const cb = await mkClass(CLASS_B);
+    created.classIds = [ca, cb];
+    let r = await japi('/api/users', { method: 'POST', body: { username: HEAD, password: '123456', role: 'teacher', realName: '菜单班主任', subject: '语文', classId: ca, profileLocked: true, teachingClasses: [{ classId: ca, roleInClass: 'head_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: SUBJ, password: '123456', role: 'teacher', realName: '菜单任课', subject: '物理', classId: ca, profileLocked: true, teachingClasses: [{ classId: ca, roleInClass: 'subject_teacher' }, { classId: cb, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '菜单班长', classId: ca, mustChangePassword: false } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: STU, password: '123456', role: 'student', realName: '菜单学生', classId: ca, mustChangePassword: false } });
+    created.userIds.push(r.data.user.id);
+    for (const c of [ca, cb]) {
+      for (let i = 1; i <= 2; i += 1) {
+        const rr = await japi('/api/students', { method: 'POST', body: { studentNo: 'MR' + stamp + c + i, name: '菜单同学' + c + i, classId: c, status: '在读' } });
+        created.studentIds.push(rr.data.student.id);
+      }
+    }
+    check('0) 夹具就绪（2 班 4 学生 + 班主任/任课/班长/学生）', created.userIds.length === 4 && created.studentIds.length === 4,
+      { u: created.userIds.length, s: created.studentIds.length });
+    const asUser = async (u) => { await japi('/api/auth/logout', { method: 'POST' }); return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } }); };
+
+    fr.style.width = '1500px'; fr.style.height = '900px';
+
+    // ============================================================
+    // A) 菜单矩阵
+    // ============================================================
+    // ---------- 管理员：5 个一级菜单 ----------
+    await asUser('admin');
+    await loadPage('/dashboard');
+    check('A) 管理员：一级菜单 = 签到操作/巡堂记录/考勤管理/教学工具/数据统计/系统管理（6 个）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navInspection', 'navAttendanceMgmt', 'navTeaching', 'navStats', 'navSystem']), topMenus());
+    check('A) 管理员：考勤管理 = 计划管理 + 学生管理',
+      JSON.stringify(itemsOf('navAttendanceMenu')) === JSON.stringify(['btnPlansView', 'btnStudents']), itemsOf('navAttendanceMenu'));
+    check('A) 管理员：教学工具 = 叫号管理 + 随机点名 + 作业管理（发布作业入口）',
+      JSON.stringify(itemsOf('navTeachingMenu')) === JSON.stringify(['btnAnnManage', 'btnRollCall', 'btnHomeworkManage']), itemsOf('navTeachingMenu'));
+    check('A) 管理员：数据统计 = 课堂表现 + 考勤分析 + 巡查面板（作业统计已提到顶层）',
+      JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis', 'btnInspectionPanel']), itemsOf('navStatsMenu'));
+    check('A) 管理员：系统管理 = 账号/年级/班级/学年/小组管理（5 个子页面）',
+      JSON.stringify(itemsOf('navSystemMenu')) === JSON.stringify(['btnAdminUsers', 'btnAdminGrades', 'btnAdminClasses', 'btnAdminYears', 'btnAdminGroups']) &&
+      Q('#navSystem').closest('.nav-group') === Q('#navGroupSystem'),
+      { items: itemsOf('navSystemMenu'), inGroup: !!Q('#navGroupSystem') });
+
+    // ---------- 班主任：4 个一级菜单（无系统管理） ----------
+    await asUser(HEAD);
+    await loadPage('/dashboard');
+    check('B) 班主任：一级菜单 = 签到操作/考勤管理/教学工具/数据统计（4 个，无系统管理）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navAttendanceMgmt', 'navTeaching', 'navStats']), topMenus());
+    check('B) 班主任：考勤管理含计划管理 + 学生管理',
+      JSON.stringify(itemsOf('navAttendanceMenu')) === JSON.stringify(['btnPlansView', 'btnStudents']), itemsOf('navAttendanceMenu'));
+    check('B) 班主任：教学工具含叫号管理 + 随机点名 + 作业管理',
+      JSON.stringify(itemsOf('navTeachingMenu')) === JSON.stringify(['btnAnnManage', 'btnRollCall', 'btnHomeworkManage']), itemsOf('navTeachingMenu'));
+    check('B) 班主任：数据统计含课堂表现 + 考勤分析（本班全部学科；作业统计在顶层；巡查面板需小组授权 → 不可见）',
+      JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis']), itemsOf('navStatsMenu'));
+    check('B) 班主任：系统管理菜单不可见', !visible('#navSystem') && hidden('#navGroupSystem') && hidden('#btnAdminUsers'));
+
+    // ---------- 任课老师：4 个一级菜单；作业统计可见（本学科） ----------
+    await asUser(SUBJ);
+    await loadPage('/dashboard');
+    check('C) 任课老师：一级菜单 = 签到操作/考勤管理/教学工具/数据统计（4 个，无系统管理）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navAttendanceMgmt', 'navTeaching', 'navStats']), topMenus());
+    check('C) 任课老师：数据统计含课堂表现 + 考勤分析（作业统计在顶层、按本学科收敛；无小组 → 不含巡查面板）',
+      JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis']), itemsOf('navStatsMenu'));
+    check('C) 任课老师：教学工具含叫号管理 + 随机点名 + 作业管理', !hidden('#btnAnnManage') && !hidden('#btnRollCall') && !hidden('#btnHomeworkManage'));
+    check('C) 任课老师：系统管理菜单不可见', !visible('#navSystem') && hidden('#navGroupSystem') && hidden('#btnAdminUsers'));
+
+    // ---------- 班长：3 个一级菜单（签到操作 / 叫号提醒 / 随机点名） ----------
+    await asUser(MON);
+    await loadPage('/dashboard');
+    check('D) 班长：一级菜单 = 签到操作 + 叫号提醒 + 随机点名（3 个）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'btnHomework', 'btnAnnouncements', 'btnRollCall', 'navLikesRanking']), topMenus());
+    check('D) 班长：叫号提醒为顶层按钮（不再是下拉项）',
+      Q('#btnAnnouncements').parentElement.id === 'navbarMenus' && Q('#btnAnnouncements').classList.contains('nav-item') &&
+      /叫号提醒/.test(Q('#btnAnnouncements').textContent), Q('#btnAnnouncements').className);
+    check('D) 班长：随机点名为顶层按钮', Q('#btnRollCall').parentElement.id === 'navbarMenus' && Q('#btnRollCall').classList.contains('nav-item'));
+    check('D) 班长：不显示考勤管理/教学工具/数据统计/系统管理',
+      !visible('#navAttendanceMgmt') && hidden('#navGroupAttendance') && hidden('#navGroupTeaching') && hidden('#navGroupStats') && hidden('#navGroupSystem') && !visible('#navSystem'));
+    check('D) 班长：顶层可见「作业统计」；不显示课堂表现 / 考勤分析 / 叫号管理 / 计划管理 / 学生管理',
+      !hidden('#btnHomework') && hidden('#btnPerformance') && hidden('#btnAnalysis') && hidden('#btnAnnManage') && hidden('#btnPlansView') && hidden('#btnStudents'));
+    // 班长默认座位表模式
+    check('D) 班长登录后签到操作台默认进入座位表模式',
+      F().body.classList.contains('monitor-mode') && visible('#seatGrid') && !visible('#studentsGrid'),
+      { monitor: F().body.classList.contains('monitor-mode'), seat: visible('#seatGrid'), list: visible('#studentsGrid') });
+    // 叫号提醒可用（打开弹窗）
+    Q('#btnAnnouncements').click();
+    check('D) 点「叫号提醒」打开叫号弹窗', await until(() => !hidden('#annModal'), 8000));
+    if (Q('#annClose')) Q('#annClose').click();
+    // 随机点名跳转
+    Q('#btnRollCall').click();
+    check('D) 点「随机点名」跳转 /random-call', await until(() => W().location.pathname === '/random-call', 10000), W().location.pathname);
+
+    // ---------- 学生：只有签到操作（只读） ----------
+    await asUser(STU);
+    await loadPage('/dashboard');
+    check('E) 学生：一级菜单只有签到操作', JSON.stringify(topMenus()) === JSON.stringify(['navAttendance']), topMenus());
+    check('E) 学生：四个分组全部不可见',
+      hidden('#navGroupAttendance') && hidden('#navGroupTeaching') && hidden('#navGroupStats') && hidden('#navGroupSystem') && !visible('#navSystem'));
+    check('E) 学生：只读（隐藏发起签到与截止时间）', hidden('#btnStart') && hidden('#deadlineSelect'));
+    check('E) 学生：签到操作条的操作组整体收起（只保留场次信息）', hidden('#dashActions'));
+    check('E) 学生：导航栏只有菜单 + 用户菜单（无签到操作）',
+      !Q('.navbar #btnStart') && !Q('.navbar #deadlineSelect') && !!Q('.navbar #navbarMenus') && !!Q('.navbar #btnUser'));
+    await asUser('admin');
+    await loadPage('/dashboard');
+    check('A) 管理员：操作组可见（截止时间 + 发起签到 + 全屏容器）', !hidden('#dashActions') && visible('#btnStart'));
+
+    // ============================================================
+    // F) 页面路由保护（未授权 → 302 回签到操作台）
+    // ============================================================
+    const routeCases = [
+      { role: 'admin', user: 'admin', allow: ['/dashboard', '/performance', '/attendance-analysis', '/students', '/random-call', '/announcements', '/homework', '/homework-manage', '/changelog', '/admin/account-management', '/admin/grade-management', '/admin/class-management', '/admin/academic-year-management', '/admin/student-transfer'], deny: [] },
+      { role: 'head', user: HEAD, allow: ['/dashboard', '/performance', '/attendance-analysis', '/students', '/random-call', '/announcements', '/homework', '/homework-manage', '/admin/student-transfer'], deny: ['/changelog', '/admin/account-management', '/admin/grade-management', '/admin/class-management', '/admin/academic-year-management'] },
+      { role: 'subj', user: SUBJ, allow: ['/dashboard', '/performance', '/attendance-analysis', '/students', '/random-call', '/announcements', '/homework', '/homework-manage'], deny: ['/changelog', '/admin/account-management', '/admin/grade-management'] },
+      // 2026-09-30：/homework 对班长是"重定向到录入台"（/dashboard?view=homework）→ 仍按「落到 /dashboard」核对
+      { role: 'mon', user: MON, allow: ['/dashboard', '/random-call'], deny: ['/changelog', '/performance', '/attendance-analysis', '/students', '/announcements', '/homework', '/homework-manage', '/admin/account-management', '/admin/class-management', '/admin/student-transfer', '/attendance/makeup'] },
+      { role: 'stu', user: STU, allow: ['/dashboard'], deny: ['/changelog', '/performance', '/attendance-analysis', '/students', '/random-call', '/announcements', '/homework', '/homework-manage', '/admin/account-management', '/admin/academic-year-management', '/admin/student-transfer', '/attendance/makeup'] },
+    ];
+    for (const c of routeCases) {
+      await asUser(c.user);
+      for (const p of c.allow) {
+        const r = await page(p);
+        check(`F) [${c.role}] ${p} → 200 且落到该页`, r.status === 200 && r.url === p && (!PAGE_MARK[p] || r.html.includes(PAGE_MARK[p])),
+          { status: r.status, url: r.url });
+      }
+      for (const p of c.deny) {
+        const r = await page(p);
+        check(`F) [${c.role}] ${p} → 重定向回签到操作台`,
+          r.url === '/dashboard' && r.html.includes(PAGE_MARK['/dashboard']), { status: r.status, url: r.url });
+      }
+    }
+    // /admin 汇总入口 → 默认落到账号管理页（管理员）
+    await asUser('admin');
+    const adminRoot = await page('/admin');
+    check('F) [admin] /admin → 默认落到 /admin/account-management',
+      adminRoot.url === '/admin/account-management' && adminRoot.status === 200, { status: adminRoot.status, url: adminRoot.url });
+    await asUser(HEAD);
+    const adminRootHead = await page('/admin');
+    check('F) [head] /admin → 重定向回签到操作台', adminRootHead.url === '/dashboard', { url: adminRootHead.url });
+    // 未登录
+    await japi('/api/auth/logout', { method: 'POST' });
+    const anon = await page('/dashboard');
+    check('F) [未登录] /dashboard → 跳登录页', anon.url === '/login', anon);
+
+    // ============================================================
+    // G) API 角色校验
+    // ============================================================
+    const apiCases = [
+      { role: 'admin', user: 'admin', ok: ['/api/performance/records', '/api/performance/options', '/api/performance/likes', '/api/attendance/analysis/overview', '/api/students'], forbidden: [] },
+      { role: 'head', user: HEAD, ok: ['/api/performance/records', '/api/performance/options', '/api/attendance/analysis/overview', '/api/students?classId=' + created.classIds[0]], forbidden: [] },
+      { role: 'subj', user: SUBJ, ok: ['/api/performance/records', '/api/attendance/analysis/overview'], forbidden: [] },
+      { role: 'mon', user: MON, ok: ['/api/announcements/inbox', '/api/rollcall/classes', '/api/students?classId=' + created.classIds[0], '/api/performance/likes', '/api/likes/options'], forbidden: ['/api/performance/records', '/api/performance/options', '/api/attendance/analysis/overview', '/api/students?classId=' + created.classIds[1], '/api/performance/likes?classId=' + created.classIds[1]] },
+      { role: 'stu', user: STU, ok: [], forbidden: ['/api/performance/records', '/api/attendance/analysis/overview', '/api/students?classId=' + created.classIds[1], '/api/rollcall/classes'] },
+    ];
+    for (const c of apiCases) {
+      await asUser(c.user);
+      for (const api of c.ok) {
+        const r = await japi(api);
+        check(`G) [${c.role}] ${api} → 非 403`, r.status !== 403, { status: r.status, err: r.data && r.data.error });
+      }
+      for (const api of c.forbidden) {
+        const r = await japi(api);
+        check(`G) [${c.role}] ${api} → 403`, r.status === 403, { status: r.status, data: r.data });
+      }
+    }
+    // 班长只能读本班名单（不带 classId 时自动限定本班）
+    await asUser(MON);
+    const myList = await japi('/api/students');
+    check('G) [mon] /api/students（不带班级）→ 仅返回本班学生',
+      myList.status === 200 && (myList.data.students || []).every((s) => s.classId === created.classIds[0]) && (myList.data.students || []).length > 0,
+      { n: (myList.data.students || []).length, classes: [...new Set((myList.data.students || []).map((s) => s.classId))] });
+    // 班长不可发布叫号（叫号提醒仅接收）
+    const pub = await japi('/api/announcements', { method: 'POST', body: { classId: created.classIds[0], studentId: created.studentIds[0], location: '菜单测试地点', scheduledTime: '2026-09-16 10:00' } });
+    check('G) [mon] 发布叫号 → 403（班长只能接收/播报）', pub.status === 403, pub.data);
+
+    // ============================================================
+    // H) 右上角用户菜单：个人中心 + 帮助文档 + 退出登录（各角色一致，多页面存在）
+    // ============================================================
+    for (const c of [{ role: 'admin', user: 'admin' }, { role: 'head', user: HEAD }, { role: 'mon', user: MON }, { role: 'stu', user: STU }]) {
+      await asUser(c.user);
+      await loadPage('/dashboard');
+      check(`H) [${c.role}] 用户菜单含 个人中心 / 帮助文档 / 退出登录`,
+        !!Q('#menuProfile') && !!Q('#menuHelp') && !!Q('#menuLogout'), { help: !!Q('#menuHelp') });
+      check(`H) [${c.role}] 帮助文档在用户下拉内（默认收起，展开后可见）`,
+        (() => { Q('#btnUser').click(); const v = visible('#menuHelp'); Q('#btnUser').click(); return v; })());
+      // 📝 更新日志：仅管理员可见（其余角色菜单里不出现，/changelog 也不放行——见 F 段）
+      const clVisible = (() => { Q('#btnUser').click(); const v = visible('#menuChangelog'); Q('#btnUser').click(); return v; })();
+      check(`H) [${c.role}] 更新日志菜单${c.role === 'admin' ? '可见（仅管理员）' : '不可见（非管理员）'}`,
+        c.role === 'admin' ? clVisible : !clVisible, { visible: clVisible });
+    }
+    // 点击帮助文档 → 新标签打开 /help（stub window.open 断言 URL）
+    await asUser('admin');
+    await loadPage('/dashboard');
+    const opened = [];
+    const realOpen = W().open;
+    W().open = (u, t) => { opened.push({ u, t }); return null; };
+    Q('#btnUser').click();
+    await sleep(150);
+    Q('#menuHelp').click();
+    await sleep(200);
+    W().open = realOpen;
+    check('H) 点「帮助文档」→ 新标签打开 /help', opened.length === 1 && opened[0].u === '/help' && opened[0].t === '_blank', opened);
+    check('H) 点「帮助文档」后用户菜单自动收起', hidden('#userDropdown'));
+    // 用户菜单里的「📝 更新日志」（仅管理员）→ 新标签打开 /changelog
+    const opened2 = [];
+    const realOpen2 = W().open;
+    W().open = (u, t) => { opened2.push({ u, t }); return null; };
+    Q('#btnUser').click();
+    await sleep(150);
+    check('H) [admin] 用户菜单含「📝 更新日志」入口（可见）', !hidden('#menuChangelog') && /更新日志/.test(txt('#menuChangelog')), txt('#menuChangelog'));
+    if (Q('#menuChangelog')) {
+      Q('#menuChangelog').click();
+      await sleep(200);
+      W().open = realOpen2;
+      check('H) 点「更新日志」→ 新标签打开 /changelog',
+        opened2.length === 1 && opened2[0].u === '/changelog' && opened2[0].t === '_blank', opened2);
+      check('H) 点「更新日志」后用户菜单自动收起', hidden('#userDropdown'));
+    } else {
+      W().open = realOpen2;
+      skip('H) 更新日志入口', '未渲染 #menuChangelog');
+    }
+    // 其它页面（学生管理 / 个人中心）也带帮助文档入口
+    await loadPage('/students', '#menuHelp');
+    check('H) 学生管理页用户菜单也含帮助文档', !!Q('#menuHelp'));
+    await loadPage('/profile', '#menuHelp');
+    check('H) 个人中心页用户菜单也含帮助文档', !!Q('#menuHelp'));
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^mr_/.test(u.username));
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^菜单[甲乙]班/.test(c.className));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^菜单年级/.test(g.grade_name || g.gradeName));
+    check('清理：临时账号/班级/年级已删除', leftUsers.length === 0 && leftClasses.length === 0 && leftGrades.length === 0,
+      { u: leftUsers.length, c: leftClasses.length, g: leftGrades.length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

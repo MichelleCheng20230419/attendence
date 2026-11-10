@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：管理员删除「已结束的签到」（计划管理页）
+    ① 计划管理：管理员在已结束行看到「补签」+「删除」两个按钮
+    ② 点「删除」→ 二次确认，文案含 日期/时间/班级/不可恢复
+    ③ 确认后：该场次与其签到记录一并删除（列表刷新 + 提示）
+    ④ 普通教师看不到「删除」按钮（后端 403，服务端用例覆盖）
+    ⑤ 只删自己点的那一场：其它场次（含真实数据）一律不受影响（逐 id 复核）
+    ⑥ 进行中的场次没有删除按钮（先结束才能删；管理员可用 close 接口结束）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_session_delete -AdminPw <管理员密码>
+  夹具：1 年级 + 1 班 + 2 学生 + 1 教师 + 1 条计划（触发成场次后由管理员结束）
+  说明：场次 id 会以 SESSIONS=<id> 打印，run-ui.ps1 跑完自动清理该场次
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1400px; height: 900px; }
+</style>
+</head>
+<body>
+<h3>管理员删除已结束签到（计划管理）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 20000);
+  await sleep(1200);
+}
+async function showEnded() {
+  const filter = Q('#planStatusFilter');
+  if (filter) { filter.value = 'ended'; filter.dispatchEvent(new (W().Event)('change', { bubbles: true })); }
+  await sleep(1500);
+}
+const sessionExists = async (sid) => {
+  const r = await japi('/api/attendance/session-records?sessionId=' + sid);
+  return r.status === 200 && !!(r.data && r.data.session);
+};
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '删签到年级' + stamp, CLASS = '删签到班' + stamp, TEA = 'sd_tea_' + stamp;
+const created = { gradeId: null, classId: null, students: [], users: [], planId: null, sessionId: null };
+
+async function cleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  // ⚠ 安全红线（2026-09-29 事故后加固）：
+  //   此前这里用 `.filter((x) => x.classId === created.classId)` 兜底收集"本夹具班级的计划"，
+  //   一旦 created.classId 为空（夹具班级没建成/已被删），这个条件会**匹配到所有"全校计划"(classId=null)**，
+  //   进而把它们关联的真实历史场次一起删除（实际发生过：误删了 2026-08-28 的场次 #6 及其 20 条记录）。
+  //   现在：①夹具班级 id 必须是正整数，否则整个"删计划/删场次"环节一律跳过；
+  //        ②删任何场次前，先查该场次的 classId 必须等于夹具班级 id，否则跳过并打印告警。
+  const fid = Number(created.classId);
+  if (!Number.isInteger(fid) || fid <= 0) {
+    log('  · 安全跳过：夹具班级未创建成功（created.classId 为空）→ 不删除任何计划/场次（避免误伤"全校计划"的真实场次）');
+  } else {
+    const plans = ((await japi('/api/plans')).data.plans || []).filter((x) => Number(x.classId) === fid);
+    const extra = [...new Set(plans.map((p) => p.sessionId).filter(Boolean))];
+    for (const p of plans) await japi('/api/plans/' + p.id, { method: 'DELETE' });
+    if (created.planId && !plans.some((p) => p.id === created.planId)) await japi('/api/plans/' + created.planId, { method: 'DELETE' });
+    for (const sid of [...new Set([created.sessionId, ...extra].filter(Boolean))]) {
+      const info = await japi('/api/attendance/session-records?sessionId=' + sid);
+      const sc = info.data && info.data.session ? info.data.session.classId : undefined;
+      if (Number(sc) !== fid) {                     // 不是本夹具班级的场次（含全校场次 null）→ 绝不删
+        log('  · 安全跳过场次 #' + sid + '（classId=' + sc + '，不属于夹具班级 #' + fid + '）');
+        continue;
+      }
+      await japi('/api/attendance/sessions/' + sid + '/close', { method: 'POST' });
+      const r = await japi('/api/attendance/sessions/' + sid, { method: 'DELETE' });
+      if (r.status === 200) log('SESSIONS=' + sid);      // 交给 run-ui.ps1 再兜一层
+    }
+  }
+  const cls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^删签到班/.test(c.className));
+  for (const c of cls) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^sd_/.test(x.username))) await japi('/api/users/' + u.id, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^删签到年级/.test(x.grade_name || x.gradeName))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'SD', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const ur = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '删签到老师', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+    created.users.push(ur.data.user.id);
+    for (const [no, nm] of [['SD' + stamp + '01', '删签甲'], ['SD' + stamp + '02', '删签乙']]) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: no, name: nm, classId: created.classId } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    // 当前分钟的计划（本班）→ 让计划触发出场次（场次与计划关联，才会出现在计划管理里）
+    const now = new Date();
+    const hm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const pr = await japi('/api/plans', { method: 'POST', body: { planDate: today, startTime: hm, durationMinutes: 30, classId: created.classId } });
+    if (pr.data && pr.data.inserted) {
+      const pl = (await japi('/api/plans')).data.plans.find((x) => x.startTime === hm && x.classId === created.classId);
+      if (pl) created.planId = pl.id;
+    }
+    check('0) 夹具就绪（1 班 + 2 学生 + 1 教师账号 + 当前时段计划）', !!created.classId && created.students.filter(Boolean).length === 2 && pr.status === 201, pr.data);
+    // 触发计划（status 接口会幂等触发到点计划）
+    //   ⚠ 必须带 classId=夹具班级：不带的话管理员是"全校视角"，会返回**最新一场进行中的场次**
+    //     （v35 起每个班整天都有"每天自动签到"场次）→ 会去结束/删除真实班级的场次（2026-09-30 实测踩到）
+    const st = await japi('/api/attendance/status?classId=' + created.classId);
+    const sid = st.data && st.data.session && st.data.session.id;
+    const sidClass = st.data && st.data.session && st.data.session.classId;
+    created.sessionId = sid;
+    if (sid) log('SESSIONS=' + sid);
+    check('0) 计划已触发出场次 #' + sid + '（且属于夹具班级 #' + created.classId + '）', !!sid && Number(sidClass) === Number(created.classId), { sid, sidClass, fixture: created.classId });
+    if (!sid) throw new Error('计划未触发（可能已有其它进行中的场次），请稍后重试');
+    if (Number(sidClass) !== Number(created.classId)) throw new Error('取到的场次不属于夹具班级 → 中止（避免误删真实场次）');
+
+    // ---------- A) 进行中：没有删除按钮 ----------
+    log('\n— A) 进行中的场次没有「删除」按钮 —');
+    await load('/dashboard?view=plans', '#planList');
+    await until(() => Qa('#planList tr').length > 0, 15000);
+    await showEnded();   // 先看已结束（此时本场还是进行中，不应出现自己的删除按钮）
+    const mineWhileActive = Qa('#planList .plan-session-del').filter((b) => Number(b.dataset.session) === sid);
+    check('A) 进行中（未结束）的场次没有「删除」按钮', mineWhileActive.length === 0, mineWhileActive.length);
+    // 教师：看不到任何删除按钮
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: TEA, password: '123456' } });
+    await load('/dashboard?view=plans', '#planList');
+    await until(() => Qa('#planList tr').length > 0, 15000);
+    check('A) 普通教师端没有任何「删除签到」按钮', Qa('#planList .plan-session-del').length === 0, Qa('#planList .plan-session-del').length);
+
+    // ---------- B) 管理员：结束该场次 → 出现删除按钮 → 二次确认 → 删除 ----------
+    log('\n— B) 管理员：先结束，再删除这一场 —');
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const cl = await japi(`/api/attendance/sessions/${sid}/close`, { method: 'POST' });
+    check('B) 管理员结束该场次 → 200（记录数 ' + (cl.data && cl.data.records) + '）', cl.status === 200 && cl.data.closed === true, cl.data);
+    await load('/dashboard?view=plans', '#planList');
+    await until(() => Qa('#planList tr').length > 0, 15000);
+    await showEnded();
+    const mineBtn = Qa('#planList .plan-session-del').find((b) => Number(b.dataset.session) === sid);
+    check('B) 已结束后该行出现「删除」按钮（管理员可见）', !!mineBtn, { sid, buttons: Qa('#planList .plan-session-del').map((b) => b.dataset.session) });
+    const myRow = mineBtn && mineBtn.closest('tr');
+    check('B) 同一行仍有「补签」按钮 + 状态「已结束」',
+      !!myRow && !!myRow.querySelector('.plan-makeup') && /已结束/.test(myRow.textContent),
+      myRow && myRow.textContent.replace(/\s+/g, ' ').trim());
+    // 记录其它场次 id（用于确认删除只影响目标场次）
+    const others = Qa('#planList .plan-session-del').map((b) => Number(b.dataset.session)).filter((x) => x !== sid);
+    const othersDeletable = [];
+    for (const o of others) if (await sessionExists(o)) othersDeletable.push(o);
+    log('    · 其它已结束场次（不受影响，将被逐条复核）：' + (othersDeletable.join(',') || '无'));
+    mineBtn.click();
+    const shown = await until(() => !hidden('#confirmModal'), 5000);
+    const msg = txt('#confirmMessage');
+    check('C) 点「删除」→ 弹出二次确认（标题 = 删除签到）', shown && /删除签到/.test(txt('#confirmTitle')), txt('#confirmTitle'));
+    check('C) 确认文案含 日期 / 时间 / 班级 / 记录不可恢复',
+      /日期/.test(msg) && /时间/.test(msg) && /班级/.test(msg) && /不可恢复/.test(msg), msg);
+    check('C) 确认文案包含夹具班级名', msg.includes(CLASS), msg);
+    Q('#confirmOk').click();
+    const gone = await until(async () => !(await sessionExists(sid)), 12000);
+    check('C) 确认后该场次被删除（接口查不到）', gone, sid);
+    check('C) 页面提示删除结果', /删除/.test(txt('#toast')), txt('#toast'));
+    // 该行不再有删除按钮（计划保留、场次已无）
+    await until(() => {
+      const b = Qa('#planList .plan-session-del').find((x) => Number(x.dataset.session) === sid);
+      return !b;
+    }, 8000);
+    check('C) 列表刷新后该行不再有「删除」按钮（计划本身保留）',
+      !Qa('#planList .plan-session-del').some((b) => Number(b.dataset.session) === sid));
+    // 只删了自己的那一场：其它场次逐条复核仍在
+    let othersOk = true;
+    for (const o of othersDeletable) if (!(await sessionExists(o))) othersOk = false;
+    check('D) 只删除目标场次：其它已结束场次全部仍在（未误删）', othersOk, othersDeletable);
+    // 该场次的签到记录也一并删除（场次已不存在 → 记录随场次删除）
+    const recs = await japi('/api/attendance/session-records?sessionId=' + sid);
+    check('D) 关联签到记录一并删除（场次与记录均不存在）',
+      recs.status === 404 || !(recs.data && recs.data.session), recs.status);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await cleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^删签到班/.test(c.className));
+    check('清理：夹具班级/学生/账号/计划已清除', leftCls.length === 0, { classes: leftCls.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

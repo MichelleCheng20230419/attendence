@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：🎲 随机点名「独立页面 /random-call」+ 大屏美化
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_random_call.html public/_ui_random_call.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiRC --virtual-time-budget=90000 --dump-dom `
+         "http://localhost:3000/_ui_random_call.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_random_call.html
+  说明：脚本创建临时年级/班级/学生/班长账号，验证"签到操作台按钮 → 独立页面"全流程，结束自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1200px; height: 720px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>随机点名：独立页面 /random-call（大屏美化）</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const css = (s, prop) => { const e = Q(s); return e ? fr.contentWindow.getComputedStyle(e)[prop] : null; };
+const pathOf = () => { try { return fr.contentWindow.location.pathname; } catch (_) { return '?'; } };
+const px = (v) => parseFloat(String(v || '0').replace('px', '')) || 0;
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '大屏点名年级' + stamp, CLASS = '大屏点名班' + stamp;
+const MON = 'rcui_mon_' + stamp, STU = 'rcui_stu_' + stamp;
+const created = { gradeId: null, classId: null, userIds: [], studentIds: [] };
+const NAMES = ['大屏甲' + stamp, '大屏乙' + stamp, '大屏丙' + stamp];
+
+async function loginAs(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+async function loadDashboard() {
+  fr.src = 'about:blank'; await sleep(120);
+  fr.src = '/dashboard';
+  await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' && Q('#btnRollCall'), 18000);
+  await sleep(800);
+}
+// 点「开始/再次点名」：必须先等按钮可用（滚动动画期间按钮是 disabled，JS click 会被忽略）
+async function clickStart() {
+  const ok = await until(() => Q('#rcStart') && Q('#rcStart').disabled === false && !Q('#rcName').classList.contains('rolling'), 25000);
+  if (!ok) throw new Error('开始点名按钮长时间不可用');
+  Q('#rcStart').click();
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'RCU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    let r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '大屏点名班长', classId: created.classId } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: STU, password: '123456', role: 'student', realName: '大屏点名学生', classId: created.classId } });
+    created.userIds.push(r.data.user.id);
+    for (let i = 0; i < NAMES.length; i += 1) {
+      await japi('/api/students', { method: 'POST', body: { studentNo: 'RCU' + stamp + '0' + (i + 1), name: NAMES[i], classId: created.classId, status: '在读' } });
+    }
+    const list = (await japi('/api/students?classId=' + created.classId + '&status=' + encodeURIComponent('在读'))).data.students || [];
+    list.forEach((s) => created.studentIds.push(s.id));
+    check('0) 夹具就绪（班级 + 3 名学生 + 班长账号）', list.length === 3, list.map((s) => s.name));
+    await japi('/api/students/seats', { method: 'POST', body: { classId: created.classId, seats: list.map((s, i) => ({ studentId: s.id, row: i + 1, col: i + 1 })) } });
+
+    // ---------- A) 操作台按钮 → 跳转独立页面（不再是弹窗）----------
+    await loginAs(MON);
+    await loadDashboard();
+    check('A) 班长端可见「🎲 随机点名」按钮', !!Q('#btnRollCall') && !Q('#btnRollCall').classList.contains('hidden'));
+    check('A) 操作台上不再有点名弹窗（DOM 中无 #rollModal）', Q('#rollModal') === null);
+    Q('#btnRollCall').click();
+    const jumped = await until(() => pathOf() === '/random-call', 12000);
+    check('A) 点击后跳转到独立页面 /random-call（不是弹窗）', jumped, pathOf());
+
+    // ---------- B) 页面结构与视觉（大屏）----------
+    await until(() => F() && F().readyState === 'complete' && Q('#rcStart'), 15000);
+    await until(() => Qa('#rcClass option').length > 0 && Q('#rcClass').value !== '', 10000);
+    await sleep(600);
+    check('B) 页面标题为 🎲 随机点名', txt('.rc-title').indexOf('随机点名') >= 0, txt('.rc-title'));
+    check('B) 有「← 返回签到」入口', !!Q('#btnBack'));
+    check('B) 页面背景 = rgb(245, 247, 250)（#f5f7fa）', css('body', 'backgroundColor') === 'rgb(245, 247, 250)', css('body', 'backgroundColor'));
+    check('B) 页面内容包裹在统一白色卡片中（.container > .page-card）',
+      !!Q('.container > .page-card') && Q('.container').children.length === 1);
+    check('B) 卡片白底 + 12px 圆角 + 阴影 + 内边距 24px',
+      css('.page-card', 'backgroundColor') === 'rgb(255, 255, 255)' && css('.page-card', 'borderRadius') === '12px' &&
+      (css('.page-card', 'boxShadow') || '') !== 'none' && css('.page-card', 'paddingTop') === '24px',
+      { bg: css('.page-card', 'backgroundColor'), r: css('.page-card', 'borderRadius'), pad: css('.page-card', 'paddingTop'), sh: css('.page-card', 'boxShadow') });
+    check('B) 页头（返回/标题/全屏）在主卡片内部',
+      Q('.page-card').contains(Q('#btnBack')) && Q('.page-card').contains(Q('.rc-controls')));
+    check('B) 主色按钮为蓝色 #2563eb', css('#rcStart', 'backgroundColor') === 'rgb(37, 99, 235)', css('#rcStart', 'backgroundColor'));
+    check('B) 开始按钮高度 ≥ 60px', px(css('#rcStart', 'height')) >= 60, css('#rcStart', 'height'));
+    check('B) 开始按钮字号 ≥ 20px', px(css('#rcStart', 'fontSize')) >= 20, css('#rcStart', 'fontSize'));
+    check('B) 未点名时显示"点击开始点名"提示', txt('#rcName').indexOf('点击开始点名') >= 0, txt('#rcName'));
+    check('B) 班级默认选中当前班级（班长只有本班）',
+      txt('#rcClass').indexOf(CLASS) >= 0 && Q('#rcClass').disabled === true, { text: txt('#rcClass'), disabled: Q('#rcClass').disabled });
+    check('B) 范围默认「全班」且「仅未签到学生」可选/禁用状态合理',
+      Q('#rcScopeAll').checked === true && (Q('#rcScopeAbsent').disabled === false || Q('#rcScopeAbsent').disabled === true),
+      { all: Q('#rcScopeAll').checked, absentDisabled: Q('#rcScopeAbsent').disabled });
+    check('B) 默认勾选「不重复抽取」', Q('#rcNoRepeat').checked === true);
+    check('B) 顶部信息显示班级/在读人数', /在读/.test(txt('#rcMeta')) && /3/.test(txt('#rcMeta')), txt('#rcMeta'));
+
+    // ---------- C) 开始点名：滚动 → 结果（大字号）----------
+    await clickStart();
+    await sleep(250);
+    check('C) 点击后进入滚动状态', Q('#rcName').classList.contains('rolling'), Q('#rcName').className);
+    const got = await until(() => Q('#rcName').classList.contains('done') && NAMES.includes(txt('#rcName')), 20000);
+    const firstName = txt('#rcName');
+    check('C) 2~3 秒后显示被点到的学生（大号姓名）', got && NAMES.includes(firstName), firstName);
+    check('C) 结果姓名字号 ≥ 80px', px(css('#rcName', 'fontSize')) >= 80, css('#rcName', 'fontSize'));
+    check('C) 显示学号与座位', /学号：RCU/.test(txt('#rcChipNo')) && /座位：\d+排\d+座/.test(txt('#rcChipSeat')),
+      { no: txt('#rcChipNo'), seat: txt('#rcChipSeat') });
+    check('C) 按钮文案变为「再次点名」', txt('#rcStart') === '再次点名', txt('#rcStart'));
+    check('C) 提示显示本次课已点人数', /本次课已点到 1 人/.test(txt('#rcHint')), txt('#rcHint'));
+
+    // ---------- D) 再次点名（不重复）----------
+    const beforeCount = (await japi('/api/rollcall/records?classId=' + created.classId)).data.total;
+    await clickStart();
+    await until(async () => (await japi('/api/rollcall/records?classId=' + created.classId)).data.total === beforeCount + 1, 20000);
+    const secondName = txt('#rcName');
+    check('D) 再次点名抽到不同同学（不重复抽取生效）', NAMES.includes(secondName) && secondName !== firstName, { first: firstName, second: secondName });
+
+    // ---------- E) 点名记录表格 + 折叠 + 导出 ----------
+    check('E) 记录表头为 时间/学生姓名/学号/座位/学科/范围/操作人',
+      Qa('table.rc-table thead th').map((th) => th.textContent.trim()).join(',') === '时间,学生姓名,学号,座位,学科,范围,操作人',
+      Qa('table.rc-table thead th').map((th) => th.textContent.trim()));
+    check('E) 表头浅蓝色背景', css('table.rc-table thead th', 'backgroundColor') === 'rgb(234, 242, 255)', css('table.rc-table thead th', 'backgroundColor'));
+    const rows = Qa('#rcRecBody tr').filter((tr) => tr.querySelector('td'));
+    check('E) 记录列表含 2 条本次课的点名（7 列，含学科）', rows.length === 2 && rows.every((tr) => tr.children.length === 7), rows.length);
+    check('E) 记录行含 姓名/学号/范围/操作人',
+      rows.every((tr) => NAMES.some((n) => tr.textContent.includes(n)) && /RCU\d+/.test(tr.textContent) && /全班/.test(tr.textContent) && /大屏点名班长/.test(tr.textContent)),
+      rows.map((tr) => tr.textContent.replace(/\s+/g, ' ').trim()).slice(0, 2));
+    check('E) 记录条数提示（最近 N 条 / 共 M 条）', /最近 2 条 \/ 共 2 条/.test(txt('#rcRecCount')), txt('#rcRecCount'));
+    Q('#rcToggleRecords').click();
+    await sleep(200);
+    check('E) 点「折叠」后表格收起（按钮变「展开」）',
+      txt('#rcToggleRecords') === '展开' && css('#rcTableWrap', 'display') === 'none', { btn: txt('#rcToggleRecords'), disp: css('#rcTableWrap', 'display') });
+    Q('#rcToggleRecords').click();
+    await sleep(200);
+    check('E) 再点「展开」表格恢复', css('#rcTableWrap', 'display') !== 'none');
+    const exp = await fetch('/api/rollcall/records/export?classId=' + created.classId, { credentials: 'same-origin' });
+    check('E) 导出接口返回 xlsx（页面「导出 Excel」按钮调用它）',
+      exp.status === 200 && (exp.headers.get('content-type') || '').includes('spreadsheet'), exp.status);
+
+    // ---------- F) 全班点完 → 提示重置 ----------
+    const third = NAMES.find((n) => n !== firstName && n !== secondName);
+    await clickStart();
+    await until(() => txt('#rcName') === third, 20000);
+    check('F) 第 3 次点到剩下的那名同学', txt('#rcName') === third, txt('#rcName'));
+    await clickStart();
+    const modalShown = await until(() => !Q('#rcModal').classList.contains('hidden') && /重置/.test(txt('#rcModalText')), 30000);
+    check('F) 全班点完后弹出「本次课所有学生已点过，是否重置？」',
+      modalShown && /本次课所有学生已点过/.test(txt('#rcModalTitle')), { title: txt('#rcModalTitle'), text: txt('#rcModalText'), shown: modalShown });
+    Q('#rcModalOk').click();
+    const resetOk = await until(() => /本次课已点到 1 人/.test(txt('#rcHint')), 30000);
+    check('F) 点「重置」后自动重新抽取（本次课已点名单重置为 1 人）', resetOk, txt('#rcHint'));
+    check('F) 重置后弹窗关闭', Q('#rcModal').classList.contains('hidden'));
+    check('F) 重置后姓名显示为一名在读学生', NAMES.includes(txt('#rcName')), txt('#rcName'));
+
+    // ---------- G) 学生端不可访问 ----------
+    await loginAs(STU);
+    const stuPage = await fetch('/random-call', { credentials: 'same-origin', redirect: 'manual' });
+    check('G) 学生访问 /random-call 被重定向（看不到点名页）', stuPage.status === 302 || stuPage.type === 'opaqueredirect', stuPage.status);
+
+    // ---------- 清理 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    for (const id of created.studentIds) await japi('/api/students/' + id, { method: 'DELETE' });
+    for (const id of created.userIds) await japi('/api/users/' + id, { method: 'DELETE' });
+    const delClass = await japi('/api/classes/' + created.classId, { method: 'DELETE' });
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    check('清理：临时班级已删除（点名记录级联清理）', delClass.status < 300, delClass.data);
+    const leftRecs = (await japi('/api/rollcall/records?classId=' + created.classId)).data;
+    check('清理：该班级点名记录已不存在', leftRecs && (leftRecs.error || (leftRecs.records || []).length === 0), leftRecs && leftRecs.error);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

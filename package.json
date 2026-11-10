@@ -1,0 +1,16 @@
+{
+  "name": "attendance-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "武汉一中管理平台 - Zeabur 部署入口（根目录）",
+  "workspaces": [
+    "server"
+  ],
+  "scripts": {
+    "start": "node server/src/index.js",
+    "dev": "node --watch server/src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

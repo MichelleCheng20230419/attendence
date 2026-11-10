@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：巡查面板（数据统计 → 📊 巡查面板）
+  验证点：
+    □ 巡查面板可访问（小组成员 200；无小组教师 302 回签到台；非管理员看不到导航入口）
+    □ 导航在「数据统计」下拉里（作业统计/课堂表现/考勤分析 之后），仅小组授权可见
+    □ 统计卡片显示正确（问题总数/已解决/处理中/待处理 + 解决率）
+    □ 班级排行按问题数排序（默认从少到多；点表头可切换升降序；解决率排序）
+    □ 趋势图正常显示（折线：按周，点数与后端一致）
+    □ 类型分布饼图正常显示（标签含类型与百分比）
+    □ 筛选（时间范围/年级）与导出功能正常（导出 URL 带当前筛选、返回 xlsx）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_inspection_panel.html public/_ui_inspection_panel.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiPanel --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_inspection_panel.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_inspection_panel.html
+    4) 夹具问题（巡堂问题没有删除接口）由运行方按输出行 ISSUES=<id,...> 清理：
+       DELETE FROM inspection_issues WHERE id IN (<ISSUES>);  ← 反馈行随外键级联删除
+       现成脚本：db/cleanup_ui_fixtures_and_verify.sql（按 [面板UI用例 前缀清理并核对基线）
+  夹具：临时年级 + 2 班 + 2 教师（1 个在巡堂组、1 个无小组）+ 1 小组 + 6 条问题
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>巡查面板</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr" style="width:1500px;height:1200px"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(p, { method = 'GET', body } = {}) {
+  const res = await fetch(p, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const csEl = (e, p) => (e ? W().getComputedStyle(e).getPropertyValue(p).trim() : null);
+const px = (v) => parseFloat(v) || 0;
+const rect = (e) => e.getBoundingClientRect();
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#navbarMenus') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 25000);
+  await sleep(1000);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+}
+const topMenus = () => Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item').filter((b) => visible('#' + b.id)).map((b) => b.id);
+const itemsOf = (menuId) => Qa('#' + menuId + ' .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+const rankRows = () => Qa('#rankBody tr').map((tr) => [...tr.children].map((td) => td.textContent.trim()));
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '面板UI年级' + stamp, CLASS_A = '面板UI甲班' + stamp, CLASS_B = '面板UI乙班' + stamp;
+const T1 = 'pn_tea_' + stamp, T2 = 'pn_tea2_' + stamp, G1 = '面板UI组' + stamp;
+const created = { gradeId: null, classIds: [], userIds: [], groupId: null, issueIds: [] };
+let realBefore = null;
+
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+function pngBlob() {
+  const bin = atob(PNG_B64); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: 'image/png' });
+}
+function isoDaysAgo(n) {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - n);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+async function createIssue({ desc, classId, category = 'hygiene', priority = 'normal', date }) {
+  const fd = new FormData();
+  fd.append('description', desc);
+  if (classId) fd.append('classId', String(classId));
+  fd.append('category', category);
+  fd.append('priority', priority);
+  if (date) fd.append('issueDate', date);
+  const res = await fetch('/api/inspection/issues', { method: 'POST', body: fd, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+async function snapshot() {
+  const u = (await japi('/api/users')).data, g = (await japi('/api/groups')).data, c = (await japi('/api/classes')).data;
+  return { users: ((u && u.users) || []).length, groups: ((g && g.groups) || []).length, classes: ((c && c.classes) || []).length };
+}
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const g of ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('面板UI组' + stamp + '$').test(x.name))) {
+    await japi('/api/groups/' + g.id, { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^pn_tea/.test(x.username) && x.username.endsWith(stamp))) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^面板UI[甲乙]班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^面板UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshot();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'PN', academicYear: year } })).data.id;
+    for (const name of [CLASS_A, CLASS_B]) {
+      created.classIds.push((await japi('/api/classes', { method: 'POST', body: { className: name, gradeName: GRADE, academicYear: year } })).data.id);
+    }
+    const mkTeacher = async (u, clsIdx) => {
+      const classId = created.classIds[clsIdx];
+      const r = await japi('/api/users', {
+        method: 'POST',
+        body: {
+          username: u, password: '123456', role: 'teacher', realName: u, classId,
+          mustChangePassword: false, profileLocked: true, subject: '数学',
+          teachingClasses: [{ classId, roleInClass: 'subject_teacher' }],
+        },
+      });
+      if (r.status !== 201) log('  · 创建账号失败 ' + u + ' ' + JSON.stringify(r.data));
+      created.userIds.push(r.data.user.id);
+      return r.data.user.id;
+    };
+    const id1 = await mkTeacher(T1, 0);
+    await mkTeacher(T2, 1);
+    const g = await japi('/api/groups', {
+      method: 'POST',
+      body: { name: G1, description: '巡查面板 UI 用例', permissions: { pages: ['inspection'], actions: ['view', 'create_issue', 'add_feedback', 'upload_photo'] } },
+    });
+    created.groupId = g.data.group.id;
+    await japi('/api/groups/' + created.groupId + '/members', { method: 'PUT', body: { userIds: [id1] } });
+    await asUser(T1);
+    const mk = async (o) => { const r = await createIssue(o); if (r.status !== 201) throw new Error(JSON.stringify(r.data)); created.issueIds.push(r.data.issue.id); return r.data.issue.id; };
+    const a1 = await mk({ desc: '[面板UI用例' + stamp + '] 甲班问题1', classId: created.classIds[0], category: 'hygiene', date: isoDaysAgo(2) });
+    const a2 = await mk({ desc: '[面板UI用例' + stamp + '] 甲班问题2', classId: created.classIds[0], category: 'discipline', date: isoDaysAgo(1) });
+    const a3 = await mk({ desc: '[面板UI用例' + stamp + '] 甲班问题3', classId: created.classIds[0], category: 'equipment', date: isoDaysAgo(1) });
+    const b1 = await mk({ desc: '[面板UI用例' + stamp + '] 乙班问题1', classId: created.classIds[1], category: 'hygiene', date: isoDaysAgo(1) });
+    const fb = async (id, st) => { await japi('/api/inspection/issues/' + id + '/feedbacks', { method: 'POST', body: { feedbackStatus: st, solution: '面板用例反馈' } }); };
+    await fb(a1, 'resolved');    // 甲 已解决
+    await fb(a2, 'resolved');    // 甲 已解决
+    await fb(b1, 'resolved');    // 乙 已解决
+    // a3 待处理
+    const ov = await japi('/api/inspection/stats/overview?range=all&gradeId=' + created.gradeId);
+    check('0) 夹具就绪（2 班 4 条问题：3 已解决 / 1 待处理）',
+      ov.status === 200 && ov.data.total === 4 && ov.data.resolved === 3 && ov.data.pending === 1,
+      ov.data);
+    const EXP = { total: ov.data.total, resolved: ov.data.resolved, processing: ov.data.processing, pending: ov.data.pending };
+
+    // ---------- A) 导航入口与页面可访问 ----------
+    log('\n— A) 入口与访问 —');
+    await asUser(T1);
+    await loadPage('/dashboard');
+    check('A) 小组成员：数据统计下拉含「📊 巡查面板」（排在考勤分析之后）',
+      JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis', 'btnInspectionPanel']),   // 作业统计已提到顶层
+      itemsOf('navStatsMenu'));
+    check('A) 小组成员：一级菜单含「数据统计」', topMenus().indexOf('navStats') >= 0, topMenus());
+    Q('#navStats').click();
+    await sleep(250);
+    Q('#btnInspectionPanel').click();
+    const onPanel = await until(() => W().location.pathname === '/inspection/panel', 15000);
+    check('A) 点「巡查面板」→ 打开 /inspection/panel', onPanel, W().location.pathname);
+    await until(() => Q('#rankBody') && Qa('#rankBody tr').length > 0 && visible('#scTotal'), 20000);
+    await sleep(900);
+    check('A) 页面为统一卡片 + 统一页头（返回签到 / 标题居中 / 导出按钮）',
+      !!Q('.container > .page-card') && /返回签到/.test(txt('#btnBack')) && /巡查面板/.test(txt('.page-title')) && /导出/.test(txt('#btnExport')));
+
+    await asUser(T2);
+    await loadPage('/dashboard');
+    check('A) 无小组教师：数据统计下拉**不含**「巡查面板」',
+      itemsOf('navStatsMenu').indexOf('btnInspectionPanel') < 0, itemsOf('navStatsMenu'));
+    const r2 = await fetch('/inspection/panel', { credentials: 'same-origin', redirect: 'follow' });
+    check('A) 无小组教师直接访问 /inspection/panel → 落到签到台',
+      new URL(r2.url).pathname === '/dashboard', new URL(r2.url).pathname);
+
+    await asUser(T1);
+    await loadPage('/inspection/panel', '#rankBody');
+    await until(() => Qa('#rankBody tr').length > 0, 20000);
+    await sleep(900);
+
+    // ---------- B) 统计卡片 ----------
+    log('\n— B) 统计卡片 —');
+    check('B) 4 张统计卡片（问题总数/已解决/处理中/待处理）',
+      Qa('.stat-card').length === 4 &&
+      JSON.stringify(Qa('.stat-card .sc-label').map((e) => e.textContent.trim())) === JSON.stringify(['问题总数', '已解决', '处理中', '待处理']),
+      Qa('.stat-card .sc-label').map((e) => e.textContent.trim()));
+    // 默认本月（未筛年级）→ 与后端同口径对比（含真实数据里本月的记录）
+    const ovMonth = await japi('/api/inspection/stats/overview?range=month');
+    const expect = ovMonth.data;
+    check(`B) 卡片数值与后端一致（本月：总 ${expect.total} / 已解决 ${expect.resolved} / 处理中 ${expect.processing} / 待处理 ${expect.pending}）`,
+      Number(txt('#scTotal')) === expect.total && Number(txt('#scResolved')) === expect.resolved &&
+      Number(txt('#scProcessing')) === expect.processing && Number(txt('#scPending')) === expect.pending,
+      { ui: [txt('#scTotal'), txt('#scResolved'), txt('#scProcessing'), txt('#scPending')] });
+    check('B) 夹具 4 条问题都计入本月（本月 ≥ 4）', expect.total >= 4, expect.total);
+    check('B) 卡片补充信息：涉及班级数 + 解决率',
+      /涉及 \d+ 个班级/.test(txt('#scTotalSub')) && /解决率 [\d.]+%/.test(txt('#scResolvedSub')),
+      { a: txt('#scTotalSub'), b: txt('#scResolvedSub') });
+    check('B) 卡片配色规范（已解决=绿 / 处理中=橙 / 待处理=红）',
+      csEl(Q('.stat-card.resolved .sc-value'), 'color') === 'rgb(35, 120, 4)' &&
+      csEl(Q('.stat-card.processing .sc-value'), 'color') === 'rgb(173, 104, 0)' &&
+      csEl(Q('.stat-card.pending .sc-value'), 'color') === 'rgb(207, 19, 34)',
+      { r: csEl(Q('.stat-card.resolved .sc-value'), 'color'), p: csEl(Q('.stat-card.processing .sc-value'), 'color'), w: csEl(Q('.stat-card.pending .sc-value'), 'color') });
+
+    // ---------- C) 班级排行 ----------
+    log('\n— C) 班级排行 —');
+    check('C) 表头 6 列（排名/班级/问题数/已解决/待处理/解决率）',
+      JSON.stringify(Qa('.rank-table thead th').map((t) => t.textContent.replace(/[▲▼\s]/g, '').trim())) ===
+      JSON.stringify(['排名', '班级', '问题数', '已解决', '待处理', '解决率']),
+      Qa('.rank-table thead th').map((t) => t.textContent.trim()));
+    // 切到"全部"时间范围并筛本夹具年级，得到 2 行（甲 3 / 乙 1）
+    Q('#pRange').value = 'all';
+    Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await sleep(300);
+    Q('#pGrade').value = String(created.gradeId);
+    Q('#pGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#rankBody tr').length === 2, 15000);
+    await sleep(400);
+    let rows = rankRows();
+    check('C) 默认按问题数从少到多（乙班 1 条在前、甲班 3 条在后）',
+      rows.length === 2 && Number(rows[0][2]) <= Number(rows[1][2]) && rows[0][1] === CLASS_B && rows[1][1] === CLASS_A,
+      rows);
+    check('C) 甲班行：问题数 3 / 已解决 2 / 待处理 1 / 解决率 66.7%',
+      rows[1][2] === '3' && rows[1][3] === '2' && rows[1][4] === '1' && rows[1][5] === '66.7%', rows[1]);
+    check('C) 排名列为 1、2', rows[0][0] === '1' && rows[1][0] === '2', rows.map((r) => r[0]));
+    // 点「问题数」表头 → desc（从多到少）
+    const thTotal = Q('.rank-table th[data-sort="total"]');
+    thTotal.click();
+    await until(() => Number(rankRows()[0][2]) >= Number(rankRows()[1][2]), 12000);
+    rows = rankRows();
+    check('C) 点「问题数」表头 → 从多到少（甲班在前）', Number(rows[0][2]) >= Number(rows[1][2]) && rows[0][1] === CLASS_A, rows);
+    check('C) 排序箭头显示在「问题数」列（▼）', /▼/.test(txt('.rank-table th[data-sort="total"]')), txt('.rank-table th[data-sort="total"]'));
+    thTotal.click();
+    await until(() => Number(rankRows()[0][2]) <= Number(rankRows()[1][2]), 12000);
+    check('C) 再点一次 → 升序（从少到多）', Number(rankRows()[0][2]) <= Number(rankRows()[1][2]) && /▲/.test(txt('.rank-table th[data-sort="total"]')), txt('.rank-table th[data-sort="total"]'));
+    // 点「解决率」→ desc
+    Q('.rank-table th[data-sort="rate"]').click();
+    await until(() => parseFloat(rankRows()[0][5]) >= parseFloat(rankRows()[1][5]), 12000);
+    rows = rankRows();
+    check('C) 点「解决率」表头 → 按解决率降序（乙班 100% 在前）', parseFloat(rows[0][5]) >= parseFloat(rows[1][5]) && rows[0][1] === CLASS_B, rows);
+    check('C) 排行表格内不再出现"未指定班级"（已按年级筛选）', rows.every((r) => r[1] !== '未指定班级'), rows.map((r) => r[1]));
+
+    // ---------- D) 趋势折线图 ----------
+    log('\n— D) 趋势图 —');
+    const trend = W().__panel.charts().trend;
+    const pts = W().__panel.trendPoints();
+    check('D) 趋势图为折线图（line）且已渲染数据点', !!trend && trend.config.type === 'line' && pts.length > 0, { type: trend && trend.config.type, points: pts.length });
+    check('D) 横轴为周次标签（MM/DD）、纵轴为问题数',
+      trend.data.labels.length === pts.length && trend.data.datasets[0].data.length === pts.length &&
+      trend.options.scales.x.title.text === '周次' && trend.options.scales.y.title.text === '问题数',
+      { labels: trend.data.labels, titles: [trend.options.scales.x.title.text, trend.options.scales.y.title.text] });
+    check('D) 折线数据与后端返回的每周数量一致',
+      JSON.stringify(trend.data.datasets[0].data) === JSON.stringify(pts.map((p) => p.total)),
+      { chart: trend.data.datasets[0].data, api: pts.map((p) => p.total) });
+    check('D) 含"已解决"对比折线', trend.data.datasets.length === 2 && trend.data.datasets[1].label === '已解决', trend.data.datasets.map((d) => d.label));
+    check('D) 画布可见且尺寸正常（未折叠/未溢出）',
+      visible('#trendChart') && rect(Q('#trendChart')).width > 200 && rect(Q('#trendChart')).height > 150,
+      { w: Math.round(rect(Q('#trendChart')).width), h: Math.round(rect(Q('#trendChart')).height) });
+
+    // ---------- E) 类型分布饼图 ----------
+    log('\n— E) 类型分布 —');
+    const typeChart = W().__panel.charts().type;
+    const items = W().__panel.typeItems();
+    const nonZero = items.filter((i) => i.count > 0);
+    check('E) 类型分布为环形/饼图且已渲染', !!typeChart && /doughnut|pie/.test(typeChart.config.type) && nonZero.length > 0, { type: typeChart && typeChart.config.type });
+    check('E) 图例标签含类型名与百分比（卫生/纪律/设备）',
+      nonZero.every((i) => new RegExp(i.label).test(typeChart.data.labels.join('|'))) && /%/.test(typeChart.data.labels.join('|')),
+      typeChart.data.labels);
+    check('E) 饼图数据与后端类型统计一致',
+      JSON.stringify(typeChart.data.datasets[0].data) === JSON.stringify(nonZero.map((i) => i.count)),
+      { chart: typeChart.data.datasets[0].data, api: nonZero.map((i) => i.count) });
+    check('E) 饼图（含图例）可见', visible('#typeChart'), { w: Math.round(rect(Q('#typeChart')).width) });
+
+    // ---------- F) 筛选与导出 ----------
+    log('\n— F) 筛选与导出 —');
+    check('F) 时间快捷项 = 本周/本月/本学期/全部/自定义',
+      JSON.stringify(Qa('#pRange option').map((o) => o.textContent.trim())) === JSON.stringify(['本周', '本月', '本学期', '全部', '自定义']),
+      Qa('#pRange option').map((o) => o.textContent.trim()));
+    check('F) 年级下拉含夹具年级', Qa('#pGrade option').some((o) => o.textContent.trim() === GRADE), Qa('#pGrade option').map((o) => o.textContent.trim()));
+    check('F) 筛选说明显示当前范围与年级', new RegExp(GRADE).test(txt('#filterNote')), txt('#filterNote'));
+    // 本周：夹具问题都是最近 2 天 → 只要不是周一，本周数量 ≤ 全部
+    Q('#pRange').value = 'week';
+    Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await sleep(500);
+    await until(() => !hidden('#rankBody') || Qa('#rankBody tr').length >= 0, 8000);
+    const ovWeek = await japi('/api/inspection/stats/overview?range=week&gradeId=' + created.gradeId);
+    check(`F) 切到「本周」→ 卡片数值随之更新（本周 ${ovWeek.data.total} 条）`,
+      Number(txt('#scTotal')) === ovWeek.data.total, { ui: txt('#scTotal'), api: ovWeek.data.total });
+    // 自定义时间：昨天~今天（含 3 条最近的问题）
+    Q('#pRange').value = 'custom';
+    Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await sleep(300);
+    Q('#pStart').value = isoDaysAgo(1);
+    Q('#pEnd').value = isoDaysAgo(0);
+    Q('#btnApply').click();
+    const ovCustom = await japi('/api/inspection/stats/overview?range=custom&startDate=' + isoDaysAgo(1) + '&endDate=' + isoDaysAgo(0) + '&gradeId=' + created.gradeId);
+    await until(() => Number(txt('#scTotal')) === ovCustom.data.total, 12000);
+    check(`F) 自定义时间（昨天~今天）→ 卡片 = ${ovCustom.data.total} 条`,
+      Number(txt('#scTotal')) === ovCustom.data.total, { ui: txt('#scTotal'), api: ovCustom.data.total });
+    check('F) 自定义时间出现日期输入框', visible('#pStart') && visible('#pEnd'));
+    // 导出：URL 带当前筛选；直接请求该 URL 校验 xlsx
+    const url = W().__panel.exportUrl();
+    check('F) 导出 URL 携带当前筛选参数（range/startDate/endDate/gradeId）',
+      /stats\/export\?/.test(url) && url.indexOf('range=custom') >= 0 && url.indexOf('gradeId=' + created.gradeId) >= 0 && url.indexOf('startDate=') >= 0,
+      url);
+    const res = await fetch(url, { credentials: 'same-origin' });
+    const buf = await res.arrayBuffer();
+    check('F) 导出返回 xlsx 文件（Content-Type 正确且非空）',
+      res.status === 200 && /spreadsheetml\.sheet/.test(res.headers.get('content-type') || '') && buf.byteLength > 2048,
+      { status: res.status, ct: res.headers.get('content-type'), size: buf.byteLength });
+    check('F) 导出按钮存在且可点（主按钮）', !!Q('#btnExport') && !Q('#btnExport').disabled);
+
+    // ---------- G) 布局 ----------
+    log('\n— G) 布局 —');
+    check('G) 统计卡片 4 列等宽', (() => {
+      const ws = Qa('.stat-card').map((c) => Math.round(rect(c).width));
+      return new Set(ws).size === 1 && ws[0] > 150;
+    })(), Qa('.stat-card').map((c) => Math.round(rect(c).width)));
+    check('G) 页面无横向溢出', (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })());
+    check('G) 两个图表卡片并排（趋势图更宽）', (() => {
+      const cards = Qa('.chart-card');
+      if (cards.length !== 2) return false;
+      const [a, b] = cards.map((c) => rect(c));
+      return Math.abs(a.top - b.top) <= 2 && a.width > b.width && a.right <= b.left + 1;
+    })(), Qa('.chart-card').map((c) => Math.round(rect(c).width)));
+    check('G) 各区块与页面卡片内边距一致（内容不贴边）', (() => {
+      const pc = Q('.container > .page-card');
+      const pad = px(csEl(pc, 'padding-left'));
+      const inner = rect(pc).left + pad;
+      return Math.abs(rect(Q('.stat-grid')).left - inner) <= 2 && csEl(pc, 'padding') === '24px';
+    })());
+
+    // ---------- 清理 ----------
+    log('\n— 清理 —');
+    await asUser('admin');
+    await hardCleanup();
+    const leftGroups = ((await japi('/api/groups')).data.groups || []).filter((g) => new RegExp('面板UI组' + stamp + '$').test(g.name));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^pn_tea/.test(u.username) && u.username.endsWith(stamp));
+    check('清理：夹具小组/账号已删除', leftGroups.length === 0 && leftUsers.length === 0, { g: leftGroups.length, u: leftUsers.length });
+    const after = await snapshot();
+    check('清理：真实用户/小组/班级数量未变', JSON.stringify(realBefore) === JSON.stringify(after), { before: realBefore, after });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  log('ISSUES=' + created.issueIds.join(','));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

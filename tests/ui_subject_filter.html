@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：作业管理「学科筛选」的角色规则
+  规则（v3.14.0 起）：
+    · 纯任课老师（无班主任班级）→ 锁定个人中心绑定学科（只读）
+    · 班主任 → 不锁定，默认「全部」（否则看不到当天自动发布的各科「每日作业」）
+    · 未绑定学科的老师 → 不锁定，引导去个人中心绑定
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_subject_filter.html public/_ui_subject_filter.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiSF --virtual-time-budget=60000 --dump-dom `
+         "http://localhost:3000/_ui_subject_filter.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_subject_filter.html
+  说明：脚本创建临时年级/班级/3 名教师（班主任·物理 / 任课·物理 / 未绑定），验证后自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1100px; height: 640px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>作业管理：学科筛选角色规则（任课老师锁定 / 班主任不锁定）</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+// 该页面本次加载实际发起过的请求（等价于 F12 Network 面板）
+const requests = () => { try { return fr.contentWindow.performance.getEntriesByType('resource').map((e) => e.name); } catch (_) { return []; } };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '筛选UI年级' + stamp, C_HEAD = '筛选UI班主任班' + stamp, C_SUBJ = '筛选UI任课班' + stamp;
+const T_HEAD = 'sfui_head_' + stamp, T_SUBJ = 'sfui_subj_' + stamp, T_NONE = 'sfui_none_' + stamp;
+const created = { gradeId: null, classIds: [], userIds: [] };
+
+async function loginAs(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+async function loadPage() {
+  fr.src = 'about:blank'; await sleep(120);
+  fr.src = '/homework-manage';
+  await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' && Q('#fSubject'), 18000);
+  await until(() => Qa('#fSubject option').length > 0, 10000);
+  await sleep(700);
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'SFU', academicYear: year } })).data.id;
+    const ch = (await japi('/api/classes', { method: 'POST', body: { className: C_HEAD, gradeName: GRADE, academicYear: year } })).data.id;
+    const cs = (await japi('/api/classes', { method: 'POST', body: { className: C_SUBJ, gradeName: GRADE, academicYear: year } })).data.id;
+    created.classIds = [ch, cs];
+    // 与真实账号同构：班主任（物理）+ 1 个任课班
+    let r = await japi('/api/users', { method: 'POST', body: { username: T_HEAD, password: '123456', role: 'teacher', realName: 'UI班主任', subject: '物理', teachingClasses: [{ classId: ch, roleInClass: 'head_teacher' }, { classId: cs, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: T_SUBJ, password: '123456', role: 'teacher', realName: 'UI任课', subject: '物理', teachingClasses: [{ classId: cs, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: T_NONE, password: '123456', role: 'teacher', realName: 'UI未绑定', teachingClasses: [{ classId: cs, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    check('0) 夹具就绪（班主任·物理 / 任课·物理 / 未绑定）', created.userIds.length === 3);
+
+    // ---------- A) 班主任：不锁定学科（原 BUG 场景的另一面）----------
+    // 规则（v3.14.0 起）：纯任课老师锁定自己的学科；班主任/管理员不锁定，
+    // 否则班主任只能看到自己任教的 1 科，看不到当天自动发布的其余各科「每日作业」。
+    await loginAs(T_HEAD);
+    await loadPage();
+    check('A) 页面加载时确实请求了 GET /api/teacher/subject',
+      requests().some((u) => u.includes('/api/teacher/subject')), requests().filter((u) => u.includes('/api/teacher')).slice(0, 4));
+    check('A) 页面也请求了 GET /api/teacher/classes',
+      requests().some((u) => u.includes('/api/teacher/classes')));
+    let sub = Q('#fSubject');
+    check('A) 班主任：学科筛选默认为「全部」（不再锁定为绑定学科「物理」）', sub.value === '',
+      { value: sub.value, options: Qa('#fSubject option').map((o, i) => (i === 0 ? '（全部）' : o.value)) });
+    check('A) 班主任：学科筛选可编辑（disabled=false）且包含全部科目选项',
+      sub.disabled === false && Qa('#fSubject option').length >= 10,
+      { disabled: sub.disabled, options: Qa('#fSubject option').length });
+    check('A) 悬停提示说明班主任可查看本班全部科目',
+      /班主任/.test(sub.title || '') && /全部科目|所有科目/.test(sub.title || ''), sub.title);
+    check('A) 顶部无"未绑定"警告', Q('#teachHint').classList.contains('hidden'));
+    // 默认「全部」时不得带 subject=物理，否则班主任看不到当天的其他科目
+    check('A) 默认视图请求不含 subject=物理（不会被锁到单一学科）',
+      !requests().some((u) => /subject=/.test(u) && /%E7%89%A9%E7%90%86|物理/.test(u)),
+      requests().filter((u) => /subject=/.test(u)).slice(0, 4));
+    // 主动选一科后，筛选必须真的生效（发往服务端的请求带 subject）
+    const sel = Q('#fSubject');
+    sel.value = '语文';
+    sel.dispatchEvent(new (fr.contentWindow.Event)('change', { bubbles: true }));
+    const okFilter = await until(() => requests().some((u) => /subject=/.test(u) && /%E8%AF%AD%E6%96%87|语文/.test(u)), 12000);
+    check('A) 班主任手动选「语文」后，列表请求带 subject=语文（筛选生效）', okFilter,
+      requests().filter((u) => /subject=/.test(u)).slice(0, 4));
+    // 刷新页面后仍然回到「全部」且可编辑
+    await loadPage();
+    sub = Q('#fSubject');
+    check('A) 刷新页面后仍为「全部」且可编辑', sub.value === '' && sub.disabled === false,
+      { value: sub.value, disabled: sub.disabled });
+
+    // ---------- B) 纯任课老师（回归）----------
+    await loginAs(T_SUBJ);
+    await loadPage();
+    check('B) 纯任课老师：筛选同样为「物理」且只读',
+      Q('#fSubject').value === '物理' && Q('#fSubject').disabled === true,
+      { value: Q('#fSubject').value, disabled: Q('#fSubject').disabled });
+
+    // ---------- C) 未绑定学科的老师 ----------
+    await loginAs(T_NONE);
+    await loadPage();
+    check('C) 未绑定学科：筛选为「全部」（不锁定）', Q('#fSubject').value === '' && Q('#fSubject').disabled === false,
+      { value: Q('#fSubject').value, disabled: Q('#fSubject').disabled });
+    check('C) 顶部提示"请先到个人中心…绑定所教学科"',
+      /请先到.*个人中心/.test(txt('#teachHint')) && /所教学科/.test(txt('#teachHint')), txt('#teachHint'));
+    check('C) 列表区提示绑定所教学科',
+      /请先到.*个人中心/.test(txt('#taskBody')) && /绑定/.test(txt('#taskBody')), txt('#taskBody').slice(0, 90));
+
+    // ---------- D) 管理员不受限 ----------
+    await loginAs('admin');
+    await loadPage();
+    check('D) 管理员：筛选可编辑且含"全部"',
+      Q('#fSubject').disabled === false && Qa('#fSubject option')[0].value === '' && Qa('#fSubject option').length >= 10,
+      { disabled: Q('#fSubject').disabled, options: Qa('#fSubject option').length });
+
+    // ---------- 清理 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    for (const id of created.userIds) {
+      await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: id, classes: [] } });
+      await japi('/api/users/' + id, { method: 'DELETE' });
+    }
+    for (const id of created.classIds) await japi('/api/classes/' + id, { method: 'DELETE' });
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    const left = await japi('/api/users');
+    check('清理：临时教师已删除', !(left.data.users || []).some((u) => [T_HEAD, T_SUBJ, T_NONE].includes(u.username)));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

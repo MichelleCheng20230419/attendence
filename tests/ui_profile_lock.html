@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：教师教学设置「首次登录确认并锁定 → 之后只读」
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/ 目录：Copy-Item tests/ui_profile_lock.html public/_ui_profile_lock.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiLock --virtual-time-budget=40000 --dump-dom `
+         "http://localhost:3000/_ui_profile_lock.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_profile_lock.html
+  说明：脚本用管理员创建临时年级/班级/教师，走完"教师首次确认 → 只读 → 管理员修改 → 教师端更新"全流程，
+        结束时自动清理（异常中断时用 db/fix_and_clean_test_fixtures.sql 兜底清理）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1000px; height: 640px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>教师教学设置：首次确认锁定 → 只读 → 管理员修改后更新</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 12000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { if (await fn()) return true; } catch (_) {}
+    if (Date.now() - t0 > ms) return false;
+    await sleep(120);
+  }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (sel) => { const d = F(); return d ? d.querySelector(sel) : null; };
+const Qa = (sel) => { const d = F(); return d ? [...d.querySelectorAll(sel)] : []; };
+const click = (sel) => { const e = Q(sel); if (e) e.click(); return !!e; };
+const text = (sel) => { const e = Q(sel); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const visible = (sel) => {
+  const d = F(); const e = d && d.querySelector(sel);
+  if (!e) return false;
+  // 逐级检查祖先 display（父级 .hidden 会让子元素同样不可见）
+  let n = e;
+  while (n && n.nodeType === 1 && n !== d.body) {
+    if (fr.contentWindow.getComputedStyle(n).display === 'none') return false;
+    n = n.parentElement;
+  }
+  return true;
+};
+function setVal(sel, val) {
+  const d = F(); const e = d && d.querySelector(sel); if (!e) return false;
+  e.value = val;
+  e.dispatchEvent(new fr.contentWindow.Event('change', { bubbles: true }));
+  return true;
+}
+// 重新加载 iframe 到指定地址（同一地址需先置空，确保真正重载）
+async function load(url) {
+  fr.src = 'about:blank';
+  await sleep(120);
+  fr.src = url;
+  await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' &&
+    fr.contentWindow.location.pathname !== 'blank', 15000);
+}
+const pathOf = () => { try { return fr.contentWindow.location.pathname; } catch (_) { return '?'; } };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = 'UI锁定年级' + stamp;
+const CNAME = 'UI锁定班' + stamp;
+const USER = 'ui_lock_' + stamp;
+const created = { gradeId: null, classId: null, userId: null };
+
+async function loginAs(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  return r;
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具（临时年级/班级/教师）…';
+    let r = await loginAs('admin');
+    check('管理员登录成功', r.status === 200, r.data);
+    const year = (await japi('/api/classes')).data.currentAcademicYear || '2025-2026';
+    const g = await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'UIL' + stamp, academicYear: year } });
+    created.gradeId = g.data && g.data.id;
+    const c = await japi('/api/classes', { method: 'POST', body: { className: CNAME, gradeName: GRADE, academicYear: year } });
+    created.classId = c.data && c.data.id;
+    const t = await japi('/api/users', {
+      method: 'POST',
+      body: { username: USER, password: '123456', role: 'teacher', realName: '锁定测试教师', teachingClasses: [] },
+    });
+    created.userId = t.data && t.data.user && t.data.user.id;
+    check('新建教师账号（未锁定，待首次确认）',
+      t.status === 201 && t.data.user.profileLocked === false && !!created.classId, { t: t.status, pl: t.data.user && t.data.user.profileLocked });
+
+    // ---------- A) 首次登录：强制跳转教学设置，可编辑 ----------
+    r = await loginAs(USER);
+    check('教师首次登录成功且 needProfileSetup=true', r.status === 200 && r.data.needProfileSetup === true, r.data);
+    await load('/dashboard');
+    const jumped = await until(() => pathOf() === '/profile', 8000);
+    check('A) 进入 /dashboard 被强制跳转到个人中心（教学设置）', jumped, pathOf());
+    const ready = await until(() => visible('#teachCard'));
+    check('A) 教学设置区块显示', ready);
+    check('A) 显示"首次登录，请确认您的所教学科和所带班级"',
+      text('#teachSetupBox .teach-banner').indexOf('首次登录，请确认您的所教学科和所带班级') >= 0, text('#teachSetupBox .teach-banner'));
+    check('A) 首次模式：确认表单显示、只读区块隐藏', visible('#teachSetupBox') && !visible('#teachReadBox'));
+    check('A) 显示姓名 + 角色教师', text('#tSetupName') === '锁定测试教师' && text('#teachSetupBox').indexOf('教师') >= 0, text('#tSetupName'));
+    check('A) 锁定警示文案存在', text('#teachSetupBox .teach-warn').indexOf('确认后将锁定，如需修改请联系管理员') >= 0);
+    check('A) 按钮为「确认并锁定」', text('#tSave') === '确认并锁定', text('#tSave'));
+
+    // 未选学科直接确认 → 前端拦截
+    click('#tSave');
+    await until(() => text('#tMsg').indexOf('请先选择所教学科') >= 0, 3000);
+    check('A) 未选学科点确认 → 前端提示"请先选择所教学科"', text('#tMsg').indexOf('请先选择所教学科') >= 0, text('#tMsg'));
+
+    // 选学科 + 年级 + 班级
+    check('A) 所教学科下拉可选', setVal('#tSubject', '物理'));
+    setVal('#tGrade', GRADE);
+    await until(() => Qa('#tClasses .teach-class-cb').length > 0, 5000);
+    const boxes = Qa('#tClasses .teach-class-cb');
+    check('A) 年级筛选后出现临时班级（含"（任课老师）"标注）',
+      Qa('#tClasses .teach-class-item').some((n) => n.textContent.includes(CNAME) && n.textContent.includes('（任课老师）')),
+      Qa('#tClasses .teach-class-item').map((n) => n.textContent.trim()));
+    const target = boxes.find((cb) => {
+      const lab = cb.closest('.teach-class-item');
+      return lab && lab.textContent.includes(CNAME);
+    });
+    if (target) { target.checked = true; target.dispatchEvent(new fr.contentWindow.Event('change', { bubbles: true })); }
+    check('A) 勾选临时班级', !!(target && target.checked));
+
+    click('#tSave');
+    const backToDashboard = await until(() => pathOf() === '/dashboard', 12000);
+    check('A) 点「确认并锁定」→ 保存并跳转签到操作台 /dashboard', backToDashboard, pathOf());
+    const s1 = await japi('/api/teacher/settings');
+    check('A) 保存后服务端 profileLocked=true，学科=物理，班级为任课老师',
+      s1.data.profileLocked === true && s1.data.subject === '物理' && s1.data.classes.length === 1 &&
+      s1.data.classes[0].classId === created.classId && s1.data.classes[0].roleInClass === 'subject_teacher', s1.data);
+    check('A) 保存后 canEdit=false', s1.data.canEdit === false, s1.data.canEdit);
+
+    // ---------- B) 再次登录：教学设置只读 ----------
+    r = await loginAs(USER);
+    check('B) 再次登录不再要求首次确认（needProfileSetup=false）', r.data.needProfileSetup === false, r.data);
+    await load('/profile');
+    await until(() => visible('#teachCard'));
+    await until(() => visible('#teachReadBox'), 8000);
+    check('B) 只读区块显示、确认表单隐藏', visible('#teachReadBox') && !visible('#teachSetupBox'),
+      { read: visible('#teachReadBox'), setup: visible('#teachSetupBox') });
+    check('B) 所教学科显示为物理', text('#tReadSubject') === '物理', text('#tReadSubject'));
+    check('B) 所带班级显示"班级名（任课老师）"',
+      text('#tReadClasses').includes(CNAME) && text('#tReadClasses').includes('（任课老师）'), text('#tReadClasses'));
+    check('B) 显示提示"如需修改，请联系管理员"',
+      text('#teachReadBox .teach-lock-note').indexOf('如需修改，请联系管理员') >= 0, text('#teachReadBox .teach-lock-note'));
+    const setupDisplay = Q('#teachSetupBox') ? fr.contentWindow.getComputedStyle(Q('#teachSetupBox')).display : '?';
+    check('B) 只读模式下不可编辑：确认表单 display:none，只读区内无表单控件、无确认按钮',
+      setupDisplay === 'none' && Qa('#teachReadBox select, #teachReadBox input').length === 0 && !visible('#tSave'),
+      { display: setupDisplay, controls: Qa('#teachReadBox select, #teachReadBox input').length, saveBtn: visible('#tSave') });
+
+    // 直接调用接口修改 → 403（后端兜底）
+    const forbid = await japi('/api/teacher/classes', { method: 'PUT', body: { classIds: [] } });
+    check('B) 教师直接调用 PUT /api/teacher/classes → 403', forbid.status === 403, forbid.data);
+
+    // ---------- C) 管理员修改 → 教师端显示更新 ----------
+    await loginAs('admin');
+    const upd = await japi('/api/users/' + created.userId, {
+      method: 'PUT',
+      body: {
+        role: 'teacher', realName: '锁定测试教师', isActive: true, subject: '化学',
+        teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }],
+      },
+    });
+    check('C) 管理员修改学科=化学、带班角色=班主任 → 200', upd.status === 200 && upd.data.user.subject === '化学', upd.data && upd.data.user);
+    check('C) 管理员修改后仍保持锁定', upd.data.user.profileLocked === true, upd.data.user.profileLocked);
+    await loginAs(USER);
+    await load('/profile');
+    await until(() => visible('#teachReadBox'), 8000);
+    check('C) 教师端显示更新：学科=化学', text('#tReadSubject') === '化学', text('#tReadSubject'));
+    check('C) 教师端显示更新：班级角色=班主任',
+      text('#tReadClasses').includes(CNAME) && text('#tReadClasses').includes('（班主任）'), text('#tReadClasses'));
+
+    // ---------- D) 管理员重置为待确认 → 教师端恢复可编辑 ----------
+    await loginAs('admin');
+    const reset = await japi('/api/users/' + created.userId, {
+      method: 'PUT',
+      body: {
+        role: 'teacher', realName: '锁定测试教师', isActive: true, subject: '化学',
+        teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }],
+        resetProfileLock: true,
+      },
+    });
+    check('D) 管理员重置为待确认 → profileLocked=false', reset.status === 200 && reset.data.user.profileLocked === false, reset.data.user.profileLocked);
+    await loginAs(USER);
+    await load('/profile');
+    await until(() => visible('#teachSetupBox'), 8000);
+    check('D) 教师端恢复"首次确认"可编辑表单', visible('#teachSetupBox') && !visible('#teachReadBox'),
+      { setup: visible('#teachSetupBox'), read: visible('#teachReadBox') });
+    check('D) 表单回显已保存的学科=化学', (Q('#tSubject') || {}).value === '化学', (Q('#tSubject') || {}).value);
+
+    // ---------- 清理 ----------
+    await loginAs('admin');
+    const clr = await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: created.userId, classes: [] } });
+    const del = await japi('/api/users/' + created.userId, { method: 'DELETE' });
+    check('清理：删除临时教师账号', clr.status === 200 && del.status === 200, { clr: clr.status, del: del.status });
+    if (created.classId) {
+      const rc = await japi('/api/classes/' + created.classId, { method: 'DELETE' });
+      if (rc.status >= 300) log('    · 删除班级失败：' + JSON.stringify(rc.data));
+    }
+    if (created.gradeId) {
+      const rg = await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+      if (rg.status >= 300) log('    · 删除年级失败：' + JSON.stringify(rg.data));
+    }
+    const left = await japi('/api/users');
+    check('清理：临时账号已不存在', !(left.data.users || []).some((x) => x.username === USER));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

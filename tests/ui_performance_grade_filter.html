@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：课堂表现页「年级 → 班级」联动筛选
+    ① 筛选栏出现「年级」下拉，默认「全部年级」；班级默认「全部班级」
+    ② 年级下拉来自 GET /api/grades?academic_year=当前学年（只含可查看范围内的年级）
+    ③ 选年级后，班级下拉只显示该年级的班级（与 /api/classes?grade_id= 交叉核对）
+    ④ 年级 + 全部班级 → 点名记录只统计该年级（与接口 classIds=… 的 total 一致）
+    ⑤ 选具体班级 → 结果收敛到该班；换年级 → 班级下拉与结果整体切换
+    ⑥ 切回「全部年级 + 全部班级」→ 结果恢复为全部可查看范围
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_performance_grade_filter -AdminPw <管理员密码>
+  夹具：2 年级 + 3 班（甲1/甲2/乙1，各 2 名学生）+ 每班 1 条点名记录；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>课堂表现：年级 → 班级 联动筛选</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const fire = (el, type) => el.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+const gradeOpts = () => Qa('#pfGrade option').map((o) => o.textContent.trim());
+const classOpts = () => Qa('#pfClass option').map((o) => o.textContent.trim());
+const recTotal = () => { const m = txt('#pfRecCount').match(/共\s*(\d+)\s*条/); return m ? Number(m[1]) : -1; };
+function selectGradeByName(name) {
+  const o = Qa('#pfGrade option').find((x) => x.textContent.trim() === name);
+  if (!o) return false;
+  const el = Q('#pfGrade'); el.value = o.value; fire(el, 'change'); return true;
+}
+function selectClassByName(name) {
+  const o = Qa('#pfClass option').find((x) => x.textContent.trim().includes(name));
+  if (!o) return false;
+  const el = Q('#pfClass'); el.value = o.value; fire(el, 'change'); return true;
+}
+// 记录表里的班级列（第 6 列）
+const rowClasses = () => Qa('#pfRecBody tr').map((tr) => { const td = tr.querySelectorAll('td'); return td.length >= 6 ? td[5].textContent.trim() : ''; }).filter(Boolean);
+
+const stamp = Date.now().toString().slice(-6);
+const GA = '表现甲年级' + stamp, GB = '表现乙年级' + stamp;
+const CA1 = '表现甲1班' + stamp, CA2 = '表现甲2班' + stamp, CB1 = '表现乙1班' + stamp;
+const created = { gradeIds: [], classIds: [], studentIds: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const cls = (await japi('/api/classes?includeArchived=1')).data.classes || [];
+  for (const c of cls.filter((x) => /^表现[甲乙]/.test(x.className))) {
+    await japi('/api/rollcall/records?classId=' + c.id, { method: 'DELETE' }).catch(() => {});
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) {
+      await japi('/api/students/' + s.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^表现[甲乙]年级/.test(x.grade_name || x.gradeName || ''))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeIds.push((await japi('/api/grades', { method: 'POST', body: { gradeName: GA, gradeCode: 'PGR1', academicYear: year } })).data.id);
+    created.gradeIds.push((await japi('/api/grades', { method: 'POST', body: { gradeName: GB, gradeCode: 'PGR2', academicYear: year } })).data.id);
+    const mkClass = async (name, gradeName) => (await japi('/api/classes', { method: 'POST', body: { className: name, gradeName, academicYear: year } })).data.id;
+    const ca1 = await mkClass(CA1, GA), ca2 = await mkClass(CA2, GA), cb1 = await mkClass(CB1, GB);
+    created.classIds = [ca1, ca2, cb1];
+    const mkStu = async (classId, prefix) => {
+      for (let i = 1; i <= 2; i += 1) {
+        const r = await japi('/api/students', { method: 'POST', body: { studentNo: prefix + stamp + String(i).padStart(2, '0'), name: prefix + '同学' + i, classId, status: '在读' } });
+        if (r.data && r.data.student) created.studentIds.push(r.data.student.id);
+      }
+    };
+    await mkStu(ca1, 'PGRA'); await mkStu(ca2, 'PGRB'); await mkStu(cb1, 'PGRC');
+    // 每班 1 条点名记录（管理员带 classId 点名）
+    const picks = [];
+    picks.push(await japi('/api/rollcall/pick', { method: 'POST', body: { classId: ca1, subject: '数学' } }));
+    picks.push(await japi('/api/rollcall/pick', { method: 'POST', body: { classId: ca2, subject: '语文' } }));
+    picks.push(await japi('/api/rollcall/pick', { method: 'POST', body: { classId: cb1, subject: '英语' } }));
+    check('0) 夹具就绪（2 年级 + 3 班 + 6 学生 + 3 条点名记录）',
+      created.gradeIds.every(Boolean) && picks.every((x) => x.status === 201), picks.map((x) => x.status));
+
+    // ---------- 打开页面 ----------
+    fr.style.width = '1500px'; fr.style.height = '1100px';
+    fr.src = '/performance';
+    await until(() => F() && F().readyState === 'complete' && Q('#pfRecBody'), 25000);
+    await until(() => Qa('#pfGrade option').length > 1 && Qa('#pfClass option').length > 0 && recTotal() >= 0, 20000);
+    await sleep(900);
+
+    // ---------- ① 筛选栏结构 + 默认值 ----------
+    check('① 筛选栏出现「年级」下拉（#pfGrade）', !!Q('#pfGrade') && !!Q('#pfGrade').closest('label'));
+    check('① 年级下拉默认「全部年级」（选中值为空）',
+      gradeOpts()[0] === '全部年级' && Q('#pfGrade').value === '', { first: gradeOpts()[0], value: Q('#pfGrade').value });
+    check('① 班级下拉默认「全部班级」（选中值为空）',
+      /^全部班级/.test(classOpts()[0]) && Q('#pfClass').value === '', { first: classOpts()[0], value: Q('#pfClass').value });
+
+    // ---------- ② 年级来自 /api/grades?academic_year=当前学年 ----------
+    const gApi = (await japi('/api/grades?academic_year=' + encodeURIComponent(year))).data.grades || [];
+    const gApiNames = gApi.map((g) => g.grade_name);
+    check('② 年级下拉项 = GET /api/grades?academic_year=当前学年 的年级（外加「全部年级」）',
+      gradeOpts().length === gApiNames.length + 1 && gApiNames.every((n) => gradeOpts().includes(n)),
+      { ui: gradeOpts().length, api: gApiNames.length });
+    check('② 夹具两个年级都出现在年级下拉中', gradeOpts().includes(GA) && gradeOpts().includes(GB), gradeOpts().slice(0, 6));
+
+    const allRecs = (await japi('/api/performance/records')).data.total;
+    check('② 默认（全部年级 + 全部班级）记录总数与接口一致（' + allRecs + ' 条）', recTotal() === allRecs, { ui: recTotal(), api: allRecs });
+
+    // ---------- ③ 选年级 → 班级下拉只显示该年级班级 ----------
+    check('③ 选中年级「' + GA + '」', selectGradeByName(GA));
+    await until(() => classOpts().some((t) => t.includes(CA1)) && !classOpts().some((t) => t.includes(CB1)), 10000);
+    const clsA = classOpts();
+    check('③ 班级下拉只剩甲年级的 2 个班（乙年级班级消失）+ 全部班级',
+      clsA.length === 3 && /^全部班级/.test(clsA[0]) && clsA.some((t) => t.includes(CA1)) && clsA.some((t) => t.includes(CA2)) && !clsA.some((t) => t.includes(CB1)),
+      clsA);
+    const apiClsA = ((await japi('/api/classes?grade_id=' + created.gradeIds[0] + '&academic_year=' + encodeURIComponent(year))).data.classes || []).map((c) => c.className).sort();
+    const uiClsA = [CA1, CA2].filter((n) => clsA.some((t) => t.includes(n))).sort();
+    check('③ 与 GET /api/classes?grade_id=甲年级 的结果一致', JSON.stringify(apiClsA) === JSON.stringify(uiClsA), { api: apiClsA, ui: uiClsA });
+    check('③ 年级切换后班级选择回到「全部班级」', Q('#pfClass').value === '', Q('#pfClass').value);
+
+    // ---------- ④ 年级 + 全部班级 → 只统计该年级 ----------
+    const apiA = (await japi('/api/performance/records?classIds=' + ca1 + ',' + ca2)).data.total;
+    await until(() => recTotal() === apiA, 15000);
+    check('④ 年级=' + GA + ' + 全部班级 → 记录 ' + apiA + ' 条（仅甲年级），与接口 classIds 一致',
+      recTotal() === apiA && apiA === 2, { ui: recTotal(), api: apiA });
+    check('④ 明细表只含甲年级班级的记录',
+      rowClasses().length === 2 && rowClasses().every((n) => n === CA1 || n === CA2), rowClasses());
+
+    // ---------- ⑤ 选具体班级 / 换年级 ----------
+    check('⑤ 选具体班级「' + CA1 + '」', selectClassByName(CA1));
+    await until(() => recTotal() === 1, 15000);
+    check('⑤ 年级=甲 + 班级=甲1 → 1 条，明细只含甲1班',
+      recTotal() === 1 && rowClasses().length === 1 && rowClasses()[0] === CA1, { total: recTotal(), rows: rowClasses() });
+    check('⑤ 切到年级「' + GB + '」', selectGradeByName(GB));
+    await until(() => classOpts().some((t) => t.includes(CB1)) && !classOpts().some((t) => t.includes(CA1)), 10000);
+    const clsB = classOpts();
+    check('⑤ 乙年级：班级下拉只剩乙1班', clsB.length === 2 && /^全部班级/.test(clsB[0]) && clsB[1].includes(CB1), clsB);
+    await until(() => recTotal() === 1 && rowClasses()[0] === CB1, 15000);
+    check('⑤ 乙年级结果：1 条且明细为乙1班', recTotal() === 1 && rowClasses()[0] === CB1, { total: recTotal(), rows: rowClasses() });
+
+    // ---------- ⑥ 切回全部年级 + 全部班级 ----------
+    check('⑥ 切回「全部年级」', selectGradeByName('全部年级'));
+    await until(() => classOpts().some((t) => t.includes(CB1)) && classOpts().some((t) => t.includes(CA1)), 10000);
+    selectClassByName('全部班级');
+    await until(() => recTotal() === allRecs, 15000);
+    check('⑥ 全部年级 + 全部班级 → 记录总数恢复到 ' + allRecs + ' 条（与接口一致）',
+      recTotal() === allRecs, { ui: recTotal(), api: allRecs });
+    check('⑥ 学科下拉在「全部班级」下仍可选（管理员不受限）',
+      Qa('#pfSubject option').length >= 10 && Q('#pfSubject').disabled === false,
+      Qa('#pfSubject option').length);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^表现[甲乙]/.test(c.className));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^表现[甲乙]年级/.test(g.grade_name || ''));
+    const leftRecs = ((await japi('/api/performance/records')).data.records || []).filter((r) => /^表现[甲乙]/.test(r.className || ''));
+    check('清理：夹具年级/班级/学生/点名记录已清除',
+      leftCls.length === 0 && leftGrades.length === 0 && leftRecs.length === 0,
+      { classes: leftCls.length, grades: leftGrades.length, records: leftRecs.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

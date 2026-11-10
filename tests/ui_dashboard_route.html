@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：签到操作台 / 签到计划 的「刷新保持当前页面」
+    BUG：在签到操作台（首页）刷新后，偶尔会自动跳到「签到计划」页面
+    根因：两个视图在同一个页面里，切换视图只改内存、**不改 URL**；
+          从别处进入计划管理时 URL 带 ?view=plans，之后点「← 返回签到」回到操作台，
+          URL 里仍留着 view=plans → 一刷新就被 URL 带回计划管理页（所以"偶尔"出现）。
+    修复：URL 作为当前视图的唯一真源（切换视图 = 同步改写 URL；刷新按 URL 加载视图），
+          并给「签到计划」独立路径 /plans（可收藏、刷新稳定）。
+    验证点（对应需求验收清单）：
+      □ 在签到操作台刷新 → 仍然停留在签到操作台
+      □ 在签到计划页刷新   → 仍然停留在签到计划
+      □ 点「计划管理」才进入计划页；点「← 返回签到」回到操作台且 URL 一并回到 /dashboard
+      □ /plans 与 ?view=plans 都能直达计划页，刷新后仍在计划页
+      □ 登录后默认进入签到操作台（服务端 / 与 /index.html 都 302 到 /dashboard）
+      □ 浏览器「后退」按 URL 恢复视图（popstate），不会随机跳页
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_dashboard_route -AdminPw <管理员密码>
+  夹具：1 个临时年级/班级 + 教师/班长账号；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1400px; height: 1000px; }
+</style>
+</head>
+<body>
+<h3>签到操作台 / 签到计划：刷新后停留在当前页面</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { if (await fn()) return true; } catch (_) {}
+    if (Date.now() - t0 > ms) return false;
+    await sleep(150);
+  }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', redirect: 'manual',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data, location: res.headers.get('location') || '' };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+// 当前 iframe 内的实际地址（pushState/replaceState 之后同步更新）
+const frameUrl = () => { try { return F().location.pathname + F().location.search; } catch (_) { return ''; } };
+const onAttendance = () => !hidden('#viewAttendance') && hidden('#viewPlans');
+const onPlans = () => hidden('#viewAttendance') && !hidden('#viewPlans');
+
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(900);
+}
+// 模拟"浏览器刷新"（F5 的真实语义）：location.reload() 重新请求同一地址。
+//   注意：刷新前在老文档打一个标记，判定条件要求"新文档里没有该标记"，
+//   否则 until() 可能命中"刷新前的旧 DOM"而假通过。
+async function reloadExpect(pred, ms = 12000) {
+  const urlBefore = frameUrl();
+  try { W().__rtMark = 1; W().location.reload(); } catch (_) { fr.src = urlBefore; }
+  await sleep(500);
+  const ok = await until(() => { try { return !W().__rtMark && pred(); } catch (_) { return false; } }, ms);
+  return { ok, urlBefore, urlAfter: frameUrl() };
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '路由UI年级' + stamp;
+const CLASS = '路由UI班' + stamp;
+const TEA = 'rtu_tea_' + stamp, MON = 'rtu_mon_' + stamp;
+const created = { gradeId: null, classId: null, users: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^rtu_/.test(x.username))) {
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^路由UI班/.test(x.className))) {
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^路由UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'RTU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    for (const [u, role] of [[TEA, 'teacher'], [MON, 'monitor']]) {
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role, realName: '路由UI' + role, classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+      created.users.push(r.data.user.id);
+    }
+    check('0) 夹具就绪（1 班 + 教师/班长账号）', !!created.classId && created.users.length === 2, created);
+
+    // ============================================================
+    // 一、登录后默认进入签到操作台
+    // ============================================================
+    log('\n— 一) 登录后默认页 —');
+    // 说明：浏览器里 fetch(..., {redirect:'manual'}) 返回的是 opaque 响应（status 0、读不到 Location），
+    //       因此这里用 iframe 实测"访问这些地址最终会落到哪一页"（比读响应头更接近真实使用）。
+    await load('/', '#viewAttendance');
+    check('一) 已登录访问 / → 落到 /dashboard 的签到操作台（不是计划页）',
+      onAttendance() && frameUrl() === '/dashboard', frameUrl());
+    await load('/index.html', '#viewAttendance');
+    check('一) 已登录访问 /index.html → 落到 /dashboard', onAttendance() && frameUrl() === '/dashboard', frameUrl());
+    await load('/login', '#viewAttendance');
+    check('一) 已登录访问 /login → 直接进 /dashboard（不用再登录）', onAttendance() && frameUrl() === '/dashboard', frameUrl());
+    await load('/dashboard', '#viewAttendance');
+    check('一) 打开首页 → 显示签到操作台（viewPlans 隐藏）', onAttendance(), { url: frameUrl(), att: hidden('#viewAttendance'), plans: hidden('#viewPlans') });
+    check('一) 首页地址栏没有 view=plans（不残留上一次的计划页参数）', frameUrl() === '/dashboard', frameUrl());
+
+    // ============================================================
+    // 二、在签到操作台刷新 → 仍然停留在签到操作台（本 BUG 的核心断言）
+    // ============================================================
+    log('\n— 二) 签到操作台刷新 —');
+    const rl1 = await reloadExpect(onAttendance);
+    check('二) 刷新后仍在签到操作台（★ 不再跳到签到计划）', rl1.ok, { url: frameUrl() });
+    check('二) 刷新后地址仍是 /dashboard', frameUrl() === '/dashboard', frameUrl());
+
+    // ============================================================
+    // 三、点「📅 计划管理」→ 进入计划页，URL 同步；刷新仍在计划页
+    // ============================================================
+    log('\n— 三) 计划管理（主动点击才进入） —');
+    // 走真实导航栏：考勤管理 ▾ → 📅 计划管理（navbar.js 在签到台内是"就地切换"，不整页刷新）
+    const mgmtBtn = Q('#navAttendanceMgmt');
+    if (mgmtBtn) { mgmtBtn.click(); await sleep(300); }
+    const planBtn = Q('#btnPlansView');
+    check('三) 导航栏「📅 计划管理」入口存在', !!planBtn, !!planBtn);
+    if (planBtn) planBtn.click();
+    await until(() => onPlans(), 15000);
+    check('三) 点击后进入签到计划页', onPlans(), { url: frameUrl() });
+    check('三) URL 同步为计划视图（?view=plans 或 /plans）',
+      /view=plans/.test(frameUrl()) || frameUrl() === '/plans', frameUrl());
+    check('三) 计划页有返回入口「← 返回签到」', !!Q('#btnBackAttendance'), txt('#btnBackAttendance'));
+    const rl2 = await reloadExpect(onPlans);
+    check('三) 在计划页刷新 → 仍然停留在签到计划（★）', rl2.ok, { before: rl2.urlBefore, after: rl2.urlAfter });
+
+    // ============================================================
+    // 四、点「← 返回签到」→ 回到操作台，URL 一并回到 /dashboard；刷新仍在操作台
+    // ============================================================
+    log('\n— 四) 返回签到台 + 刷新 —');
+    const back = Q('#btnBackAttendance');
+    if (back) back.click();
+    await until(() => onAttendance(), 15000);
+    check('四) 点「← 返回签到」→ 回到签到操作台', onAttendance(), frameUrl());
+    check('四) 返回后 URL 里不再残留 view=plans（★ 修复点）', frameUrl() === '/dashboard', frameUrl());
+    const rl3 = await reloadExpect(onAttendance);
+    check('四) 返回后再刷新 → 仍在签到操作台（★ 修复点）', rl3.ok, { url: frameUrl() });
+
+    // ============================================================
+    // 四b、真实复现路径：从别处进入计划管理（地址带 ?view=plans）→ 点返回签到 → 刷新
+    //      （修复前：URL 里残留 view=plans → 刷新被带回计划页 = 用户反馈的"偶尔跳转"）
+    // ============================================================
+    log('\n— 四b) 「从计划页返回签到台」后刷新（真实复现路径） —');
+    await load('/dashboard?view=plans', '#viewPlans');
+    check('四b) 以带参地址进入计划页（= 从其它页面点「计划管理」进来的效果）', onPlans(), frameUrl());
+    const back2 = Q('#btnBackAttendance');
+    if (back2) back2.click();
+    await until(() => onAttendance(), 15000);
+    check('四b) 点「← 返回签到」→ 回到操作台且地址清掉 view=plans（★ 根因修复点）',
+      onAttendance() && frameUrl() === '/dashboard', frameUrl());
+    const rl4b = await reloadExpect(onAttendance);
+    check('四b) 返回后再刷新 → 仍在签到操作台（★ 用户反馈的场景）', rl4b.ok, { before: rl4b.urlBefore, after: rl4b.urlAfter });
+
+    // ============================================================
+    // 五、直达地址：?view=plans 与 /plans 都能进计划页，刷新后仍在计划页
+    // ============================================================
+    log('\n— 五) 直达地址 —');
+    await load('/dashboard?view=plans', '#viewPlans');
+    check('五) /dashboard?view=plans → 计划页（兼容旧地址）', onPlans(), { url: frameUrl() });
+    const rl4 = await reloadExpect(onPlans);
+    check('五) 该地址刷新后仍在计划页', rl4.ok, frameUrl());
+    await load('/plans', '#viewPlans');
+    check('五) /plans → 计划页（独立路径，可收藏）', onPlans(), { url: frameUrl() });
+    const rl5 = await reloadExpect(onPlans);
+    check('五) /plans 刷新后仍在计划页', rl5.ok, frameUrl());
+    await load('/dashboard?view=attendance', '#viewAttendance');
+    check('五) /dashboard?view=attendance → 签到操作台（未知 view 值按操作台处理）', onAttendance(), frameUrl());
+
+    // ============================================================
+    // 六、浏览器「后退」：按 URL 恢复视图（popstate），不会随机跳页
+    // ============================================================
+    log('\n— 六) 浏览器后退 —');
+    await load('/dashboard', '#viewAttendance');
+    const mgmtBtn2 = Q('#navAttendanceMgmt');
+    if (mgmtBtn2) { mgmtBtn2.click(); await sleep(300); }
+    const planBtn2 = Q('#btnPlansView');
+    if (planBtn2) planBtn2.click();
+    await until(() => onPlans(), 15000);
+    check('六) 切到计划页（URL=' + frameUrl() + '）', onPlans(), frameUrl());
+    try { W().history.back(); } catch (_) {}
+    await until(() => onAttendance(), 15000);
+    check('六) 浏览器后退 → 回到签到操作台（按 URL 恢复视图）', onAttendance(), frameUrl());
+    check('六) 后退后 URL 回到 /dashboard', frameUrl() === '/dashboard', frameUrl());
+
+    // ============================================================
+    // 七、权限一致的直达：班长访问 /plans 会被送回签到操作台
+    // ============================================================
+    log('\n— 七) 班长端 —');
+    await asUser(MON);
+    await load('/plans', '#viewAttendance');
+    check('七) 班长访问 /plans → 回到签到操作台（班长没有计划管理）', onAttendance(), { url: frameUrl() });
+    await load('/dashboard', '#viewAttendance');
+    const planBtnMon = Q('#btnPlansView');
+    check('七) 班长端导航栏没有「📅 计划管理」入口（或不可见）',
+      !planBtnMon || planBtnMon.classList.contains('hidden'), !!planBtnMon);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^rtu_/.test(u.username));
+    const leftClasses = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^路由UI班/.test(c.className));
+    check('清理：夹具账号/班级已清除', leftUsers.length === 0 && leftClasses.length === 0,
+      { users: leftUsers.length, classes: leftClasses.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>课堂表现 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="style.css?v=3.16.0">
+  <style>
+    body { background: #f5f7fa; margin: 0; }
+    /* 页头位于统一白色卡片内部（.page-card）；栅格由 style.css 的 .page-head-bar 提供 */
+    .action-bar button {
+      border: 1px solid #d7deea; background: #fff; color: #2563eb; font-size: 15px; font-weight: 700;
+      padding: 9px 16px; border-radius: 10px; cursor: pointer; transition: all .15s ease; white-space: nowrap;
+    }
+    .action-bar button:hover { background: #eff5ff; border-color: #2563eb; }
+    /* 卡内小节（筛选 / 点名记录 / 点赞）：白底与阴影由 .page-card 提供，小节间用分隔线 */
+    .pf-card { padding: 0; }
+    .pf-filters { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+    .pf-filters label { font-size: 15px; font-weight: 700; color: #4b5563; display: inline-flex; align-items: center; gap: 8px; }
+    .pf-filters select, .pf-filters input[type="date"] {
+      font-size: 15px; padding: 9px 12px; border: 1px solid #d7deea; border-radius: 10px; background: #fff;
+    }
+    .pf-quick { display: inline-flex; gap: 6px; }
+    .pf-quick button {
+      border: 1px solid #d7deea; background: #fff; color: #374151; font-size: 14px; font-weight: 700;
+      padding: 8px 14px; border-radius: 999px; cursor: pointer;
+    }
+    .pf-quick button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .pf-scope { margin-left: auto; font-size: 14px; color: #6b7280; }
+    .pf-scope b { color: #2563eb; }
+    /* 学期设置提示：选「本学期」时显示统计区间，未配置时给设置入口提示 */
+    .pf-term-hint {
+      margin-top: 10px; border-radius: 8px; padding: 10px 14px; font-size: 13px; line-height: 1.7;
+      background: #EFF5FF; border: 1px solid #C9DCFF; color: #1B4E9B;
+    }
+    .pf-term-hint.warn { background: #FFF8E6; border-color: #FFE0A3; color: #A9700B; }
+    .pf-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .pf-head h3 { font-size: 18px; font-weight: 800; margin: 0; }
+    .pf-head .pf-count { font-size: 14px; color: #6b7280; }
+    .pf-head .spacer { flex: 1; }
+    .pf-head button.pf-export {
+      border: 1px solid #d7deea; background: #fff; color: #2563eb; font-size: 14px; font-weight: 700;
+      padding: 8px 14px; border-radius: 10px; cursor: pointer;
+    }
+    .pf-head button.pf-export:hover { background: #eff5ff; border-color: #2563eb; }
+    .pf-table-wrap { max-height: 380px; overflow: auto; border: 1px solid #eef1f7; border-radius: 10px; }
+    table.pf-table { width: 100%; border-collapse: collapse; font-size: 15px; }
+    table.pf-table thead th {
+      position: sticky; top: 0; z-index: 1; background: #eaf2ff; color: #1e40af; font-weight: 800;
+      text-align: left; padding: 11px 14px; white-space: nowrap; border-bottom: 1px solid #d7e5ff;
+    }
+    table.pf-table tbody td { padding: 10px 14px; border-bottom: 1px solid #f2f5fa; }
+    table.pf-table tbody tr:hover { background: #f8fbff; }
+    .pf-tag { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 13px; font-weight: 700; background: #eef2ff; color: #4338ca; }
+    .pf-tag.absent { background: #fff1f0; color: #cf1322; }
+    .pf-rank { font-weight: 800; color: #2563eb; }
+    .pf-likes { font-weight: 800; color: #d97706; }
+    .pf-empty { padding: 22px; text-align: center; color: #9aa3b0; }
+    .pf-toast {
+      position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%);
+      background: rgba(31, 41, 55, .94); color: #fff; font-size: 15px; padding: 12px 20px;
+      border-radius: 10px; z-index: 60; transition: opacity .2s ease;
+    }
+    .pf-toast.hidden { opacity: 0; pointer-events: none; }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头（卡片内部）：返回(左) · 标题居中 · 功能按钮(右) -->
+      <div class="page-head-bar">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+        <h2 class="page-title">📋 课堂表现</h2>
+        <div class="action-bar">
+          <button id="btnRefresh" class="btn btn-secondary">↻ 刷新</button>
+        </div>
+      </div>
+
+    <!-- 小节一：筛选 -->
+    <section class="pf-card pf-filters">
+      <label>年级 <select id="pfGrade"><option value="">全部年级</option></select></label>
+      <label>班级 <select id="pfClass"></select></label>
+      <label>学科 <select id="pfSubject"><option value="">全部学科</option></select></label>
+      <span class="pf-quick" id="pfQuick">
+        <button data-period="week">本周</button>
+        <button data-period="month">本月</button>
+        <button data-period="term">本学期</button>
+        <button data-period="all" class="active">全部</button>
+      </span>
+      <label>自定义 <input type="date" id="pfFrom"> ~ <input type="date" id="pfTo"></label>
+      <button id="pfApply" style="border:1px solid #2563eb;background:#2563eb;color:#fff;font-size:14px;font-weight:700;padding:9px 16px;border-radius:10px;cursor:pointer">查询</button>
+      <span class="pf-scope">可查看范围：<b id="pfScope">—</b></span>
+    </section>
+    <div class="pf-term-hint hidden" id="pfTermHint"></div>
+
+    <!-- 点名记录 -->
+    <section class="pf-card">
+      <div class="pf-head">
+        <h3>📋 点名记录</h3>
+        <span class="pf-count" id="pfRecCount">—</span>
+        <span class="spacer"></span>
+        <button class="pf-export" id="pfExportRec" data-type="records">📤 导出点名记录</button>
+      </div>
+      <div class="pf-table-wrap">
+        <table class="pf-table">
+          <thead>
+            <tr><th style="width:150px">时间</th><th>学生姓名</th><th style="width:140px">学号</th><th style="width:110px">座位</th><th style="width:110px">学科</th><th style="width:130px">班级</th><th style="width:120px">范围</th><th style="width:160px">操作人（班长）</th></tr>
+          </thead>
+          <tbody id="pfRecBody"><tr><td colspan="8" class="pf-empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 点赞排名 -->
+    <section class="pf-card">
+      <div class="pf-head">
+        <h3>👍 点赞排名</h3>
+        <span class="pf-count" id="pfLikeCount">—</span>
+        <span class="spacer"></span>
+        <button class="pf-export" id="pfExportLike" data-type="likes">📤 导出点赞数据</button>
+      </div>
+      <div class="pf-table-wrap">
+        <table class="pf-table">
+          <thead>
+            <tr><th style="width:90px">排名</th><th>学生姓名</th><th style="width:140px">学号</th><th style="width:110px">座位</th><th style="width:120px">点赞次数</th><th style="width:120px">最近点赞</th></tr>
+          </thead>
+          <tbody id="pfLikeBody"><tr><td colspan="6" class="pf-empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    </section><!-- /.page-card -->
+  </div>
+
+  <div id="pfToast" class="pf-toast hidden"></div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="performance.js?v=3.7.0"></script>
+</body>
+</html>

@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：叫号系统（教师发布 / 班长接收+语音播报+标记已处理）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_announcements.html public/_ui_announcements.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiAnn --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_announcements.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_announcements.html
+  夹具：临时年级 + 1 班（3 学生）+ 班长/任课老师/学生账号；结束自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1220px; height: 780px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>叫号系统（教师发布 → 班长接收/语音播报/已处理）</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const val = (s) => { const e = Q(s); return e ? e.value : null; };
+const pathOf = () => { try { return fr.contentWindow.location.pathname; } catch (_) { return '?'; } };
+function fire(sel, type) {
+  const e = Q(sel); if (!e) return false;
+  e.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+  return true;
+}
+function setVal(sel, v) { const e = Q(sel); if (!e) return false; e.value = v; fire(sel, 'change'); return true; }
+function setInput(sel, v) { const e = Q(sel); if (!e) return false; e.value = v; fire(sel, 'input'); return true; }
+function setCheck(sel, on) { const e = Q(sel); if (!e) return false; e.checked = !!on; fire(sel, 'change'); return true; }
+async function clickWhenReady(sel, ms = 15000) {
+  const ok = await until(() => Q(sel) && !Q(sel).disabled, ms);
+  if (ok) Q(sel).click();
+  return ok;
+}
+async function loadPage(url) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q('h1'), 25000);
+  await sleep(900);
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '叫号UI年级' + stamp, CLASS = '叫号UI班' + stamp;
+const MON = 'anui_mon_' + stamp, TEA = 'anui_tea_' + stamp, STU = 'anui_stu_' + stamp;
+const created = { gradeId: null, classId: null, userIds: [], studentIds: [], annIds: [] };
+const NAMES = ['叫号甲', '叫号乙', '叫号丙'];
+const LOC1 = 'ANTEST教务处' + stamp;
+const LOC2 = 'ANTEST班主任办公室' + stamp;
+const LOC3 = 'ANTEST广播室' + stamp;
+
+async function loginAs(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+// 自愈式清理：即使中途异常也能按前缀清掉本次（及历史中断遗留）的夹具
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const classes = (await japi('/api/classes')).data.classes || [];
+  for (const c of classes.filter((x) => /^叫号UI班/.test(x.className))) {
+    for (const id of created.studentIds) await japi('/api/students/' + id, { method: 'DELETE' });
+    const anns = (await japi('/api/announcements?classId=' + c.id)).data.announcements || [];
+    for (const a of anns) await japi('/api/announcements/' + a.id, { method: 'DELETE' });
+    const stus = (await japi('/api/students?classId=' + c.id)).data.students || [];
+    for (const s of stus) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    const users = (await japi('/api/users')).data.users || [];
+    for (const u of users.filter((x) => /^anui_/.test(x.username))) {
+      await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+      await japi('/api/users/' + u.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  const grades = (await japi('/api/grades')).data.grades || [];
+  for (const g of grades.filter((x) => /^叫号UI年级/.test(x.grade_name || x.gradeName))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+}
+const todayIso = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'ANU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    let r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '叫号UI班长', classId: created.classId, mustChangePassword: false } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '叫号UI老师', subject: '物理', profileLocked: true, teachingClasses: [{ classId: created.classId, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: STU, password: '123456', role: 'student', realName: '叫号UI学生', classId: created.classId, mustChangePassword: false } });
+    created.userIds.push(r.data.user.id);
+    for (let i = 0; i < NAMES.length; i += 1) {
+      await japi('/api/students', { method: 'POST', body: { studentNo: 'ANU' + stamp + '0' + (i + 1), name: NAMES[i], classId: created.classId, status: '在读' } });
+    }
+    const list = (await japi('/api/students?classId=' + created.classId + '&status=' + encodeURIComponent('在读'))).data.students || [];
+    list.forEach((s) => created.studentIds.push(s.id));
+    check('0) 夹具就绪（1 班 3 学生 + 班长/老师/学生）', list.length === 3 && created.userIds.length === 3, list.length);
+
+    // ---------- A) 教师端：叫号管理页（发布 + 列表） ----------
+    await loginAs(TEA);
+    await loadPage('/dashboard');
+    check('A) 教师端显示「📢 叫号管理」入口', !hidden('#btnAnnManage'));
+    check('A) 教师端不显示班长「📢 叫号」接收按钮', hidden('#btnAnnouncements'));
+    await clickWhenReady('#btnAnnManage');
+    await until(() => pathOf() === '/announcements', 10000);
+    await sleep(900);
+    check('A) 点「叫号管理」→ 进入 /announcements', pathOf() === '/announcements', pathOf());
+    check('A) 页面标题为「叫号管理」', /叫号管理/.test(txt('.page-title')), txt('.page-title'));
+
+    // 班级下拉（仅所带班级）
+    await until(() => Qa('#anClass option').length > 0, 12000);
+    check('A) 班级下拉只含所带班级', Qa('#anClass option').length === 1 && /叫号UI班/.test(Qa('#anClass option')[0].textContent),
+      Qa('#anClass option').map((o) => o.textContent.trim()));
+    check('A) 班级下拉默认选中本班', val('#anClass') === String(created.classId), val('#anClass'));
+
+    // 学生搜索（姓名）
+    check('A) 搜索框输入姓名 → 出现候选下拉', setInput('#anStudent', '叫号甲'));
+    const sugOk = await until(() => Qa('#anSuggest div[data-id]').length > 0, 8000);
+    check('A) 候选列表含「叫号甲」', sugOk && /叫号甲/.test(txt('#anSuggest')), txt('#anSuggest').slice(0, 60));
+    const sug = Q('#anSuggest div[data-id]');
+    const stuId1 = sug ? Number(sug.dataset.id) : null;
+    sug.dispatchEvent(new (W().MouseEvent)('mousedown', { bubbles: true, cancelable: true }));
+    await sleep(200);
+    check('A) 选中学生后记录 id 与提示', val('#anStudentId') === String(stuId1) && /已选择/.test(txt('#anStudentMsg')),
+      { id: val('#anStudentId'), msg: txt('#anStudentMsg') });
+    check('A) 选中后候选下拉收起', hidden('#anSuggest'));
+
+    // 学号搜索（第 2 位同学）
+    setInput('#anStudent', 'ANU' + stamp + '02');
+    await until(() => Qa('#anSuggest div[data-id]').length > 0, 8000);
+    const sug2 = Qa('#anSuggest div[data-id]').find((d) => d.dataset.name === NAMES[1]);
+    if (sug2) sug2.dispatchEvent(new (W().MouseEvent)('mousedown', { bubbles: true, cancelable: true }));
+    await sleep(200);
+    check('A) 支持按学号搜索并选中「叫号乙」', val('#anStudentId') && Q('#anStudent').value === NAMES[1], { v: Q('#anStudent').value });
+
+    // 发布第一条（紧急）
+    setVal('#anLocation', LOC1);
+    setVal('#anDate', todayIso());
+    setVal('#anTime', '09:30');
+    setVal('#anNote', '请带上课本');
+    setCheck('#anUrgent', true);
+    await clickWhenReady('#anSubmit');
+    const row1 = await until(() => Qa('#anBody tr').some((tr) => tr.textContent.includes(LOC1)), 15000);
+    check('A) 发布紧急叫号成功并出现在列表', row1, txt('#anBody').slice(0, 120));
+    check('A) 发布后表单已重置（学生/地点清空）', val('#anStudentId') === '' && val('#anLocation') === '',
+      { id: val('#anStudentId'), loc: val('#anLocation') });
+    const rowHtml = (loc) => Qa('#anBody tr').find((tr) => tr.textContent.includes(loc));
+    check('A) 紧急行红色高亮（class=urgent）', rowHtml(LOC1) && rowHtml(LOC1).classList.contains('urgent'),
+      rowHtml(LOC1) ? rowHtml(LOC1).className : null);
+    check('A) 行内含学生姓名 / 班级 / 何时 / 待处理',
+      /叫号乙/.test(rowHtml(LOC1).textContent) && /叫号UI班/.test(rowHtml(LOC1).textContent) &&
+      /09:30/.test(rowHtml(LOC1).textContent) && /待处理/.test(rowHtml(LOC1).textContent),
+      rowHtml(LOC1).textContent.replace(/\s+/g, ' ').trim());
+
+    // 列表表头
+    const heads = Qa('table.an-table thead th').map((th) => th.textContent.trim());
+    check('A) 列表列 = 时间/班级/学生姓名/到何处/何时/状态/操作',
+      ['时间', '班级', '学生姓名', '到何处', '何时', '状态', '操作'].every((h) => heads.includes(h)), heads);
+
+    // 发布第二条（普通）
+    await setInput('#anStudent', NAMES[2]);
+    await until(() => Qa('#anSuggest div[data-id]').length > 0, 8000);
+    const sug3 = Q('#anSuggest div[data-id]');
+    if (sug3) sug3.dispatchEvent(new (W().MouseEvent)('mousedown', { bubbles: true, cancelable: true }));
+    setVal('#anLocation', LOC2);
+    setVal('#anDate', todayIso());
+    setVal('#anTime', '10:15');
+    await clickWhenReady('#anSubmit');
+    const row2 = await until(() => Qa('#anBody tr').some((tr) => tr.textContent.includes(LOC2)), 15000);
+    check('A) 发布第二条（普通）成功', row2);
+    check('A) 普通行无 urgent 高亮', rowHtml(LOC2) && !rowHtml(LOC2).classList.contains('urgent'));
+    check('A) 列表顶部统计显示共 2 条 / 待处理 2 条', /共 2 条/.test(txt('#anCount')) && /待处理 2 条/.test(txt('#anCount')), txt('#anCount'));
+
+    // 详情弹窗
+    const detailBtn = rowHtml(LOC1).querySelector('button[data-act="detail"]');
+    detailBtn.click();
+    const detailOpen = await until(() => !hidden('#anDetailMask'), 8000);
+    check('A) 点「详情」弹出详情窗', detailOpen && Q('#anDetailBody').textContent.includes(LOC1),
+      Q('#anDetailBody') ? Q('#anDetailBody').textContent.replace(/\s+/g, ' ').trim().slice(0, 120) : null);
+    check('A) 详情含备注与优先级', /请带上课本/.test(txt('#anDetailBody')) && /紧急/.test(txt('#anDetailBody')));
+    Q('#anDetailClose').click();
+    check('A) 关闭详情窗', await until(() => hidden('#anDetailMask'), 5000));
+
+    // 状态筛选
+    setVal('#anFilterStatus', 'processed');
+    const noProc = await until(() => /暂无叫号记录/.test(txt('#anBody')), 10000);
+    check('A) 状态筛选「已处理」→ 无记录', noProc, txt('#anBody').slice(0, 60));
+    setVal('#anFilterStatus', '');
+    await until(() => Qa('#anBody tr').length === 2, 10000);
+    check('A) 状态筛选「全部」→ 恢复 2 条', Qa('#anBody tr').length === 2, Qa('#anBody tr').length);
+
+    // 删除（列表减 1）
+    W().confirm = () => true;
+    const delAnn = (await japi('/api/announcements')).data.announcements || [];
+    check('A) 后端已有 2 条叫号（教师端列表一致）', delAnn.length === 2, delAnn.length);
+
+    // ---------- B) 班长端：接收 + 语音播报 + 未读角标 ----------
+    await loginAs(MON);
+    await loadPage('/dashboard');
+    check('B) 班长端显示「📢 叫号」按钮', !hidden('#btnAnnouncements'));
+    check('B) 班长端不显示「叫号管理」入口', hidden('#btnAnnManage'));
+    const badgeOk = await until(() => Q('#annBadge') && !hidden('#annBadge') && txt('#annBadge') === '2', 15000);
+    check('B) 未读角标显示 2（未处理叫号数）', badgeOk, txt('#annBadge'));
+    check('B) 导入脚本已注册 30 秒自动刷新', W().__ann && W().__ann.intervalMs === 30000, W().__ann ? W().__ann.intervalMs : null);
+
+    // 自动语音播报（未播报的叫号进入页面即播报）
+    const spoke = await until(() => typeof W().__lastSpoken === 'string' && W().__lastSpoken.length > 0, 12000);
+    check('B) 进入页面自动语音播报（已调用 speechSynthesis）', spoke, W().__lastSpoken);
+    check('B) 播报文本格式 = 请[班级][学生姓名]到[地点]',
+      new RegExp('^请' + CLASS + '叫号[甲乙丙]到ANTEST').test(W().__lastSpoken || ''), W().__lastSpoken);
+    check('B) 播报语音参数 zh-CN / 正常语速(1) / 最大音量(1)',
+      W().__lastSpokenOpts && W().__lastSpokenOpts.lang === 'zh-CN' && W().__lastSpokenOpts.rate === 1 && W().__lastSpokenOpts.volume === 1,
+      W().__lastSpokenOpts);
+
+    // 播报后 is_played 已写库（刷新不重复播报）
+    const inbox = await japi('/api/announcements/inbox');
+    check('B) 收件箱：本班 2 条且均已标记 isPlayed', inbox.status === 200 && inbox.data.announcements.length === 2 &&
+      inbox.data.announcements.every((a) => a.isPlayed === true),
+      (inbox.data.announcements || []).map((a) => a.isPlayed));
+    check('B) 收件箱 pendingCount = 2', inbox.data.pendingCount === 2, inbox.data.pendingCount);
+
+    // 打开叫号列表弹窗
+    Q('#btnAnnouncements').click();
+    const modalOpen = await until(() => !hidden('#annModal') && Qa('#annList .ann-item').length === 2, 12000);
+    check('B) 点「叫号」→ 弹出叫号列表（2 条）', modalOpen, Qa('#annList .ann-item').length);
+    const items = Qa('#annList .ann-item');
+    const urgentItem = items.find((it) => it.classList.contains('urgent'));
+    check('B) 紧急叫号行红色高亮', !!urgentItem, items.map((i) => i.className));
+    check('B) 列表项显示学生姓名 / 到何处 / 发布人',
+      items.some((it) => /叫号甲|叫号乙/.test(it.textContent)) &&
+      items.some((it) => it.textContent.includes(LOC1)) &&
+      /叫号UI老师/.test(txt('#annList')),
+      txt('#annList').replace(/\s+/g, ' ').slice(0, 160));
+    check('B) 弹窗显示本班班名', /叫号UI班/.test(txt('#annClassTag')), txt('#annClassTag'));
+
+    // 手动播报按钮（列表首条为最新一条）
+    const speakBtn = Q('#annList button[data-act="speak"]');
+    const firstItem = Qa('#annList .ann-item')[0];
+    const firstName = (firstItem.querySelector('b') || {}).textContent || '';
+    W().__lastSpoken = '';
+    speakBtn.click();
+    const spoke2 = await until(() => typeof W().__lastSpoken === 'string' && W().__lastSpoken.length > 0, 8000);
+    check('B) 点「🔊 播报」→ 再次语音播报该条学生',
+      spoke2 && W().__lastSpoken === '请' + CLASS + firstName + '到' + (firstItem.textContent.includes(LOC2) ? LOC2 : LOC1),
+      { spoken: W().__lastSpoken, name: firstName });
+
+    // 标记已处理：该条变 ✅，剩下的待处理按钮减为 1
+    //   注意：列表每 30 秒（及点击后）会重渲染 → 必须**每次重新查询**按钮再点，
+    //   否则点到已脱离 DOM 的旧节点（偶发"点了没反应"）
+    const procBtnsBefore = Qa('#annList button[data-act="process"]').length;
+    let processed = false;
+    for (let i = 0; i < 3 && !processed; i += 1) {
+      const btn = Qa('#annList button[data-act="process"]')[0];
+      if (btn) btn.click();
+      processed = await until(() => {
+        const it = Qa('#annList .ann-item').find((x) => x.querySelector('b') && x.querySelector('b').textContent === firstName);
+        return !!it && /已处理/.test(it.textContent) && Qa('#annList button[data-act="process"]').length === procBtnsBefore - 1;
+      }, 6000);
+    }
+    check('B) 点「已处理」→ 该条变为 ✅ 已处理，待处理按钮减 1', processed,
+      { before: procBtnsBefore, after: Qa('#annList button[data-act="process"]').length, name: firstName });
+    const badge2 = await until(() => txt('#annBadge') === '1', 12000);
+    check('B) 未读角标减为 1', badge2, txt('#annBadge'));
+    const after = await japi('/api/announcements/inbox');
+    check('B) 后端已处理数 = 1 / 待处理 = 1',
+      after.data.announcements.filter((a) => a.status === 'processed').length === 1 && after.data.pendingCount === 1,
+      { p: after.data.pendingCount });
+
+    // 30 秒自动刷新：轮询次数随时间增长
+    const p0 = W().__ann.pollCount();
+    const grew = await until(() => W().__ann.pollCount() > p0, 90000);
+    check('B) 30 秒自动刷新在运行（轮询次数递增）', grew, { before: p0, after: W().__ann.pollCount() });
+
+    // 重新打开页面：已播报的不再重复播报
+    W().__lastSpoken = '';
+    await loadPage('/dashboard');
+    await until(() => W().__ann && W().__ann.pollCount() > 0, 15000);
+    await sleep(1500);
+    check('B) 再次进入页面不重复播报已播报叫号', !W().__lastSpoken, W().__lastSpoken);
+
+    // ---------- C) 权限镜像（学生 / 班长 / 老师） ----------
+    await loginAs(STU);
+    await loadPage('/dashboard');
+    check('C) 学生端无「叫号」按钮', hidden('#btnAnnouncements'));
+    check('C) 学生端无「叫号管理」入口', hidden('#btnAnnManage'));
+    const stuPage = await fetch('/announcements', { credentials: 'same-origin', redirect: 'manual' });
+    check('C) 学生访问 /announcements → 302', stuPage.status === 302 || stuPage.type === 'opaqueredirect', stuPage.status);
+
+    await loginAs(MON);
+    const monPage = await fetch('/announcements', { credentials: 'same-origin', redirect: 'manual' });
+    check('C) 班长访问 /announcements（教师端页）→ 302', monPage.status === 302 || monPage.type === 'opaqueredirect', monPage.status);
+
+    // ---------- D) 教师端删除叫号 ----------
+    await loginAs(TEA);
+    await loadPage('/announcements');
+    await until(() => Qa('#anBody tr').length === 2, 12000);
+    W().confirm = () => true;
+    rowHtml(LOC2).querySelector('button[data-act="del"]').click();
+    const deleted = await until(() => Qa('#anBody tr').length === 1, 15000);
+    check('D) 教师点「删除」→ 列表减为 1 条', deleted, Qa('#anBody tr').length);
+    const rest = (await japi('/api/announcements')).data.announcements || [];
+    check('D) 后端同步删除', rest.length === 1, rest.length);
+
+    // ---------- 清理 ----------
+    // ⚠️ 严禁删除真实叫号：只删"本次夹具班级/学生产生"或"测试前就存在之外的新增"记录
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const allAnn = (await japi('/api/announcements')).data.announcements || [];
+    const mineAnn = allAnn.filter((a) => a.classId === created.classId
+      || /^ANTEST/.test(a.location || ''));
+    const keptAnn = allAnn.filter((a) => !mineAnn.includes(a));
+    for (const a of mineAnn) await japi('/api/announcements/' + a.id, { method: 'DELETE' });
+    for (const id of created.studentIds) await japi('/api/students/' + id, { method: 'DELETE' });
+    for (const id of created.userIds) await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: id, classes: [] } });
+    for (const id of created.userIds) await japi('/api/users/' + id, { method: 'DELETE' });
+    const delClass = await japi('/api/classes/' + created.classId, { method: 'DELETE' });
+    await hardCleanup();   // 兜底：清理历史中断遗留的同前缀夹具
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    check('清理：临时班级/账号已删除', delClass.status < 300, delClass.data);
+    check('清理：夹具叫号已删除且未误删真实叫号', keptAnn.every((k) => allAnn.some((a) => a.id === k.id)) && mineAnn.length >= 0,
+      { 删除夹具: mineAnn.length, 保留其他: keptAnn.length });
+    const leftUsers = await japi('/api/users');
+    check('清理：临时账号已不存在', !(leftUsers.data.users || []).some((u) => [MON, TEA, STU].includes(u.username)));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

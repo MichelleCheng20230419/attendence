@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：新建/编辑小组的「权限配置」卡片排版修复
+  背景：一级权限名称与子权限文字曾因 flex 子项被压缩到"1 个字宽"而竖排显示；
+        复选框与文字错位、父子层级不清、卡片间距 10px 不统一。
+  验证点：
+    □ 文字横排（一级权限名称、子权限都不竖排：单行、宽度 ≥ 3 个字宽、white-space:nowrap）
+    □ 层级清晰：一级权限 14px 加粗；子权限 13px 常规、缩进 24px；无子权限项用 └ 说明行
+    □ 复选框与文字同一行且垂直居中对齐
+    □ 权限卡片间距统一 12px
+    □ 交互：勾一级 → 全选子项；取消一级 → 全取消；子项可单独勾选（自动带上父项）
+    □ 保存后重开编辑：勾选状态与后端规整结果一致
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_perm_layout.html public/_ui_perm_layout.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiPerm --virtual-time-budget=300000 --dump-dom `
+         "http://localhost:3000/_ui_perm_layout.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_perm_layout.html
+  夹具：1 个临时小组（自愈式清理，并断言真实小组数量未变）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>小组权限配置卡片排版</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr" style="width:1500px;height:1000px"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(p, { method = 'GET', body } = {}) {
+  const res = await fetch(p, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const csEl = (e, p) => (e ? W().getComputedStyle(e).getPropertyValue(p).trim() : null);
+const px = (v) => parseFloat(v) || 0;
+const rect = (e) => e.getBoundingClientRect();
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+
+const stamp = Date.now().toString().slice(-6);
+const GNAME = '排版UI组' + stamp;
+const created = { groupIds: [] };
+let realBefore = null;
+
+async function snapshot() {
+  const g = (await japi('/api/groups')).data;
+  return ((g && g.groups) || []).length;
+}
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const g of ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('排版UI组' + stamp + '$').test(x.name))) {
+    await japi('/api/groups/' + g.id, { method: 'DELETE' });
+  }
+}
+async function openModal() {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = '/admin/group-management';
+  await until(() => F() && F().readyState === 'complete' && Q('#groupList'), 25000);
+  await sleep(800);
+  Q('#btnAddGroup').click();
+  await until(() => !hidden('#groupModal') && Q('.perm-page'), 12000);
+  await sleep(400);
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshot();
+    await openModal();
+    const cards = Qa('.perm-page');
+    check('0) 权限配置渲染出 6 个一级权限卡片（签到操作/考勤管理/教学工具/数据统计/巡堂记录/系统管理）',
+      cards.length === 6, cards.map((c) => c.dataset.pageCard));
+
+    // ---------- A) 文字横排（不竖排） ----------
+    log('\n— A) 文字横排 —');
+    let allSingleLine = true, allNamesWide = true, allNowrap = true;
+    const detail = [];
+    cards.forEach((card) => {
+      const head = card.querySelector('.perm-head');
+      const name = card.querySelector('.perm-name');
+      const lh = px(csEl(head, 'line-height')) || 20;
+      const hh = rect(head).height;
+      const nw = rect(name).width;
+      const nameLen = (name.textContent || '').trim().length;
+      const lines = Math.round((hh / lh) * 10) / 10;
+      const single = hh <= lh + 2;
+      const wide = nw >= Math.min(nameLen, 4) * 12;   // 至少 4 个字宽（或按实际字数）
+      const nowrap = csEl(name, 'white-space') === 'nowrap';
+      if (!single) allSingleLine = false;
+      if (!wide) allNamesWide = false;
+      if (!nowrap) allNowrap = false;
+      detail.push({ page: card.dataset.pageCard, name: name.textContent.trim(), headH: Math.round(hh), lines, nameW: Math.round(nw) });
+    });
+    check('A) 一级权限名称都是单行（高度 ≤ 行高，未逐字换行 → 不竖排）', allSingleLine, detail);
+    check('A) 一级权限名称宽度足够（≥ 名称字数×12px，未被压缩成窄条）', allNamesWide, detail.map((d) => d.name + ':' + d.nameW));
+    check('A) 一级权限名称 white-space = nowrap（从根上避免竖排）', allNowrap);
+    const chips = Qa('.perm-chip');
+    const chipLines = chips.map((c) => {
+      const lh = px(csEl(c, 'line-height')) || 18;
+      return Math.round((rect(c).height / lh) * 10) / 10;
+    });
+    check('A) 子权限文字也都是单行（每个 chip 高度 ≤ 行高）',
+      chipLines.every((n) => n <= 1.2), { chips: chips.length, lines: chipLines });
+    check('A) 子权限文字 white-space = nowrap',
+      chips.every((c) => csEl(c.querySelector('span'), 'white-space') === 'nowrap'));
+
+    // ---------- B) 层级与字号 ----------
+    log('\n— B) 层级与字号 —');
+    const headStyle = cards.map((c) => {
+      const h = c.querySelector('.perm-head');
+      return { fs: csEl(h, 'font-size'), fw: csEl(h, 'font-weight'), color: csEl(h, 'color'), mb: csEl(h, 'margin-bottom') };
+    });
+    check('B) 一级权限：字号 14px、字重加粗（700）、颜色为正文色（不是灰色说明色）',
+      headStyle.every((s) => s.fs === '14px' && (s.fw === '700' || Number(s.fw) >= 700) && s.color === 'rgb(51, 51, 51)'),
+      headStyle);
+    check('B) 一级权限标题不再被 .form-row label 的 6px 下间距撑开', headStyle.every((s) => s.mb === '0px'), headStyle.map((s) => s.mb));
+    const chipStyle = { fs: csEl(chips[0], 'font-size'), fw: csEl(chips[0], 'font-weight'), color: csEl(chips[0], 'color') };
+    check('B) 子权限：字号 13px、常规字重（400）、正文色',
+      chipStyle.fs === '13px' && String(chipStyle.fw) === '400' && chipStyle.color === 'rgb(51, 51, 51)', chipStyle);
+    const indents = cards.map((c) => {
+      const body = c.querySelector('.perm-body');
+      if (!body) return null;
+      const cardRect = rect(c);
+      const bodyRect = rect(body);
+      const padLeft = px(csEl(c, 'padding-left'));
+      const borderLeft = px(csEl(c, 'border-left-width'));
+      return Math.round(bodyRect.left - (cardRect.left + borderLeft + padLeft));
+    });
+    check('B) 子权限/说明行相对卡片内容左侧缩进 = 24px',
+      indents.filter((v) => v !== null).every((v) => v === 24), indents);
+    const leaf = cards.find((c) => c.dataset.pageCard === 'dashboard');
+    const leafDesc = leaf.querySelector('.perm-desc-line');
+    check('B) 无子权限的「签到操作」用 └ 说明行显示其说明',
+      !!leafDesc && leafDesc.textContent.includes('└') && /所有角色默认可见/.test(leafDesc.textContent), leafDesc && leafDesc.textContent.trim());
+    const sys = cards.find((c) => c.dataset.pageCard === 'system_management');
+    const sysDesc = sys.querySelector('.perm-desc-line');
+    check('B) 「系统管理」为锁定项：复选框禁用 + └ 说明注明"仅管理员"',
+      sys.querySelector('input[data-page]').disabled === true && !!sysDesc && /仅管理员/.test(sysDesc.textContent),
+      sysDesc && sysDesc.textContent.trim());
+    check('B) 有子权限的卡片显示"N 项操作"标签', cards.filter((c) => c.querySelector('.perm-tag')).length === 4,
+      cards.filter((c) => c.querySelector('.perm-tag')).map((c) => c.dataset.pageCard + ':' + c.querySelector('.perm-tag').textContent));
+
+    // ---------- C) 复选框与文字对齐 ----------
+    log('\n— C) 复选框与文字对齐 —');
+    const aligns = cards.map((c) => {
+      const cb = c.querySelector('.perm-head input[type="checkbox"]');
+      const nm = c.querySelector('.perm-name');
+      const cr = rect(cb), nr = rect(nm);
+      return {
+        page: c.dataset.pageCard,
+        dx: Math.round((cr.top + cr.height / 2) - (nr.top + nr.height / 2)),
+        gap: Math.round(nr.left - cr.right),
+        sameLine: cr.top < nr.bottom && nr.top < cr.bottom,
+        cbSize: [Math.round(cr.width), Math.round(cr.height)],
+      };
+    });
+    check('C) 一级权限：复选框与文字垂直居中（中心偏差 ≤ 2px）',
+      aligns.every((a) => Math.abs(a.dx) <= 2), aligns);
+    check('C) 一级权限：复选框在文字左侧、同一行、间距 6~12px',
+      aligns.every((a) => a.sameLine && a.gap >= 4 && a.gap <= 14), aligns);
+    check('C) 复选框尺寸统一（16×16）', aligns.every((a) => a.cbSize[0] === 16 && a.cbSize[1] === 16), aligns.map((a) => a.cbSize));
+    const chipAligns = chips.slice(0, 8).map((c) => {
+      const cb = c.querySelector('input');
+      const sp = c.querySelector('span');
+      const cr = rect(cb), sr = rect(sp);
+      return { dy: Math.round((cr.top + cr.height / 2) - (sr.top + sr.height / 2)), gap: Math.round(sr.left - cr.right), size: Math.round(cr.width) };
+    });
+    check('C) 子权限：复选框与文字垂直居中（中心偏差 ≤ 2px）', chipAligns.every((a) => Math.abs(a.dy) <= 2), chipAligns);
+    check('C) 子权限：复选框在文字左侧、间距 4~12px', chipAligns.every((a) => a.gap >= 3 && a.gap <= 14), chipAligns);
+
+    // ---------- D) 卡片间距与整体布局 ----------
+    log('\n— D) 卡片间距与整体布局 —');
+    const rects = cards.map(rect);
+    const gaps = [];
+    for (let i = 1; i < rects.length; i++) gaps.push(Math.round(rects[i].top - rects[i - 1].bottom));
+    check('D) 卡片间距统一 12px', gaps.every((g) => g === 12), gaps);
+    check('D) 卡片宽度一致、左边缘对齐（同一列）',
+      new Set(rects.map((r) => Math.round(r.width))).size === 1 &&
+      new Set(rects.map((r) => Math.round(r.left))).size === 1,
+      { widths: [...new Set(rects.map((r) => Math.round(r.width)))], lefts: [...new Set(rects.map((r) => Math.round(r.left)))] });
+    const cardPad = csEl(cards[0], 'padding');
+    check('D) 卡片内边距统一（12px 14px）', cardPad === '12px 14px', cardPad);
+    const modal = Q('#groupModal .modal-box');
+    const mr = rect(modal);
+    check('D) 弹窗加宽（≥ 700px）以容纳权限树', Math.round(mr.width) >= 700, Math.round(mr.width));
+    check('D) 权限树未超出弹窗（无横向溢出）',
+      rect(Q('#permTree')).right <= mr.right - 20 && (() => { const t = Q('#permTree'); return t.scrollWidth <= t.clientWidth + 1; })(),
+      { tree: Math.round(rect(Q('#permTree')).right), modalRight: Math.round(mr.right) });
+    check('D) 所有子权限 chip 都在其卡片内（不溢出）',
+      chips.every((c) => { const card = c.closest('.perm-page'); return rect(c).right <= rect(card).right - 6; }),
+      chips.filter((c) => rect(c).right > rect(c.closest('.perm-page')).right - 6).map((c) => c.textContent.trim()));
+    check('D) 权限区提示文字存在（说明勾选规则）', /勾选一级权限会同时勾选/.test(txt('.perm-tip')), txt('.perm-tip'));
+
+    // ---------- E) 交互逻辑 ----------
+    log('\n— E) 勾选交互 —');
+    const setCb = async (cb, val) => { cb.checked = val; cb.dispatchEvent(new (W().Event)('change', { bubbles: true })); await sleep(150); };
+    const parentOf = (key) => Q('#permTree input[data-page="' + key + '"]');
+    const childrenOf = (key) => Qa('#permTree input[data-action][data-page="' + key + '"]');
+    const cardOf = (key) => Q('.perm-page[data-page-card="' + key + '"]');
+
+    await setCb(parentOf('attendance_management'), true);
+    check('E) 勾选一级权限「考勤管理」→ 其下 5 个子权限全部自动勾选',
+      childrenOf('attendance_management').every((c) => c.checked) && childrenOf('attendance_management').length === 5,
+      childrenOf('attendance_management').map((c) => c.checked));
+    check('E) 勾选后该卡片高亮（.on 类）', cardOf('attendance_management').classList.contains('on'));
+    await setCb(parentOf('attendance_management'), false);
+    check('E) 取消一级权限 → 其下子权限全部取消',
+      childrenOf('attendance_management').every((c) => !c.checked));
+    check('E) 取消后高亮消失', !cardOf('attendance_management').classList.contains('on'));
+    await setCb(childrenOf('inspection')[1], true);   // 只勾"创建问题"
+    check('E) 单独勾选子权限「创建问题」→ 自动勾选所属一级权限「巡堂记录」',
+      parentOf('inspection').checked === true && childrenOf('inspection')[1].checked === true);
+    check('E) 只勾一个子权限时其它子权限保持未勾选',
+      childrenOf('inspection').filter((c) => c.checked).length === 1,
+      childrenOf('inspection').map((c) => c.dataset.action + ':' + c.checked));
+    check('E) 系统管理复选框始终禁用（不可通过小组授予）', parentOf('system_management').disabled === true);
+
+    // ---------- F) 保存 → 重开编辑回显一致 ----------
+    log('\n— F) 保存与回显 —');
+    Q('#gName').value = GNAME;
+    Q('#gDesc').value = '排版用例';
+    Q('#gSubmit').click();
+    const saved = await until(() => txt('#groupList').includes(GNAME), 12000);
+    check('F) 保存成功 → 列表出现该小组', saved, txt('#groupList').slice(0, 80));
+    const row = Qa('#groupList tr').find((tr) => tr.textContent.includes(GNAME));
+    if (row) created.groupIds.push(Number(row.dataset.id));
+    const apiGroups = (await japi('/api/groups')).data.groups || [];
+    const g = apiGroups.find((x) => x.name === GNAME);
+    check('F) 后端保存的权限 = {pages:[inspection], actions:[create_issue]}（页面随子项自动带上）',
+      !!g && JSON.stringify(g.permissions) === JSON.stringify({ pages: ['inspection'], actions: ['create_issue'] }),
+      g && g.permissions);
+    // 重开编辑
+    if (row) {
+      row.querySelector('button[data-act="edit"]').click();
+      await until(() => !hidden('#groupModal') && Q('.perm-page'), 10000);
+      await sleep(400);
+      check('F) 重开编辑：名称与勾选状态正确回显（巡堂记录 + 创建问题）',
+        Q('#gName').value === GNAME && parentOf('inspection').checked === true &&
+        childrenOf('inspection').filter((c) => c.checked).length === 1 && childrenOf('inspection')[1].checked === true,
+        { name: Q('#gName').value, page: parentOf('inspection').checked, checked: childrenOf('inspection').map((c) => c.dataset.action + ':' + c.checked) });
+      check('F) 重开编辑：排版仍为单行横排（名称未被压缩）',
+        (() => { const h = Q('.perm-page[data-page-card="inspection"] .perm-head'); const n = Q('.perm-page[data-page-card="inspection"] .perm-name');
+          return rect(h).height <= (px(csEl(h, 'line-height')) + 2) && rect(n).width >= 48; })(),
+        (() => { const n = Q('.perm-page[data-page-card="inspection"] .perm-name'); return n && Math.round(rect(n).width); })());
+      Q('#gCancel').click();
+      await sleep(200);
+    } else { check('F) 重开编辑回显', false, '未找到新小组行'); }
+
+    // ---------- G) 窄屏（子权限换行但文字仍单行，不竖排、不溢出） ----------
+    log('\n— G) 窄屏排版 —');
+    fr.style.width = '520px'; fr.style.height = '900px';
+    await sleep(500);
+    await openModal();
+    await sleep(400);
+    const narrowHead = Qa('.perm-page .perm-head');
+    check('G) 窄屏：一级权限名称仍为单行（未逐字换行）',
+      narrowHead.every((h) => rect(h).height <= (px(csEl(h, 'line-height')) + 2)),
+      narrowHead.map((h) => Math.round(rect(h).height)));
+    const narrowChips = Qa('.perm-chip');
+    check('G) 窄屏：子权限 chip 文字仍单行（换行发生在 chip 之间）',
+      narrowChips.every((c) => rect(c).height <= (px(csEl(c, 'line-height')) + 2)),
+      narrowChips.map((c) => Math.round(rect(c).height)));
+    check('G) 窄屏：chip 仍然全部在卡片内、无横向溢出',
+      narrowChips.every((c) => rect(c).right <= rect(c.closest('.perm-page')).right - 4) &&
+      (() => { const t = Q('#permTree'); return t.scrollWidth <= t.clientWidth + 1; })(),
+      (() => { const t = Q('#permTree'); return { sw: t.scrollWidth, cw: t.clientWidth }; })());
+    check('G) 窄屏：卡片间距仍为 12px',
+      (() => { const rs = Qa('.perm-page').map(rect); for (let i = 1; i < rs.length; i++) { if (Math.round(rs[i].top - rs[i - 1].bottom) !== 12) return false; } return true; })());
+    Q('#gCancel').click();
+    await sleep(200);
+    fr.style.width = '1500px';
+    await sleep(300);
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const left = ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('排版UI组' + stamp + '$').test(x.name));
+    check('清理：临时小组已删除', left.length === 0, left.length);
+    const after = await snapshot();
+    check('清理：真实小组数量未变（管理员真实「教务组」保留）', after === realBefore, { before: realBefore, after });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

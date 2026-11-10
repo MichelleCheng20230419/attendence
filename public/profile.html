@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>个人中心 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="style.css?v=3.16.0">
+  <style>
+    .profile-head {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .avatar {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: var(--primary);
+      color: #fff;
+      font-size: 26px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--shadow-md);
+      flex-shrink: 0;
+    }
+    .profile-head h2 { font-size: 20px; margin-bottom: 4px; }
+    .profile-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      padding: 20px;
+    }
+    .card h3 {
+      font-size: 15px;
+      font-weight: 700;
+      padding-bottom: 10px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    input.readonly-field,
+    input:disabled {
+      background: var(--bg) !important;
+      color: var(--text-light);
+      cursor: not-allowed;
+    }
+    .stat-line {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      font-size: 14px;
+      color: var(--text-light);
+      border-bottom: 1px dashed #F0F2F5;
+    }
+    .stat-line b { color: var(--text); font-size: 15px; }
+    .security-row { margin-bottom: 8px; }
+    .profile-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 16px;
+    }
+    .profile-actions .btn { padding: 10px 36px; font-size: 15px; }
+    .sys-info {
+      text-align: right;
+      font-size: 12px;
+      color: var(--text-light);
+      margin-top: 16px;
+    }
+    .sys-info a { color: var(--primary); text-decoration: none; }
+    .role-tag { font-size: 13px; }
+    /* 教学设置（新增）：所带班级多选 */
+    .teach-class-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-height: 190px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+    }
+    .teach-class-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    .teach-class-item input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; }
+    .teach-class-item.head { border-color: var(--primary); color: var(--primary); font-weight: 600; }
+    /* 教学设置：首次确认横幅 / 锁定提示 */
+    .teach-banner {
+      background: #EAF3FF;
+      border: 1px solid #BBD8FF;
+      color: #1B5FBF;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    .teach-warn {
+      background: #FFF8E6;
+      border: 1px solid #FFE0A3;
+      color: #A9700B;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      margin-top: 10px;
+    }
+    .teach-lock-note {
+      background: var(--bg);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      color: var(--text-light);
+      margin-top: 12px;
+    }
+    .form-row-inline { display: flex; gap: 10px; margin-bottom: 8px; }
+    .form-row-inline select { flex: 1; }
+    @media (max-width: 800px) {
+      .profile-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏 -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+    <!-- 统一页头：返回按钮在左上角、与页面标题同一行（返回上一页） -->
+    <div class="page-head">
+      <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回上一页</button>
+      <h2 class="page-title">👤 个人中心</h2>
+    </div>
+
+    <!-- 顶部头像区 -->
+    <div class="profile-head">
+      <div class="avatar" id="avatar">👤</div>
+      <div>
+        <h2 id="profileTitle">--</h2>
+        <span id="roleTag" class="tag"></span>
+      </div>
+    </div>
+
+    <!-- 区块一 + 区块二 -->
+    <div class="profile-grid">
+      <!-- 基本信息 -->
+      <section class="card">
+        <h3>基本信息</h3>
+        <div class="form-row">
+          <label>姓名 *</label>
+          <input type="text" id="fName" maxlength="50">
+        </div>
+        <div class="form-row">
+          <label>工号（只读）</label>
+          <input type="text" id="fEmployeeNo" class="readonly-field" disabled>
+        </div>
+        <div class="form-row">
+          <label>工作单位</label>
+          <input type="text" id="fOrg" maxlength="100" placeholder="如：第三实验小学">
+        </div>
+        <div class="form-row">
+          <label>手机号</label>
+          <input type="text" id="fPhone" maxlength="11" placeholder="11 位手机号">
+        </div>
+        <div class="form-row">
+          <label>邮箱</label>
+          <input type="text" id="fEmail" maxlength="100" placeholder="name@example.com">
+        </div>
+        <div class="form-row">
+          <label>角色（只读）</label>
+          <div><span id="roleTag2" class="tag"></span></div>
+        </div>
+      </section>
+
+      <!-- 班级信息 -->
+      <section class="card">
+        <h3>班级信息</h3>
+        <div class="form-row">
+          <label>年级</label>
+          <select id="fGrade"></select>
+        </div>
+        <div class="form-row">
+          <label>班级</label>
+          <select id="fClass"></select>
+        </div>
+        <div class="stat-line"><span>班级学生人数</span><b id="fStudentCount">—</b></div>
+        <div class="stat-line"><span>本周出勤率</span><b id="fWeekRate">—</b></div>
+      </section>
+    </div>
+
+    <!-- 区块：教学设置（仅教师显示：未锁定→首次确认表单；已锁定→只读展示） -->
+    <section class="card hidden" id="teachCard">
+      <h3 id="teachCardTitle">📚 教学设置</h3>
+
+      <!-- 首次登录：确认表单（profile_locked = false） -->
+      <div id="teachSetupBox" class="hidden">
+        <div class="teach-banner">
+          👤 首次登录，请确认您的所教学科和所带班级
+        </div>
+        <div class="stat-line"><span>姓名</span><b id="tSetupName">—</b></div>
+        <div class="stat-line"><span>角色</span><b>教师</b></div>
+        <div class="form-row" style="margin-top:12px">
+          <label>所教学科 *</label>
+          <select id="tSubject">
+            <option value="">请选择学科</option>
+            <option>语文</option><option>数学</option><option>英语</option><option>物理</option>
+            <option>化学</option><option>生物</option><option>历史</option><option>政治</option>
+            <option>地理</option><option>其他</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>所带班级（可多选）</label>
+          <div class="form-row-inline">
+            <select id="tGrade"></select>
+          </div>
+          <div id="tClasses" class="teach-class-list"></div>
+          <div id="tHeadNote" class="hint hidden" style="font-size:12px;margin-top:6px"></div>
+        </div>
+        <div class="teach-warn">⚠️ 确认后将锁定，如需修改请联系管理员</div>
+        <div id="tMsg" class="hint hidden" style="font-size:12px"></div>
+        <div class="profile-actions" style="margin-top:10px">
+          <button id="tSave" class="btn btn-primary btn-sm">确认并锁定</button>
+        </div>
+      </div>
+
+      <!-- 已锁定：只读展示（profile_locked = true） -->
+      <div id="teachReadBox" class="hidden">
+        <div class="stat-line"><span>所教学科</span><b id="tReadSubject">—</b></div>
+        <div class="stat-line" style="align-items:flex-start">
+          <span>所带班级</span>
+          <b id="tReadClasses" style="text-align:right;max-width:70%">—</b>
+        </div>
+        <div class="teach-lock-note">🔒 如需修改，请联系管理员</div>
+      </div>
+    </section>
+
+    <!-- 区块三：安全设置 -->
+    <section class="card">
+      <h3>安全设置</h3>
+      <div class="security-row">
+        <button id="btnChangePass" class="btn btn-secondary">🔒 修改密码</button>
+      </div>
+      <div class="stat-line"><span>上次登录时间</span><b id="fLastLoginAt">—</b></div>
+      <div class="stat-line"><span>上次登录 IP</span><b id="fLastLoginIp">—</b></div>
+    </section>
+
+    <!-- 保存 -->
+    <div class="profile-actions">
+      <button id="btnSave" class="btn btn-primary">保 存</button>
+    </div>
+
+    <!-- 区块四：系统信息 -->
+    <div class="sys-info">系统版本 v2.3.1 · <a href="/help" target="_blank">帮助文档</a></div>
+    </section><!-- /.page-card -->
+  </div>
+
+  <!-- 修改密码弹窗 -->
+  <div id="pwdModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>🔒 修改密码</h3>
+      <div class="form-row">
+        <label>原密码 *</label>
+        <input type="password" id="pwdOld" autocomplete="current-password">
+      </div>
+      <div class="form-row">
+        <label>新密码 *（至少 4 位）</label>
+        <input type="password" id="pwdNew" autocomplete="new-password">
+      </div>
+      <div class="form-row">
+        <label>确认新密码 *</label>
+        <input type="password" id="pwdConfirm" autocomplete="new-password">
+      </div>
+      <div id="pwdError" class="import-preview err hidden"></div>
+      <div class="modal-actions">
+        <button id="pwdCancel" class="btn btn-secondary">取消</button>
+        <button id="pwdSubmit" class="btn btn-primary">确认修改</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提示浮层 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="profile.js?v=3.11.0"></script>
+</body>
+</html>

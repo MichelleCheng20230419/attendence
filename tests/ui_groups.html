@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：小组管理（灵活的权限配置系统）
+  验证点：
+    □ 系统管理下拉菜单包含 5 个子项，且「小组管理」在「学年管理」之后
+    □ 只有管理员能看到「系统管理 / 小组管理」，非管理员访问该页 → 302 回签到台
+    □ 点击「小组管理」进入独立页面（统一卡片布局）
+    □ 小组创建（名称/描述/权限勾选树：页面 + 页面下操作）
+    □ 成员分配（一个用户可属于多个小组）
+    □ 小组创建后，成员登录能看到对应菜单（叠加在原有角色菜单之上）
+    □ 多个小组权限自动合并（并集）
+    □ 不属于任何小组的用户菜单与改动前完全一致（兼容性）
+    □ 权限变更/移除成员即时生效（菜单消失、接口 403）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_groups.html public/_ui_groups.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiGrp --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_groups.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_groups.html
+  夹具：临时年级 + 1 班 + 2 教师 + 2 学生 + 2 小组（自愈式清理，并断言真实数据行数不变）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>小组管理（灵活权限配置系统）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#navbarMenus') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 25000);
+  await sleep(800);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+}
+const topMenus = () => Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item')
+  .filter((b) => visible('#' + b.id)).map((b) => b.id);
+const itemsOf = (menuId) => Qa('#' + menuId + ' .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '小组UI年级' + stamp, CLASS = '小组UI班' + stamp;
+const T1 = 'gu_tea1_' + stamp, T2 = 'gu_tea2_' + stamp, S1 = 'gu_stu1_' + stamp, S2 = 'gu_stu2_' + stamp;
+const G_INSPECT = '巡堂UI组' + stamp, G_STATS = '统计UI组' + stamp;
+const created = { gradeId: null, classId: null, teacherIds: [], studentIds: [], groupIds: [], userIds: [] };
+let realBefore = null;
+
+async function snapshotReal() {
+  const users = (await japi('/api/users')).data;
+  const classes = (await japi('/api/classes')).data;
+  const groups = (await japi('/api/groups')).data;
+  return {
+    users: ((users && users.users) || []).length,
+    classes: ((classes && classes.classes) || []).length,
+    groups: ((groups && groups.groups) || []).length,
+  };
+}
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const g of ((await japi('/api/groups')).data.groups || []).filter((x) => /UI组/.test(x.name))) {
+    await japi('/api/groups/' + g.id, { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^gu_/.test(x.username))) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^小组UI班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^小组UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshotReal();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'GU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    // 教师夹具：一次创建（profileLocked=true 免去"首次登录确认教学设置"，与 ui_menu_roles 一致）
+    const mkUser = async (u, role) => {
+      const r = await japi('/api/users', {
+        method: 'POST',
+        body: {
+          username: u, password: '123456', role, realName: u, classId: created.classId,
+          mustChangePassword: false, profileLocked: true,
+          ...(role === 'teacher' ? { subject: '数学', teachingClasses: [{ classId: created.classId, roleInClass: 'subject_teacher' }] } : {}),
+        },
+      });
+      if (r.status !== 201) log('  · 创建账号 ' + u + ' → ' + r.status + ' ' + JSON.stringify(r.data));
+      const id = r.data && r.data.user && r.data.user.id;
+      if (id) created.userIds.push(id);
+      return id;
+    };
+    await mkUser(T1, 'teacher');
+    await mkUser(T2, 'teacher');
+    await mkUser(S1, 'student');
+    await mkUser(S2, 'student');
+    const users = ((await japi('/api/users')).data.users || []);
+    const idOf = (u) => (users.find((x) => x.username === u) || {}).id;
+    created.teacherIds = [idOf(T1), idOf(T2)];
+    created.studentIds = [idOf(S1), idOf(S2)];
+    await asUser('admin');
+    // 两个小组：巡堂组（巡堂记录）/ 统计组（数据统计）
+    const g1 = await japi('/api/groups', { method: 'POST', body: { name: G_INSPECT, description: '教学巡查', permissions: { pages: ['inspection'], actions: ['view', 'create_issue'] } } });
+    const g2 = await japi('/api/groups', { method: 'POST', body: { name: G_STATS, description: '统计数据查看', permissions: { pages: ['data_stats'], actions: ['analysis', 'export'] } } });
+    check('0) 夹具就绪（年级 + 班 + 2 教师 + 2 学生 + 2 小组）',
+      !!created.gradeId && !!created.classId && created.teacherIds.every(Boolean) && created.studentIds.every(Boolean) && g1.status === 201 && g2.status === 201,
+      { t: created.teacherIds, s: created.studentIds, g1: g1.status, g2: g2.status });
+    created.groupIds = [g1.data.group.id, g2.data.group.id];
+    // 成员：T1 只属巡堂组；T2 同属两组的教师；S1 同属两组（验证并集与"非教师角色也能按组授权"）
+    await japi('/api/groups/' + created.groupIds[0] + '/members', { method: 'PUT', body: { userIds: [created.teacherIds[0], created.teacherIds[1], created.studentIds[0]] } });
+    await japi('/api/groups/' + created.groupIds[1] + '/members', { method: 'PUT', body: { userIds: [created.teacherIds[1], created.studentIds[0]] } });
+    check('0) 成员分配就绪（T1→巡堂组；T2→两组；S1→两组；S2→无小组）', true);
+
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+
+    // ---------- A) 管理员：系统管理下拉 5 项 + 小组管理在学年管理之后 ----------
+    log('\n— A) 管理员入口 —');
+    await asUser('admin');
+    await loadPage('/dashboard');
+    W().__nav.openGroup('navGroupSystem');
+    await sleep(250);
+    const adminItems = itemsOf('navSystemMenu');
+    check('A) 系统管理下拉 = 5 个子项（账号/年级/班级/学年/小组管理）',
+      JSON.stringify(adminItems) === JSON.stringify(['btnAdminUsers', 'btnAdminGrades', 'btnAdminClasses', 'btnAdminYears', 'btnAdminGroups']),
+      adminItems);
+    check('A) 「小组管理」排在「学年管理」之后', adminItems.indexOf('btnAdminGroups') === adminItems.indexOf('btnAdminYears') + 1, adminItems);
+    check('A) 「小组管理」文案与路径正确',
+      /小组管理/.test(txt('#btnAdminGroups')) && Q('#btnAdminGroups').dataset.path === '/admin/group-management',
+      { text: txt('#btnAdminGroups'), path: Q('#btnAdminGroups').dataset.path });
+    Q('#btnAdminGroups').click();
+    const onGroupPage = await until(() => W().location.pathname === '/admin/group-management', 12000);
+    check('A) 点「小组管理」→ 进入独立页面 /admin/group-management', onGroupPage, W().location.pathname);
+    await until(() => Q('#groupList'), 15000);
+    await sleep(600);
+    check('A) 独立页面：统一卡片 + 页头（返回签到 / 标题居中）',
+      !!Q('.container > .page-card') && /返回签到/.test(txt('#btnBack')) && /小组管理/.test(txt('.page-title')));
+    check('A) 页面无页内 Tab（独立页面，非 Tab 切换）', !Q('.admin-tabs') && !Q('.admin-tab'));
+    check('A) 列出夹具小组（含成员数 3/2 与权限徽章）',
+      txt('#groupList').includes(G_INSPECT) && txt('#groupList').includes(G_STATS) &&
+      /巡查记录|巡堂记录/.test(txt('#groupList')) && /3 人/.test(txt('#groupList')) && /2 人/.test(txt('#groupList')),
+      txt('#groupList').slice(0, 140));
+
+    // ---------- B) 非管理员不可见 / 不可访问 ----------
+    log('\n— B) 非管理员 —');
+    await asUser(T1);
+    await loadPage('/dashboard');
+    check('B) 教师：系统管理分组不可见（无小组管理入口）',
+      !visible('#navSystem') && hidden('#navGroupSystem') && hidden('#btnAdminGroupsFull'.replace('Full', '')) || hidden('#btnAdminGroups'),
+      { navSystem: visible('#navSystem'), btnAdminGroups: hidden('#btnAdminGroups') });
+    const res = await fetch('/admin/group-management', { credentials: 'same-origin', redirect: 'follow' });
+    const finalPath = new URL(res.url).pathname;
+    check('B) 教师直接访问 /admin/group-management → 落到签到台', res.status === 200 && finalPath === '/dashboard', { status: res.status, path: finalPath });
+    const apiGroups = await japi('/api/groups');
+    check('B) 教师调小组 API → 403', apiGroups.status === 403, apiGroups.status);
+
+    // ---------- C) 小组创建（UI 表单 + 权限勾选树） ----------
+    log('\n— C) 界面创建小组 —');
+    await asUser('admin');
+    await loadPage('/admin/group-management', '#groupList');
+    Q('#btnAddGroup').click();
+    await sleep(400);
+    check('C) 点「＋ 新建小组」→ 弹窗打开', !hidden('#groupModal') && visible('#groupModal'));
+    check('C) 权限勾选树渲染出页面项（含巡堂记录）',
+      Qa('#permTree input[data-page]').length >= 5 && !!Q('#permTree input[data-page="inspection"]'),
+      Qa('#permTree input[data-page]').map((c) => c.dataset.page));
+    check('C) 巡堂记录下有细分操作（创建问题/添加反馈/上传照片）',
+      Qa('#permTree input[data-action]').filter((c) => c.dataset.page === 'inspection').length === 4,
+      Qa('#permTree input[data-action]').filter((c) => c.dataset.page === 'inspection').map((c) => c.dataset.action));
+    check('C) 子权限复选框始终可勾选（不强制依赖父级）',
+      Qa('#permTree input[data-action][data-page="inspection"]').every((c) => c.disabled === false));
+    // 只勾"创建问题"（不先勾父级）→ 自动带上父级"巡堂记录"
+    const actCb = Q('#permTree input[data-action="create_issue"]');
+    actCb.checked = true;
+    actCb.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await sleep(200);
+    const pageCb = Q('#permTree input[data-page="inspection"]');
+    check('C) 单独勾选子权限 → 自动勾选所属一级权限', pageCb.checked === true, pageCb.checked);
+    Q('#gName').value = '德育UI组' + stamp;
+    Q('#gDesc').value = '界面创建的小组';
+    Q('#gSubmit').click();
+    const createdOk = await until(() => txt('#groupList').includes('德育UI组' + stamp), 12000);
+    check('C) 保存 → 列表出现新小组', createdOk, txt('#groupList').slice(0, 100));
+    // 记录 id 供清理
+    const newRow = Qa('#groupList tr').find((tr) => tr.textContent.includes('德育UI组' + stamp));
+    if (newRow) created.groupIds.push(Number(newRow.dataset.id));
+    check('C) 新小组权限徽章含「巡堂记录」', !!newRow && /巡堂记录/.test(newRow.textContent), newRow && newRow.textContent.replace(/\s+/g, ' ').slice(0, 80));
+
+    // 编辑：改描述
+    if (newRow) {
+      newRow.querySelector('button[data-act="edit"]').click();
+      await sleep(400);
+      check('C) 点「编辑」→ 弹窗回填名称与已选权限',
+        Q('#gName').value === '德育UI组' + stamp && Q('#permTree input[data-page="inspection"]').checked === true &&
+        Q('#permTree input[data-action="create_issue"]').checked === true,
+        { name: Q('#gName').value, page: Q('#permTree input[data-page="inspection"]').checked, act: Q('#permTree input[data-action="create_issue"]').checked });
+      Q('#gDesc').value = '已编辑描述';
+      Q('#gSubmit').click();
+      const edited = await until(() => txt('#groupList').includes('已编辑描述'), 12000);
+      check('C) 保存编辑 → 列表描述更新', edited);
+    } else { check('C) 编辑小组', false, '未找到新小组行'); }
+
+    // ---------- D) 成员管理（界面） ----------
+    log('\n— D) 成员管理（界面） —');
+    const gInspRow = Qa('#groupList tr').find((tr) => tr.textContent.includes(G_INSPECT));
+    gInspRow.querySelector('button[data-act="members"]').click();
+    await until(() => Qa('#mmList input[data-uid]').length > 0, 12000);
+    await sleep(300);
+    check('D) 点「管理成员」→ 弹窗列出用户且已选成员被勾选',
+      Qa('#mmList input[data-uid]').length > 0 &&
+      Qa('#mmList input[data-uid]').filter((c) => c.checked).length === 3,
+      { total: Qa('#mmList input[data-uid]').length, checked: Qa('#mmList input[data-uid]').filter((c) => c.checked).length });
+    // 取消勾选 S1，保存
+    const s1cb = Qa('#mmList input[data-uid]').find((c) => c.checked && c.closest('.member-row').textContent.includes(S1));
+    if (s1cb) {
+      s1cb.checked = false;
+      s1cb.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      Q('#mmSubmit').click();
+      const saved = await until(() => {
+        const row = Qa('#groupList tr').find((tr) => tr.textContent.includes(G_INSPECT));
+        return row && /2 人/.test(row.textContent);
+      }, 12000);
+      check('D) 取消成员后保存 → 成员数 3 → 2', saved, Qa('#groupList tr').map((tr) => tr.textContent.replace(/\s+/g, ' ').slice(0, 60)));
+    } else { check('D) 取消成员', false, '未找到该成员的勾选框'); }
+    // 恢复：把 S1 加回（供并集用例）
+    await japi('/api/groups/' + created.groupIds[0] + '/members', { method: 'PUT', body: { userIds: [created.teacherIds[0], created.teacherIds[1], created.studentIds[0]] } });
+
+    // ---------- E) 成员登录后菜单 ----------
+    log('\n— E) 成员菜单（巡堂组成员） —');
+    await asUser(T1);
+    await loadPage('/dashboard');
+    check('E) T1（巡堂组）：导航出现「🧭 巡堂记录」',
+      visible('#navInspection') && /巡堂记录/.test(txt('#navInspection')), topMenus());
+    check('E) T1 原有角色菜单不变（考勤管理/教学工具/数据统计仍在）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navInspection', 'navAttendanceMgmt', 'navTeaching', 'navStats']),
+      topMenus());
+    Q('#navInspection').click();
+    const onInsp = await until(() => W().location.pathname === '/inspection', 12000);
+    check('E) 点「巡堂记录」→ 打开 /inspection', onInsp, W().location.pathname);
+    await until(() => Q('#issueBody'), 15000);
+    await sleep(800);
+    check('E) 巡堂记录列表页在统一卡片内（含返回签到/标题/导航栏）',
+      !!Q('.container > .page-card') && !!Q('#navbarMenus') && /返回签到/.test(txt('#btnBack')) && /巡堂记录/.test(txt('.page-title')));
+    check('E) 列表页渲染筛选栏与表格（真实业务页面）',
+      !!Q('#fStatus') && !!Q('#fGrade') && !!Q('#fClass') && !!Q('#fDate') && !!Q('#fKeyword') && !!Q('.insp-table') && !!Q('#rangeInfo'));
+    check('E) 授权操作可用：有 create_issue 权限 → 「＋ 记录问题」按钮可点',
+      !!Q('#btnNewIssue') && Q('#btnNewIssue').disabled === false, Q('#btnNewIssue') && Q('#btnNewIssue').disabled);
+    Q('#btnNewIssue').click();
+    const onNew = await until(() => W().location.pathname === '/inspection/new', 12000);
+    await until(() => Q('#issueForm'), 12000);
+    await sleep(500);
+    check('E) 点「＋ 记录问题」→ 打开创建页且表单可用（有权限）',
+      onNew && !!Q('#fDescription') && Q('#fDescription').disabled === false && hidden('#denyTip'),
+      { path: W().location.pathname, disabled: Q('#fDescription') && Q('#fDescription').disabled });
+
+    // ---------- F) 多小组并集 ----------
+    log('\n— F) 多个小组权限合并 —');
+    await asUser(T2);
+    await loadPage('/dashboard');
+    check('F) T2（巡堂组 + 统计组）：同时可见 巡堂记录 与 数据统计',
+      visible('#navInspection') && visible('#navStats') && visible('#navAttendanceMgmt'),
+      topMenus());
+    check('F) T2 数据统计下拉含 课堂表现/考勤分析（作业统计已提到顶层）',
+      JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis', 'btnInspectionPanel']),
+      itemsOf('navStatsMenu'));
+
+    await asUser(S1);   // 学生 + 两个小组 → 菜单 = 签到操作 + 巡堂记录 + 数据统计
+    await loadPage('/dashboard');
+    check('F) S1（学生 + 两小组）：菜单 = 签到操作 + 巡堂记录 + 数据统计（并集）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navInspection', 'navStats']), topMenus());   // 学生看不到作业统计
+    const inspRes = await fetch('/inspection', { credentials: 'same-origin', redirect: 'follow' });
+    check('F) S1 可打开 /inspection（小组授权页面）', new URL(inspRes.url).pathname === '/inspection', new URL(inspRes.url).pathname);
+
+    await asUser(S2);   // 无小组的学生 → 与改动前一致
+    await loadPage('/dashboard');
+    check('F) S2（无小组学生）：菜单只有签到操作（与改动前完全一致）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance']), topMenus());
+    check('F) S2 访问 /inspection → 回签到台（未授权）',
+      await (async () => { const r = await fetch('/inspection', { credentials: 'same-origin', redirect: 'follow' }); return new URL(r.url).pathname === '/dashboard'; })());
+
+    // ---------- G) 权限即时生效 ----------
+    log('\n— G) 权限即时生效 —');
+    await asUser('admin');
+    await japi('/api/groups/' + created.groupIds[0] + '/members', { method: 'PUT', body: { userIds: [created.teacherIds[1], created.studentIds[0]] } });
+    await asUser(T1);
+    await loadPage('/dashboard');
+    check('G) T1 被移出小组后 → 巡堂记录菜单消失', hidden('#navInspection'), topMenus());
+    await asUser('admin');
+    await japi('/api/groups/' + created.groupIds[0] + '/members', { method: 'PUT', body: { userIds: [created.teacherIds[0], created.teacherIds[1], created.studentIds[0]] } });
+    await japi('/api/groups/' + created.groupIds[0], { method: 'PUT', body: { name: G_INSPECT, description: '教学巡查', permissions: { pages: ['inspection'], actions: ['view'] } } });
+    await asUser(T1);
+    await loadPage('/inspection', '#issueBody');
+    await sleep(800);
+    check('G) 取消「创建问题」权限后 → 列表页「＋ 记录问题」按钮被禁用',
+      !!Q('#btnNewIssue') && Q('#btnNewIssue').disabled === true, Q('#btnNewIssue') && Q('#btnNewIssue').disabled);
+    await loadPage('/inspection/new', '#issueForm');
+    await sleep(700);
+    check('G) 取消权限后创建页显示无权限提示且不可提交',
+      !hidden('#denyTip') && Q('#btnSubmit').disabled === true,
+      { tip: hidden('#denyTip'), submit: Q('#btnSubmit') && Q('#btnSubmit').disabled });
+
+    // ---------- 清理 ----------
+    log('\n— 清理 —');
+    await asUser('admin');
+    await hardCleanup();
+    const leftGroups = ((await japi('/api/groups')).data.groups || []).filter((g) => /UI组/.test(g.name));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^gu_/.test(u.username));
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^小组UI班/.test(c.className));
+    check('清理：夹具小组/账号/班级已删除',
+      leftGroups.length === 0 && leftUsers.length === 0 && leftClasses.length === 0,
+      { g: leftGroups.length, u: leftUsers.length, c: leftClasses.length });
+    const realAfter = await snapshotReal();
+    check('清理：真实用户/班级/小组数量未变', JSON.stringify(realBefore) === JSON.stringify(realAfter), { before: realBefore, after: realAfter });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

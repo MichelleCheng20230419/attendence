@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome 样式/布局验证：叫号管理页（卡片式美化）
+  验证方式：读取 iframe 内真实 DOM 的 computedStyle + 几何尺寸（不依赖人工看图）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_announcements_style.html public/_ui_announcements_style.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiAnnStyle --virtual-time-budget=200000 --dump-dom `
+         "http://localhost:3000/_ui_announcements_style.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_announcements_style.html
+  夹具：临时年级 + 1 班（2 学生）+ 老师/班长账号 + 3 条叫号（待处理/紧急/已处理已播报）；自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -10000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>叫号管理页样式/布局（卡片式美化）自动化验证</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? fr.contentWindow.getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const csEl = (e, prop) => (e ? fr.contentWindow.getComputedStyle(e).getPropertyValue(prop).trim() : null);
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const setWidth = async (w) => { fr.style.width = w + 'px'; fr.style.height = '1100px'; await sleep(500); };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '样式年级' + stamp, CLASS = '样式班' + stamp;
+const TEA = 'style_tea_' + stamp, MON = 'style_mon_' + stamp;
+const NAMES = ['孙伯文', '李文博'];
+const created = { gradeId: null, classId: null, userIds: [], studentIds: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const classes = (await japi('/api/classes')).data.classes || [];
+  for (const c of classes.filter((x) => /^样式班/.test(x.className))) {
+    const anns = (await japi('/api/announcements?classId=' + c.id)).data.announcements || [];
+    for (const a of anns) await japi('/api/announcements/' + a.id, { method: 'DELETE' });
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^style_/.test(x.username))) {
+      await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+      await japi('/api/users/' + u.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^样式年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+  if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });  // 按 id 兜底，避免残留
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'STY', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    let r = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '样式老师', subject: '语文', profileLocked: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '样式班长', classId: created.classId, mustChangePassword: false } });
+    created.userIds.push(r.data.user.id);
+    for (let i = 0; i < NAMES.length; i += 1) {
+      const rr = await japi('/api/students', { method: 'POST', body: { studentNo: 'STY' + stamp + '0' + (i + 1), name: NAMES[i], classId: created.classId, status: '在读' } });
+      created.studentIds.push(rr.data.student.id);
+    }
+    const today = (() => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; })();
+    // 以「老师本人」身份发布（教师端列表只显示自己发布的叫号）
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: TEA, password: '123456' } });
+    const mk = async (i, loc, time, note, urgent) => (await japi('/api/announcements', { method: 'POST', body: { classId: created.classId, studentId: created.studentIds[i], location: loc, scheduledTime: today + ' ' + time, note, priority: urgent ? 'urgent' : 'normal' } })).data.announcement;
+    await mk(0, '教学楼北楼305', '19:00', '带上作业本', false);
+    await mk(1, '教务处（一楼东）', '19:30', '家长到访', true);
+    const a3 = await mk(0, '广播室', '18:30', '', false);
+    // 班长把第 3 条标记为已处理（自动同时置 is_played）
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: MON, password: '123456' } });
+    await japi('/api/announcements/' + a3.id + '/played', { method: 'POST' });
+    await japi('/api/announcements/' + a3.id + '/process', { method: 'POST' });
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: TEA, password: '123456' } });
+
+    await setWidth(1420);
+    fr.src = '/announcements';
+    await until(() => F() && F().readyState === 'complete' && Qa('#anBody tr').length === 3, 25000);
+    await sleep(700);
+    check('0) 页面就绪（3 条叫号：待处理 2 / 已处理 1）', Qa('#anBody tr').length === 3, Qa('#anBody tr').length);
+
+    // ---------- A) 整体布局 ----------
+    check('A) 页面背景 = #f5f7fa', cs('body', 'background-color') === 'rgb(245, 247, 250)', cs('body', 'background-color'));
+    check('A) 页面内容包裹在统一白色卡片中（.container > .page-card）',
+      !!Q('.container > .page-card') && Q('.container').children.length === 1,
+      Q('.container') ? [...Q('.container').children].map((c) => c.tagName + '.' + c.className) : null);
+    check('A) 两个小节：发布叫号 + 我的叫号列表（都在同一张卡片内）',
+      !!Q('#anPublishCard') && !!Q('#anListCard') && Q('.page-card').contains(Q('#anPublishCard')) && Q('.page-card').contains(Q('#anListCard')));
+    const c1 = ['background-color', 'border-radius', 'box-shadow', 'padding-top'].map((p) => cs('.page-card', p));
+    check('A) 卡片：白底 / 圆角 12px / 有阴影 / 内边距 24px',
+      c1[0] === 'rgb(255, 255, 255)' && c1[1] === '12px' && c1[2] !== 'none' && c1[3] === '24px', c1);
+    // 卡片边框统一使用全站 --border 变量（#e4e9f0），不再用页面私有色
+    const borderRgb = (() => {
+      const hex = fr.contentWindow.getComputedStyle(F().documentElement).getPropertyValue('--border').trim().replace('#', '');
+      const n = parseInt(hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex, 16);
+      return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`;
+    })();
+    check('A) 卡片边框 = 全站统一 --border 变量', cs('.page-card', 'border-top-color') === borderRgb,
+      { got: cs('.page-card', 'border-top-color'), want: borderRgb });
+    check('A) 小节之间用分隔线区分（第二个小节有上边框）',
+      cs('#anListCard', 'border-top-width') === '1px', cs('#anListCard', 'border-top-width'));
+    const h3 = Q('#anPublishCard .an-card-head h3');
+    check('A) 卡片标题加粗 16px', csEl(h3, 'font-size') === '16px' && csEl(h3, 'font-weight') === '800',
+      [csEl(h3, 'font-size'), csEl(h3, 'font-weight')]);
+    check('A) 标题下有分隔线（head 下边框）', cs('#anPublishCard .an-card-head', 'border-bottom-width') === '1px');
+    const box1 = Q('#anPublishCard').getBoundingClientRect();
+    const box2 = Q('#anListCard').getBoundingClientRect();
+    check('A) 两小节不重叠且上下排列', box2.top >= box1.bottom - 1, Math.round(box2.top - box1.bottom));
+
+    // ---------- B) 表单分组与字段对齐 ----------
+    const grid = cs('.an-form-grid', 'grid-template-columns').split(' ').filter((x) => x && x !== '0px');
+    check('B) 桌面端表单两列布局', grid.length === 2, grid);
+    const l1 = Q('#anClass').closest('.an-field').getBoundingClientRect();
+    const l2 = Q('#anLocation').closest('.an-field').getBoundingClientRect();
+    check('B) 左列(班级/学生) 与 右列(到何处/何时/备注) 分列对齐',
+      l2.left > l1.right - 5 && Math.abs(l1.top - l2.top) < 30, { l1: [Math.round(l1.left), Math.round(l1.right)], l2: [Math.round(l2.left), Math.round(l2.right)] });
+    const lab = document.createElement('div');
+    const labelEl = Q('#anClass').closest('.an-field').querySelector('label');
+    check('B) 字段标签 13px / 颜色 #666',
+      csEl(labelEl, 'font-size') === '13px' && csEl(labelEl, 'color') === 'rgb(102, 102, 102)',
+      [csEl(labelEl, 'font-size'), csEl(labelEl, 'color')]);
+    check('B) 必填项标红 *', [...Qa('.an-field .req')].every((e) => csEl(e, 'color') === 'rgb(239, 68, 68)') && Qa('.an-field .req').length >= 3,
+      Qa('.an-field .req').length);
+    check('B) 输入框圆角 8px / 浅灰边框',
+      cs('#anLocation', 'border-radius') === '8px' && cs('#anLocation', 'border-top-color') === 'rgb(232, 236, 241)',
+      [cs('#anLocation', 'border-radius'), cs('#anLocation', 'border-top-color')]);
+    // 聚焦变蓝
+    const inp = Q('#anLocation');
+    inp.focus();
+    await sleep(400);
+    check('B) 输入框聚焦边框变蓝 #2563eb', cs('#anLocation', 'border-top-color') === 'rgb(37, 99, 235)', cs('#anLocation', 'border-top-color'));
+    inp.blur();
+    check('B) 何时字段：日期 + 时间 同行', (() => {
+      const d = Q('#anDate').getBoundingClientRect(), t = Q('#anTime').getBoundingClientRect();
+      return Math.abs(d.top - t.top) < 4 && t.left > d.right - 4;
+    })(), [Q('#anDate').getBoundingClientRect().top, Q('#anTime').getBoundingClientRect().top]);
+    check('B) 表单底部有操作区（上方虚线分隔）', !!Q('.an-form-actions') && cs('.an-form-actions', 'border-top-style') === 'dashed',
+      cs('.an-form-actions', 'border-top-style'));
+
+    // ---------- C) 按钮主次区分 ----------
+    check('C) 主按钮「发布叫号」蓝色实心 + 圆角 8px',
+      cs('#anSubmit', 'background-color') === 'rgb(37, 99, 235)' && cs('#anSubmit', 'border-radius') === '8px' && cs('#anSubmit', 'color') === 'rgb(255, 255, 255)',
+      [cs('#anSubmit', 'background-color'), cs('#anSubmit', 'border-radius')]);
+    check('C) 主按钮有阴影（层次感）', cs('#anSubmit', 'box-shadow') !== 'none', cs('#anSubmit', 'box-shadow'));
+    check('C) 次按钮「重置」白底描边（与主按钮区分）',
+      cs('#anFilterReset', 'background-color') === 'rgb(255, 255, 255)' && cs('#anFilterReset', 'border-top-style') === 'solid',
+      [cs('#anFilterReset', 'background-color'), cs('#anFilterReset', 'border-top-style')]);
+    const cssHover = await (await fetch('/announcements')).text();
+    check('C) 主按钮悬停加深（:hover 规则存在）', /\.an-btn-primary:not\(:disabled\):hover\s*\{[^}]*var\(--an-primary-dark\)/.test(cssHover));
+    check('C) 次按钮悬停有反馈（:hover 规则存在）', /\.an-btn-ghost:hover\s*\{[^}]*primary-soft/.test(cssHover));
+    check('C) 顶部按钮悬停有反馈（:hover 规则存在）', /\.action-bar button:hover\s*\{/.test(cssHover));
+    check('C) 页头返回按钮已统一为 .back-link（左上角文字按钮）', /id="btnBack" class="back-link"/.test(cssHover));
+    // 紧急复选框
+    const chkLabel = Q('.an-check');
+    check('C) 「紧急」复选框红色文字', csEl(chkLabel, 'color') === 'rgb(239, 68, 68)', csEl(chkLabel, 'color'));
+    Q('#anUrgent').checked = true;
+    Q('#anUrgent').dispatchEvent(new (fr.contentWindow.Event)('change', { bubbles: true }));
+    await sleep(150);
+    check('C) 勾选「紧急」后显示红色边框',
+      csEl(chkLabel, 'border-top-style') === 'solid' && csEl(chkLabel, 'border-top-color') === 'rgb(239, 68, 68)',
+      [csEl(chkLabel, 'border-top-style'), csEl(chkLabel, 'border-top-color')]);
+    Q('#anUrgent').checked = false;
+    Q('#anUrgent').dispatchEvent(new (fr.contentWindow.Event)('change', { bubbles: true }));
+
+    // ---------- D) 列表与状态标签 ----------
+    check('D) 表头浅蓝底 #f0f7ff 且加粗',
+      cs('table.an-table thead th', 'background-color') === 'rgb(240, 247, 255)' && cs('table.an-table thead th', 'font-weight') === '800',
+      [cs('table.an-table thead th', 'background-color'), cs('table.an-table thead th', 'font-weight')]);
+    check('D) 行悬停浅蓝 #f5f9ff（:hover 规则存在）', /tbody tr:hover\s*\{\s*background:\s*#f5f9ff/.test(cssHover));
+    check('D) 统计文案「共 X 条，待处理 X 条」且待处理橙色',
+      /共\s*3\s*条/.test(txt('#anCount')) && /待处理\s*2\s*条/.test(txt('#anCount')) && cs('#anCount .pend', 'color') === 'rgb(245, 158, 11)',
+      txt('#anCount'));
+    const tagPend = Qa('#anBody .an-tag.pending')[0];
+    const tagProc = Qa('#anBody .an-tag.processed')[0];
+    const tagPlay = Qa('#anBody .an-tag.played')[0];
+    check('D) 「待处理」橙色标签（橙底/橙字）',
+      !!tagPend && csEl(tagPend, 'background-color') === 'rgb(255, 247, 230)' && csEl(tagPend, 'color') === 'rgb(180, 83, 9)',
+      tagPend ? [csEl(tagPend, 'background-color'), csEl(tagPend, 'color')] : null);
+    check('D) 「已处理」绿色标签（绿底/绿字 #10b981 系）',
+      !!tagProc && csEl(tagProc, 'background-color') === 'rgb(232, 249, 242)' && csEl(tagProc, 'color') === 'rgb(4, 120, 87)',
+      tagProc ? [csEl(tagProc, 'background-color'), csEl(tagProc, 'color')] : null);
+    check('D) 「已播报」蓝色文字标签（无底色）',
+      !!tagPlay && csEl(tagPlay, 'color') === 'rgb(37, 99, 235)' && csEl(tagPlay, 'background-color') === 'rgba(0, 0, 0, 0)',
+      tagPlay ? [csEl(tagPlay, 'color'), csEl(tagPlay, 'background-color')] : null);
+    const urgentRow = Qa('#anBody tr.urgent')[0];
+    check('D) 紧急行浅红底 + 左侧红色标记',
+      !!urgentRow && csEl(urgentRow, 'background-color') === 'rgb(255, 247, 247)' && /inset/.test(csEl(urgentRow, 'box-shadow')),
+      urgentRow ? [csEl(urgentRow, 'background-color'), csEl(urgentRow, 'box-shadow')] : null);
+    check('D) 紧急标签红色', Qa('#anBody .an-tag.urgent').length >= 1 && csEl(Qa('#anBody .an-tag.urgent')[0], 'color') === 'rgb(239, 68, 68)');
+    // 操作列文字按钮
+    const detailBtn = Qa('#anBody button[data-act="detail"]')[0];
+    const delBtn = Qa('#anBody button[data-act="del"]')[0];
+    check('D) 操作列「详情」蓝色文字按钮（无边框无底色）',
+      csEl(detailBtn, 'color') === 'rgb(37, 99, 235)' && csEl(detailBtn, 'border-top-style') === 'none' && csEl(detailBtn, 'background-color') === 'rgba(0, 0, 0, 0)',
+      [csEl(detailBtn, 'color'), csEl(detailBtn, 'border-top-style'), csEl(detailBtn, 'background-color')]);
+    check('D) 操作列「删除」红色文字按钮',
+      csEl(delBtn, 'color') === 'rgb(239, 68, 68)' && csEl(delBtn, 'border-top-style') === 'none', csEl(delBtn, 'color'));
+    check('D) 「详情」「删除」水平排列在同一操作格内',
+      (() => { const a = detailBtn.getBoundingClientRect(), b = delBtn.getBoundingClientRect(); return Math.abs(a.top - b.top) < 4 && b.left > a.right - 2; })());
+    check('D) 筛选栏（状态/日期/重置）水平排列',
+      (() => {
+        const s = Q('#anFilterStatus').getBoundingClientRect(), d = Q('#anFilterDate').getBoundingClientRect(), b = Q('#anFilterReset').getBoundingClientRect();
+        return Math.abs(s.top - d.top) < 4 && Math.abs(d.top - b.top) < 6 && b.left > d.right - 2;
+      })());
+    // 表格不溢出卡片
+    check('D) 桌面端表格宽度自适应卡片（无横向溢出）', (() => {
+      const w = Q('.an-table-wrap'); return w.scrollWidth <= w.clientWidth + 1;
+    })(), [Q('.an-table-wrap').scrollWidth, Q('.an-table-wrap').clientWidth]);
+
+    // ---------- E) 空状态 ----------
+    Q('#anFilterReset').click();
+    await sleep(300);
+    const emptyAfterDate = (async () => {
+      const d = Q('#anFilterDate');
+      d.value = '2000-01-01';
+      d.dispatchEvent(new (fr.contentWindow.Event)('change', { bubbles: true }));
+      await sleep(900);
+    })();
+    await emptyAfterDate;
+    check('E) 无数据时显示占位图 + 「暂无叫号记录」',
+      !!Q('#anBody .an-empty svg') && /暂无叫号记录/.test(txt('#anBody')), txt('#anBody').slice(0, 60));
+    check('E) 空状态含引导文案', /发布后即显示在这里/.test(txt('#anBody')), txt('#anBody').slice(0, 90));
+    check('E) 空状态占位图为内联 SVG（无需外部图片）', (Q('#anBody .an-empty svg') || {}).tagName === 'svg');
+    // 恢复
+    Q('#anFilterDate').value = '';
+    Q('#anFilterDate').dispatchEvent(new (fr.contentWindow.Event)('change', { bubbles: true }));
+    await until(() => Qa('#anBody tr').length === 3, 10000);
+
+    // ---------- F) 响应式 ----------
+    await setWidth(900);
+    const gridTab = cs('.an-form-grid', 'grid-template-columns').split(' ').filter((x) => x && x !== '0px');
+    check('F) 平板(900px)：表单自动换行 → 单列', gridTab.length === 1, gridTab);
+    await setWidth(1420);
+    const gridDesk = cs('.an-form-grid', 'grid-template-columns').split(' ').filter((x) => x && x !== '0px');
+    check('F) 回到桌面(1420px)：恢复两列', gridDesk.length === 2, gridDesk);
+    await setWidth(420);
+    const wrap = Q('.an-table-wrap');
+    check('F) 手机(420px)：表格可左右滑动（scrollWidth > clientWidth）', wrap.scrollWidth > wrap.clientWidth + 1,
+      [wrap.scrollWidth, wrap.clientWidth]);
+    check('F) 手机端表格保留最小宽度（不挤压变形）', fr.contentWindow.getComputedStyle(Q('table.an-table')).minWidth === '720px',
+      fr.contentWindow.getComputedStyle(Q('table.an-table')).minWidth);
+    const gridMob = cs('.an-form-grid', 'grid-template-columns').split(' ').filter((x) => x && x !== '0px');
+    check('F) 手机端表单单列堆叠', gridMob.length === 1, gridMob);
+    check('F) 手机端日期/时间上下排列', (() => {
+      const d = Q('#anDate').getBoundingClientRect(), t = Q('#anTime').getBoundingClientRect();
+      return t.top > d.bottom - 2;
+    })());
+    check('F) 手机端页面无整体横向溢出', (() => {
+      const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1;
+    })(), (() => { const de = F().documentElement; return [de.scrollWidth, de.clientWidth]; })());
+    await setWidth(1420);
+
+    // ---------- G) 详情弹窗样式 ----------
+    Qa('#anBody button[data-act="detail"]')[0].click();
+    await until(() => !Q('#anDetailMask').classList.contains('hidden'), 8000);
+    await sleep(250);
+    check('G) 详情弹窗白底圆角 + 遮罩半透明',
+      cs('.an-modal', 'background-color') === 'rgb(255, 255, 255)' && cs('.an-modal', 'border-radius') === '14px' &&
+      /rgba\(15, 23, 42/.test(cs('#anDetailMask', 'background-color')),
+      [cs('.an-modal', 'background-color'), cs('#anDetailMask', 'background-color')]);
+    check('G) 详情字段两列表格对齐（dt 96px）', cs('#anDetailBody', 'grid-template-columns').startsWith('96px'), cs('#anDetailBody', 'grid-template-columns'));
+    check('G) 详情弹窗底部「关闭」为次按钮样式', cs('#anDetailClose', 'background-color') === 'rgb(255, 255, 255)');
+    Q('#anDetailClose').click();
+    check('G) 关闭详情弹窗', await until(() => Q('#anDetailMask').classList.contains('hidden'), 5000));
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^样式班/.test(c.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^style_/.test(u.username));
+    check('清理：临时班级/账号已删除', leftClasses.length === 0 && leftUsers.length === 0, { classes: leftClasses.length, users: leftUsers.length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：巡堂记录业务功能（列表 / 记录问题 / 问题详情 + 反馈与状态流转）
+  验证点：
+    □ 列表页：筛选（状态/班级/日期/搜索）+ 分页信息 + 6 列表格 + 状态标签颜色（待处理红/处理中橙/已解决绿）
+    □ 照片列缩略图可点击放大（灯箱）
+    □ 点「详情」进入问题详情页；点「＋ 记录问题」进入创建页
+    □ 创建页：日期/班级/类型/紧急/描述/照片上传（多张预览、可移除）＋ 校验与错误提示
+    □ 详情页：问题信息 + 照片 + 反馈记录 + 添加反馈（状态按规则流转）
+    □ 权限：无 create_issue / add_feedback 时按钮禁用或提示
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_inspection.html public/_ui_inspection.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiInsp --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_inspection.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_inspection.html
+  夹具：临时年级 + 1 班 + 2 教师（1 个含全部巡堂操作权限 / 1 个只有查看权限）+ 2 个小组 + 3 条问题
+       自愈式清理（含上传照片文件），并断言真实数据行数不变
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>巡堂记录业务功能（列表 / 创建 / 详情）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const csEl = (e, prop) => (e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null);
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#navbarMenus') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 25000);
+  await sleep(800);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '巡堂UI年级' + stamp, CLASS = '巡堂UI班' + stamp;
+const T_ALL = 'iu_tea_all_' + stamp;    // 巡堂组（全部操作）
+const T_VIEW = 'iu_tea_view_' + stamp;  // 巡堂组（仅查看）
+const G_ALL = '巡堂全权组' + stamp, G_VIEW = '巡堂只读组' + stamp;
+const created = { gradeId: null, classId: null, groupIds: [], userIds: [], issueIds: [] };
+let realBefore = null;
+
+// 1x1 PNG（浏览器端 Blob）
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+function pngBlob() {
+  const bin = atob(PNG_B64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: 'image/png' });
+}
+async function createIssue({ desc, classId, category = 'hygiene', priority = 'normal', date, photos = 0 }) {
+  const fd = new FormData();
+  fd.append('description', desc);
+  if (classId) fd.append('classId', String(classId));
+  fd.append('category', category);
+  fd.append('priority', priority);
+  if (date) fd.append('issueDate', date);
+  for (let i = 0; i < photos; i++) fd.append('photos', pngBlob(), `p${i + 1}.png`);
+  const res = await fetch('/api/inspection/issues', { method: 'POST', body: fd, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+
+async function snapshotReal() {
+  const users = (await japi('/api/users')).data;
+  const groups = (await japi('/api/groups')).data;
+  const classes = (await japi('/api/classes')).data;
+  return {
+    users: ((users && users.users) || []).length,
+    groups: ((groups && groups.groups) || []).length,
+    classes: ((classes && classes.classes) || []).length,
+  };
+}
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const id of created.issueIds) {
+    // 问题删除接口未开放，用管理员身份通过"描述特征"清理（本驱动只创建带 stamp 的描述）
+  }
+  for (const g of ((await japi('/api/groups')).data.groups || []).filter((x) => new RegExp('组' + stamp + '$').test(x.name))) {
+    await japi('/api/groups/' + g.id, { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^iu_tea_/.test(x.username) && x.username.endsWith(stamp))) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^巡堂UI班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^巡堂UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshotReal();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'IU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const mkTeacher = async (u) => {
+      const r = await japi('/api/users', {
+        method: 'POST',
+        body: {
+          username: u, password: '123456', role: 'teacher', realName: u, classId: created.classId,
+          mustChangePassword: false, profileLocked: true, subject: '数学',
+          teachingClasses: [{ classId: created.classId, roleInClass: 'subject_teacher' }],
+        },
+      });
+      if (r.status !== 201) log('  · 创建账号失败 ' + u + ' ' + JSON.stringify(r.data));
+      created.userIds.push(r.data.user.id);
+      return r.data.user.id;
+    };
+    const idAll = await mkTeacher(T_ALL);
+    const idView = await mkTeacher(T_VIEW);
+    const gAll = await japi('/api/groups', {
+      method: 'POST',
+      body: { name: G_ALL, description: '巡堂全权', permissions: { pages: ['inspection'], actions: ['view', 'create_issue', 'add_feedback', 'upload_photo'] } },
+    });
+    const gView = await japi('/api/groups', {
+      method: 'POST',
+      body: { name: G_VIEW, description: '巡堂只读', permissions: { pages: ['inspection'], actions: ['view'] } },
+    });
+    created.groupIds = [gAll.data.group.id, gView.data.group.id];
+    await japi('/api/groups/' + created.groupIds[0] + '/members', { method: 'PUT', body: { userIds: [idAll] } });
+    await japi('/api/groups/' + created.groupIds[1] + '/members', { method: 'PUT', body: { userIds: [idView] } });
+    // 3 条问题：待处理(带2张照片) / 处理中 / 已解决
+    const r1 = await createIssue({ desc: '[UI巡堂' + stamp + '] 教室卫生较差，桌椅摆放不整齐', classId: created.classId, category: 'hygiene', priority: 'normal', photos: 2 });
+    const r2 = await createIssue({ desc: '[UI巡堂' + stamp + '] 课堂纪律松散', classId: created.classId, category: 'discipline', priority: 'urgent' });
+    const r3 = await createIssue({ desc: '[UI巡堂' + stamp + '] 多媒体设备故障', classId: created.classId, category: 'equipment', date: '2026-09-16' });
+    check('0) 夹具就绪（1 班 + 2 教师 + 2 小组 + 3 条问题）',
+      !!created.gradeId && !!created.classId && created.groupIds.length === 2 && r1.status === 201 && r2.status === 201 && r3.status === 201,
+      { r1: r1.status, r2: r2.status, r3: r3.status });
+    const idA = r1.data.issue.id, idB = r2.data.issue.id, idC = r3.data.issue.id;
+    created.issueIds = [idA, idB, idC];
+    // 让"处理中/已解决"各有一条
+    await japi('/api/inspection/issues/' + idB + '/feedbacks', { method: 'POST', body: { feedbackStatus: 'processing', solution: '已通知班主任' } });
+    await japi('/api/inspection/issues/' + idC + '/feedbacks', { method: 'POST', body: { feedbackStatus: 'resolved', solution: '已更换设备' } });
+    const chk = await japi('/api/inspection/issues?keyword=' + encodeURIComponent(stamp) + '&pageSize=50');
+    check('0) 三条问题状态 = 待处理 / 处理中 / 已解决',
+      (chk.data.issues || []).map((i) => i.status).sort().join(',') === 'pending,processing,resolved',
+      (chk.data.issues || []).map((i) => i.id + ':' + i.status));
+
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+
+    // ---------- A) 列表页 ----------
+    log('\n— A) 列表页 —');
+    await asUser(T_ALL);
+    await loadPage('/inspection', '#issueBody');
+    await until(() => Qa('#issueBody tr').length >= 3, 15000);
+    check('A) 页面为统一卡片 + 统一页头（返回签到 / 标题居中 / ＋记录问题）',
+      !!Q('.container > .page-card') && /返回签到/.test(txt('#btnBack')) && /巡堂记录/.test(txt('.page-title')) && /记录问题/.test(txt('#btnNewIssue')));
+    check('A) 筛选栏含 状态/年级/班级/日期/搜索 与 查询/重置',
+      !!Q('#fStatus') && !!Q('#fGrade') && !!Q('#fClass') && !!Q('#fDate') && !!Q('#fKeyword') && !!Q('#btnSearch') && !!Q('#btnReset'));
+    // 年级 → 班级 两级联动
+    await until(() => Qa('#fGrade option').length > 1, 12000);
+    check('A) 未选年级 → 班级下拉禁用且提示「请先选择年级」',
+      Q('#fClass').disabled === true && /请先选择年级/.test(txt('#fClass')),
+      { disabled: Q('#fClass').disabled, text: txt('#fClass') });
+    Q('#fGrade').value = String(created.gradeId);
+    Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#fClass option').length > 1, 10000);
+    const classOpts = Qa('#fClass option').map((o) => o.value).filter(Boolean);
+    check('A) 选年级后 → 班级下拉可用且只含该年级班级（+全部班级）',
+      Q('#fClass').disabled === false && classOpts.length === 1 && classOpts[0] === String(created.classId),
+      { disabled: Q('#fClass').disabled, opts: Qa('#fClass option').map((o) => o.textContent.trim()) });
+    await until(() => /共 3 条/.test(txt('#rangeInfo')), 10000);
+    check('A) 只选年级（未选班级）→ 按年级筛出该年级全部问题（3 条）',
+      /共 3 条/.test(txt('#rangeInfo')) && W().location.search.includes('gradeId=' + created.gradeId),
+      { range: txt('#rangeInfo'), search: W().location.search });
+    // 换成「全部年级」→ 班级下拉回到禁用提示
+    Q('#fGrade').value = '';
+    Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Q('#fClass').disabled === true, 10000);
+    check('A) 年级改回「全部年级」→ 班级下拉重新禁用并提示',
+      Q('#fClass').disabled === true && /请先选择年级/.test(txt('#fClass')), txt('#fClass'));
+    Q('#fGrade').value = String(created.gradeId);
+    Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#fClass option').length > 1, 10000);
+    check('A) 表头 6 列（日期/班级/问题描述/照片/状态/操作）',
+      JSON.stringify(Qa('.insp-table thead th').map((t) => t.textContent.trim())) === JSON.stringify(['日期', '班级', '问题描述', '照片', '状态', '操作']),
+      Qa('.insp-table thead th').map((t) => t.textContent.trim()));
+    // 只看本套件数据：关键词搜索
+    Q('#fKeyword').value = stamp;
+    Q('#btnSearch').click();
+    await until(() => Qa('#issueBody tr').length === 3 && /共 3 条/.test(txt('#rangeInfo')), 12000);
+    check('A) 搜索关键词 → 命中 3 条并显示"显示 1-3 条，共 3 条"', /显示 1-3 条，共 3 条/.test(txt('#rangeInfo')), txt('#rangeInfo'));
+    check('A) 分页信息 = 第 1 / 1 页，上/下一页禁用',
+      txt('#pageInfo').replace(/\s+/g, '') === '第1/1页' && Q('#btnPrev').disabled === true && Q('#btnNext').disabled === true,
+      { page: txt('#pageInfo'), prev: Q('#btnPrev').disabled, next: Q('#btnNext').disabled });
+    check('A) 顶部汇总显示三种状态数量', /待处理/.test(txt('#inspSummary')) && /处理中/.test(txt('#inspSummary')) && /已解决/.test(txt('#inspSummary')), txt('#inspSummary'));
+
+    // 状态标签颜色
+    const badge = (status) => Qa('.st[' + 'data-status="' + status + '"]')[0];
+    const pendingEl = badge('pending'), procEl = badge('processing'), resEl = badge('resolved');
+    check('A) 状态标签颜色：待处理=红 / 处理中=橙 / 已解决=绿',
+      csEl(pendingEl, 'color') === 'rgb(207, 19, 34)' && csEl(procEl, 'color') === 'rgb(173, 104, 0)' && csEl(resEl, 'color') === 'rgb(35, 120, 4)',
+      { p: pendingEl && csEl(pendingEl, 'color'), pr: procEl && csEl(procEl, 'color'), r: resEl && csEl(resEl, 'color') });
+
+    // 照片缩略图 + 灯箱
+    const thumb = Q('.insp-thumb');
+    check('A) 照片列显示缩略图（带照片的那条）', !!thumb && /^\/uploads\/inspection\//.test(thumb.getAttribute('src')), thumb && thumb.getAttribute('src'));
+    check('A) 无照片的记录显示"无"', /无/.test(txt('#issueBody')), '');
+    thumb.click();
+    await sleep(300);
+    check('A) 点缩略图 → 照片放大（灯箱显示同一张图）',
+      !hidden('#lightbox') && Q('#lbImg').getAttribute('src') === thumb.getAttribute('src'),
+      { box: hidden('#lightbox'), img: Q('#lbImg') && Q('#lbImg').getAttribute('src') });
+    Q('#lbClose').click();
+    await sleep(200);
+    check('A) 关闭灯箱', hidden('#lightbox'));
+
+    // 筛选：状态 / 班级 / 日期 / 重置
+    Q('#fStatus').value = 'resolved';
+    Q('#fStatus').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#issueBody tr').length === 1, 10000);
+    check('A) 按状态筛选（已解决）→ 只显示 1 条', Qa('#issueBody tr').length === 1 && /共 1 条/.test(txt('#rangeInfo')), txt('#rangeInfo'));
+    Q('#fStatus').value = '';
+    Q('#fStatus').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#issueBody tr').length === 3, 10000);
+    Q('#fDate').value = '';
+    await sleep(200);
+    Q('#fClass').value = String(created.classId);
+    Q('#fClass').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => /共 3 条/.test(txt('#rangeInfo')), 10000);
+    check('A) 年级+班级都选 → 按班级筛选命中 3 条', /共 3 条/.test(txt('#rangeInfo')), txt('#rangeInfo'));
+    Q('#fClass').value = '';
+    Q('#fDate').value = '2026-09-16';
+    Q('#fDate').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    // 该日期只有夹具 #3 一条；列表日期用 fmtDateShort 渲染（如 09-16），断言"每行都是该日期"
+    // 注意：无头 Chrome 的虚拟时间会把 sleep 瞬间快进 → 轮询里必须夹一次**真实请求**，
+    //       否则页面筛选请求还在路上时就把预算耗尽，读到的是未筛选的旧列表（偶发失败）
+    await until(async () => {
+      await japi('/api/inspection/issues?date=2026-09-16&limit=1');
+      return Qa('#issueBody tr').some((tr) => /(^|\D)09-16(\D|$)/.test(tr.textContent));
+    }, 20000);
+    await sleep(300);
+    const dateRows = Qa('#issueBody tr');
+    check('A) 按日期筛选（2026-09-16）→ 列表只剩该日期的记录',
+      dateRows.length > 0 && dateRows.every((tr) => /(^|\D)09-16(\D|$)/.test(tr.textContent)),
+      { rows: dateRows.length, info: txt('#rangeInfo'), first: dateRows[0] && dateRows[0].textContent.replace(/\s+/g, ' ').slice(0, 60) });
+    Q('#btnReset').click();
+    await until(() => Qa('#issueBody tr').length > 0 && Q('#fDate').value === '', 10000);
+    check('A) 重置筛选 → 条件清空、列表恢复', Q('#fDate').value === '' && Q('#fKeyword').value === '', { date: Q('#fDate').value, kw: Q('#fKeyword').value });
+
+    // 详情跳转
+    Q('#fKeyword').value = stamp;
+    Q('#btnSearch').click();
+    await until(() => Qa('#issueBody tr').length === 3, 10000);
+    const detailBtn = Qa('#issueBody tr')[0].querySelector('[data-detail]');
+    const targetId = detailBtn.dataset.detail;
+    detailBtn.click();
+    const onDetail = await until(() => W().location.pathname === '/inspection/detail', 12000);
+    check('A) 点「详情」→ 进入问题详情页（带问题编号）', onDetail && /[?&]id=/.test(W().location.search), W().location.pathname + W().location.search);
+
+    // ---------- B) 详情页 ----------
+    log('\n— B) 问题详情页 —');
+    await loadPage('/inspection/detail?id=' + idA, '#fbList');
+    await until(() => txt('#dDesc').length > 0, 12000);
+    check('B) 信息卡显示 日期/班级/类型/紧急/描述/状态/记录人',
+      !!txt('#dDate') && /巡堂UI班/.test(txt('#dClass')) && /卫生/.test(txt('#dCategory')) && /普通/.test(txt('#dPriority')) &&
+      /教室卫生较差/.test(txt('#dDesc')) && /待处理/.test(txt('#dStatus')) && txt('#dCreator').length > 3,
+      { date: txt('#dDate'), cls: txt('#dClass'), cat: txt('#dCategory'), st: txt('#dStatus'), by: txt('#dCreator') });
+    check('B) 详情含 2 张照片缩略图', Qa('#dPhotos img').length === 2, Qa('#dPhotos img').length);
+    Qa('#dPhotos img')[0].click();
+    await sleep(250);
+    check('B) 点详情照片 → 放大显示', !hidden('#lightbox'));
+    Q('#lbClose').click();
+    await sleep(150);
+    check('B) 反馈记录初始为空（提示"暂无反馈记录"）', /暂无反馈记录/.test(txt('#fbList')), txt('#fbList'));
+    check('B) 添加反馈表单含「是否解决」下拉（已解决/处理中/未解决）与解决方案',
+      JSON.stringify(Qa('#fbStatus option').map((o) => o.textContent.trim())) === JSON.stringify(['处理中', '已解决', '未解决']) && !!Q('#fbSolution'),
+      Qa('#fbStatus option').map((o) => o.textContent.trim()));
+
+    // 反馈 1：处理中
+    Q('#fbStatus').value = 'processing';
+    Q('#fbSolution').value = '已通知班主任整改，预计明天完成';
+    Q('#btnSubmitFb').click();
+    await until(() => Qa('#fbList .fb-item').length === 1, 12000);
+    check('B) 提交反馈（处理中）→ 反馈列表出现 1 条（含反馈人/时间/方案）',
+      /已通知班主任整改/.test(txt('#fbList')) && new RegExp(T_ALL).test(txt('#fbList')), txt('#fbList').slice(0, 80));
+    await until(() => /处理中/.test(txt('#dStatus')), 8000);
+    check('B) 状态由「待处理」→「处理中」', /处理中/.test(txt('#dStatus')), txt('#dStatus'));
+    check('B) 反馈标签显示「处理中」', /处理中/.test(txt('#fbList')));
+    // 反馈 2：已解决
+    Q('#fbStatus').value = 'resolved';
+    Q('#fbSolution').value = '班主任已组织学生打扫，教室恢复整洁';
+    Q('#btnSubmitFb').click();
+    await until(() => Qa('#fbList .fb-item').length === 2, 12000);
+    await until(() => /已解决/.test(txt('#dStatus')), 8000);
+    check('B) 反馈（已解决）→ 状态变「已解决」', /已解决/.test(txt('#dStatus')), txt('#dStatus'));
+    // 反馈 3：未解决 → 回到处理中
+    Q('#fbStatus').value = 'unresolved';
+    Q('#fbSolution').value = '问题复现，需重新处理';
+    Q('#btnSubmitFb').click();
+    await until(() => Qa('#fbList .fb-item').length === 3, 12000);
+    await until(() => /处理中/.test(txt('#dStatus')), 8000);
+    check('B) 反馈（未解决）→ 状态回到「处理中」（已解决 + 未解决 = 处理中）', /处理中/.test(txt('#dStatus')), txt('#dStatus'));
+    // 校验：空方案
+    Q('#fbSolution').value = '';
+    Q('#btnSubmitFb').click();
+    await sleep(400);
+    check('B) 未填解决方案 → 提示且不提交（反馈仍 3 条）', Qa('#fbList .fb-item').length === 3 && /解决方案/.test(txt('#errBox')), txt('#errBox'));
+
+    // ---------- C) 创建页 ----------
+    log('\n— C) 记录问题页 —');
+    await loadPage('/inspection/new', '#issueForm');
+    await until(() => Qa('#fGrade option').length > 1, 12000);
+    check('C) 表单字段齐全（日期/年级/班级/类型/紧急程度/描述/照片）',
+      !!Q('#fIssueDate') && !!Q('#fGrade') && !!Q('#fClass') && !!Q('#fCategory') && !!Q('#fPriority') && !!Q('#fDescription') && !!Q('#photoInput'));
+    check('C) 未选年级 → 班级下拉禁用且提示「请先选择年级」',
+      Q('#fClass').disabled === true && /请先选择年级/.test(txt('#fClass')),
+      { disabled: Q('#fClass').disabled, text: txt('#fClass') });
+    check('C) 未选年级时提交 → 提示「请先选择年级」（不误报班级）',
+      await (async () => {
+        Q('#fDescription').value = '[UI巡堂' + stamp + '] 年级校验';
+        Q('#btnSubmit').click();
+        await sleep(400);
+        const ok = /请先选择年级/.test(txt('#errBox'));
+        Q('#fDescription').value = '';   // 复原：下一步还要验证"空描述"分支
+        return ok;
+      })(), txt('#errBox'));
+    // 选年级 → 班级下拉只显示该年级班级
+    Q('#fGrade').value = String(created.gradeId);
+    Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await until(() => Qa('#fClass option').length > 1, 10000);
+    check('C) 选年级后 → 班级下拉只含该年级的班级',
+      Q('#fClass').disabled === false &&
+      JSON.stringify(Qa('#fClass option').map((o) => o.value).filter(Boolean)) === JSON.stringify([String(created.classId)]),
+      Qa('#fClass option').map((o) => o.textContent.trim()));
+    check('C) 日期默认今天', /^\d{4}-\d{2}-\d{2}$/.test(Q('#fIssueDate').value), Q('#fIssueDate').value);
+    check('C) 问题类型 = 卫生/纪律/设备/教学/其他',
+      JSON.stringify(Qa('#fCategory option').map((o) => o.textContent.trim())) === JSON.stringify(['卫生', '纪律', '设备', '教学', '其他']),
+      Qa('#fCategory option').map((o) => o.textContent.trim()));
+    check('C) 紧急程度含 普通/紧急', JSON.stringify(Qa('#fPriority option').map((o) => o.textContent.trim())) === JSON.stringify(['普通', '紧急']), Qa('#fPriority option').map((o) => o.textContent.trim()));
+
+    // 切到别的年级 → 班级下拉刷新（旧的班级选项被清掉）
+    const otherGrade = Qa('#fGrade option').map((o) => o.value).filter((v) => v && v !== String(created.gradeId))[0];
+    if (otherGrade) {
+      Q('#fGrade').value = otherGrade;
+      Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      await sleep(300);
+      check('C) 换年级 → 班级下拉刷新，旧年级的班级消失',
+        !Qa('#fClass option').some((o) => o.value === String(created.classId)),
+        { grade: Q('#fGrade').value, opts: Qa('#fClass option').map((o) => o.textContent.trim()) });
+      Q('#fGrade').value = String(created.gradeId);
+      Q('#fGrade').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      await until(() => Qa('#fClass option').some((o) => o.value === String(created.classId)), 10000);
+    } else { skip('C) 换年级刷新班级下拉', '库里只有一个年级'); }
+
+    // 空描述 → 校验
+    Q('#fClass').value = String(created.classId);
+    Q('#btnSubmit').click();
+    await sleep(400);
+    check('C) 未填问题描述 → 提示错误且停留在创建页', /问题描述/.test(txt('#errBox')) && W().location.pathname === '/inspection/new', txt('#errBox'));
+
+    // 选择 2 张照片 → 预览
+    const dt = new DataTransfer();
+    dt.items.add(new File([pngBlob()], 'a.png', { type: 'image/png' }));
+    dt.items.add(new File([pngBlob()], 'b.png', { type: 'image/png' }));
+    Q('#photoInput').files = dt.files;
+    Q('#photoInput').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    await sleep(400);
+    check('C) 选择照片 → 出现 2 个预览 + 1 个「＋」按钮',
+      Qa('#photoBox .photo-item').length === 2 && !!Q('#photoBox .photo-add'),
+      { items: Qa('#photoBox .photo-item').length, add: !!Q('#photoBox .photo-add') });
+    check('C) 提示已选 2 张', /已选择 2 张/.test(txt('#photoHint')), txt('#photoHint'));
+    // 移除 1 张
+    Qa('#photoBox .photo-item .rm')[0].click();
+    await sleep(300);
+    check('C) 点「✕」移除照片 → 剩 1 张', Qa('#photoBox .photo-item').length === 1, Qa('#photoBox .photo-item').length);
+
+    // 提交
+    Q('#fDescription').value = '[UI巡堂' + stamp + '] 由界面创建的问题：走廊堆放杂物';
+    Q('#fCategory').value = 'other';
+    Q('#fPriority').value = 'urgent';
+    Q('#btnSubmit').click();
+    const created2 = await until(() => W().location.pathname === '/inspection/detail' && /[?&]id=/.test(W().location.search), 15000);
+    await sleep(900);
+    check('C) 提交成功 → 跳到问题详情页', created2, W().location.pathname + W().location.search);
+    const newId = Number(new URLSearchParams(W().location.search).get('id'));
+    if (newId) created.issueIds.push(newId);
+    await until(() => /走廊堆放杂物/.test(txt('#dDesc')), 12000);
+    check('C) 详情页显示新问题（描述/紧急/照片/记录人 = 当前登录教师）',
+      /走廊堆放杂物/.test(txt('#dDesc')) && /紧急/.test(txt('#dPriority')) && Qa('#dPhotos img').length === 1 &&
+      new RegExp(T_ALL).test(txt('#dCreator')),
+      { desc: txt('#dDesc').slice(0, 40), prio: txt('#dPriority'), photos: Qa('#dPhotos img').length, by: txt('#dCreator') });
+    check('C) 新问题状态 = 待处理', /待处理/.test(txt('#dStatus')), txt('#dStatus'));
+    check('C) 保存后问题正确关联所选班级（详情页班级 = 夹具班级）',
+      txt('#dClass').includes(CLASS), { got: txt('#dClass'), want: CLASS });
+
+    // ---------- D) 权限：只有查看权限的成员 ----------
+    log('\n— D) 权限（只读成员） —');
+    await asUser(T_VIEW);
+    await loadPage('/inspection', '#issueBody');
+    await sleep(600);
+    check('D) 只读成员可查看列表', !!Q('#issueBody') && Qa('#issueBody tr').length > 0);
+    check('D) 只读成员「＋ 记录问题」按钮被禁用', Q('#btnNewIssue').disabled === true, Q('#btnNewIssue').disabled);
+    await loadPage('/inspection/new', '#issueForm');
+    await sleep(600);
+    check('D) 只读成员创建页显示无权限提示且提交禁用',
+      !hidden('#denyTip') && Q('#btnSubmit').disabled === true && Q('#fDescription').disabled === true,
+      { tip: hidden('#denyTip'), submit: Q('#btnSubmit').disabled });
+    await loadPage('/inspection/detail?id=' + idA, '#fbList');
+    await until(() => txt('#dDesc').length > 0, 12000);
+    check('D) 只读成员详情页可查看，但「添加反馈」表单隐藏并提示无权限',
+      /教室卫生较差/.test(txt('#dDesc')) && hidden('#fbForm') && !hidden('#fbDeny'),
+      { form: hidden('#fbForm'), deny: hidden('#fbDeny') });
+
+    // ---------- E) 删除巡堂记录（仅管理员） ----------
+    log('\n— E) 删除巡堂记录（仅管理员） —');
+    await asUser(T_ALL);   // 巡堂组成员：有全部操作权限，但没有删除权限
+    await loadPage('/inspection', '#issueBody');
+    Q('#fKeyword').value = stamp;
+    Q('#btnSearch').click();
+    await until(() => Qa('#issueBody tr').length >= 3, 12000);
+    check('E) 巡堂组成员（教务组）看不到「删除」按钮',
+      Qa('#issueBody [data-del]').length === 0 && Qa('#issueBody [data-detail]').length >= 3,
+      { del: Qa('#issueBody [data-del]').length, detail: Qa('#issueBody [data-detail]').length });
+    check('E) 巡堂组成员直接调用删除接口 → 403',
+      (await japi('/api/inspection/issues/' + idA, { method: 'DELETE' })).status === 403);
+
+    await asUser('admin');
+    await loadPage('/inspection', '#issueBody');
+    Q('#fKeyword').value = stamp;
+    Q('#btnSearch').click();
+    await until(() => Qa('#issueBody [data-del]').length >= 3, 12000);
+    check('E) 管理员在操作列看到「删除」按钮（详情按钮同时保留）',
+      Qa('#issueBody [data-del]').length >= 3 && Qa('#issueBody [data-detail]').length >= 3,
+      { del: Qa('#issueBody [data-del]').length });
+    // 以接口为准确定"本套件夹具问题"的条数，再等页面渲染到该条数（避免读到筛选前的旧列表）
+    const apiList = await japi('/api/inspection/issues?keyword=' + stamp + '&pageSize=100');
+    const apiTotal = (apiList.data && apiList.data.total) || 0;
+    await until(() => Qa('#issueBody tr').length === apiTotal, 12000);
+    const beforeCount = Qa('#issueBody tr').length;
+    check('E) 关键词筛选后列表条数 = 接口 total（' + apiTotal + '）', beforeCount === apiTotal, { dom: beforeCount, api: apiTotal });
+    const victimId = (apiList.data.issues || [])[0].id;
+    const rowOf = (id) => Qa('#issueBody tr').find((tr) => Number(tr.dataset.id) === Number(id));
+    check('E) 能找到目标记录行', !!rowOf(victimId), victimId);
+    rowOf(victimId).querySelector('[data-del]').click();
+    await sleep(350);
+    check('E) 点「删除」→ 二次确认弹窗（文案含「确定要删除这条巡堂记录吗？删除后不可恢复。」）',
+      !hidden('#delModal') && /确定要删除这条巡堂记录吗？删除后不可恢复。/.test(txt('#delMessage')), { hidden: hidden('#delModal'), msg: txt('#delMessage') });
+    check('E) 确认弹窗有「取消」与「确认删除」按钮',
+      !!Q('#delCancel') && !!Q('#delOk') && /取消/.test(txt('#delCancel')) && /删除/.test(txt('#delOk')));
+    Q('#delCancel').click();
+    await sleep(300);
+    check('E) 点「取消」→ 弹窗关闭且记录未被删除（列表条数不变、详情仍可打开）',
+      hidden('#delModal') && Qa('#issueBody tr').length === beforeCount && (await japi('/api/inspection/issues/' + victimId)).status === 200,
+      { rows: Qa('#issueBody tr').length, before: beforeCount });
+
+    rowOf(victimId).querySelector('[data-del]').click();
+    await sleep(300);
+    Q('#delOk').click();
+    const deletedOk = await until(() => /删除成功/.test(txt('#toast')), 15000);
+    await until(() => Qa('#issueBody tr').length === beforeCount - 1, 12000);
+    check('E) 确认删除 → 提示「删除成功」且列表少一条',
+      deletedOk && Qa('#issueBody tr').length === beforeCount - 1,
+      { toast: txt('#toast'), rows: Qa('#issueBody tr').length, before: beforeCount });
+    check('E) 被删记录已不存在（详情 404，问题/照片/反馈一并删除）',
+      (await japi('/api/inspection/issues/' + victimId)).status === 404);
+    const leftList = await japi('/api/inspection/issues?keyword=' + stamp + '&pageSize=100');
+    check('E) 列表接口也不再返回被删记录（total 少 1）',
+      !((leftList.data && leftList.data.issues) || []).some((x) => x.id === victimId) && leftList.data.total === apiTotal - 1,
+      { total: leftList.data && leftList.data.total, apiTotal });
+    created.issueIds = created.issueIds.filter((x) => x !== victimId);   // 已删除 → 不必再清
+
+    // ---------- 清理 ----------
+    log('\n— 清理 —');
+    // 问题删除接口未开放：由外层脚本按描述特征清理（本驱动所有问题描述都含 stamp）
+    //   → 见 db/cleanup_ui_fixtures_and_verify.sql（按 [UI巡堂 前缀清理）；驱动末行输出 ISSUES=<id,...>
+    await asUser('admin');
+    await hardCleanup();
+    const leftGroups = ((await japi('/api/groups')).data.groups || []).filter((g) => new RegExp('组' + stamp + '$').test(g.name));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^iu_tea_/.test(u.username) && u.username.endsWith(stamp));
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^巡堂UI班/.test(c.className));
+    check('清理：夹具小组/账号/班级已删除',
+      leftGroups.length === 0 && leftUsers.length === 0 && leftClasses.length === 0,
+      { g: leftGroups.length, u: leftUsers.length, c: leftClasses.length });
+    const realAfter = await snapshotReal();
+    check('清理：真实用户/班级/小组数量未变', JSON.stringify(realBefore) === JSON.stringify(realAfter), { before: realBefore, after: realAfter });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  log('ISSUES=' + created.issueIds.join(','));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

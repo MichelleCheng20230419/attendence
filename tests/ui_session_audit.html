@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：发起签到后的「发起人」展示（迁移 v25）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_session_audit.html public/_ui_session_audit.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiSessAudit --virtual-time-budget=120000 --dump-dom `
+         "http://localhost:3000/_ui_session_audit.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_session_audit.html
+  ⚠️ 运行顺序：本驱动会创建一条【进行中的场次】（前端没有删除场次接口，只能由外层按
+     输出行 SESSIONS=<id,...> 用 SQL 清理）。其它依赖"当天最近已结束场次"的 UI 驱动
+     （如 ui_seat_card 的真实班级断言）必须在本驱动【之前】运行，或先清掉该场次。
+  夹具：临时年级 + 1 班（2 学生）+ 班主任老师；测完删除场次与夹具（自愈式）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>body{font-family:Consolas,monospace;font-size:13px;padding:16px}#out{white-space:pre-wrap}iframe{width:1280px;height:760px;border:1px solid #ccc}</style>
+</head>
+<body>
+<h3>发起签到「发起人」展示（/dashboard 场次信息条）</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const pathOf = () => { try { return fr.contentWindow.location.pathname; } catch (_) { return '?'; } };
+async function loadPage(url) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q('h1'), 20000);
+  await sleep(800);
+}
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '发起人年级' + stamp, CLASS = '发起人班' + stamp, TEA = 'sa_tea_' + stamp;
+const created = { gradeId: null, classId: null, userIds: [], studentIds: [], sessionIds: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const classes = (await japi('/api/classes')).data.classes || [];
+  for (const c of classes.filter((x) => new RegExp('^发起人班').test(x.className))) {
+    const users = (await japi('/api/users')).data.users || [];
+    const uids = users.filter((x) => /^sa_tea_/.test(x.username)).map((x) => x.id);
+    const stus = (await japi('/api/students?classId=' + c.id)).data.students || [];
+    for (const s of stus) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    for (const uid of uids) {
+      await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: uid, classes: [] } });
+      await japi('/api/users/' + uid, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^发起人年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+  // 按 id 兜底：即使上面的列表扫描失败也要删掉本次夹具年级（否则会残留）
+  if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+}
+// 注：前端没有"删除场次"接口，本驱动产生的场次由外层脚本按 SESSIONS= 输出立即清理
+
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'SES', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    let r = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '发起人班主任', subject: '物理', classId: created.classId, profileLocked: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    for (let i = 1; i <= 2; i += 1) {
+      const rr = await japi('/api/students', { method: 'POST', body: { studentNo: 'SES' + stamp + '0' + i, name: '发起同学' + i, classId: created.classId, status: '在读' } });
+      created.studentIds.push(rr.data.student.id);
+    }
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: TEA, password: '123456' } });
+    check('0) 夹具就绪（1 班 2 学生 + 班主任）', created.studentIds.length === 2, created.studentIds.length);
+
+    // ---------- A) 老师点「发起签到」 ----------
+    // 安全前置：若当前存在【真实进行中的场次】，绝不点击「发起签到」
+    // （该接口会先关闭上一场并对其执行全校补缺勤 → 会污染真实课堂数据）
+    const pre = await japi('/api/attendance/status');
+    const preS = pre.data && pre.data.session;
+    const realActive = !!preS && !preS.ended && preS.status === 'active' && preS.createdByName !== '发起人班主任';
+    if (realActive) skip('A/B/C 发起与展示', '当前有真实进行中场次（' + (preS.createdByName || '未知发起人') + '），避免影响真实数据');
+    await loadPage('/dashboard');
+    check('A) 进入签到操作台', pathOf() === '/dashboard', pathOf());
+    // 未发起时信息条可能回看"当天最近已结束场次"（历史 plan 场次显示"计划发起"），
+    // 因此这里只做格式断言：无场次时整个 wrap 隐藏（#sessionStarter 的 '--' 是 index.html 静态占位），
+    // 有内容时必须是「发起：X」或「计划发起」
+    const starterBefore = txt('#sessionStarter');
+    const starterWrapHidden = !!Q('#sessionStarterWrap') && Q('#sessionStarterWrap').classList.contains('hidden');
+    check('A) 未发起时发起人标签隐藏，或格式合法（留空 / 发起：X / 计划发起 / 计划发起：X）',
+      starterWrapHidden || starterBefore === '' || starterBefore === '计划发起' || /^(计划)?发起：.+/.test(starterBefore),
+      { starterBefore, starterWrapHidden });
+
+    // ---------- A2) 回归：已结束场次回看时不得出现无限刷新循环 ----------
+    // 历史 bug：refreshStatus → renderAll → renderSessionInfo → startCountdown（deadline 已过）
+    //           → tick() 立刻 refreshStatus() → 无限循环，页面狂刷 /api/attendance/status
+    if (preS && preS.ended) {
+      const W = fr.contentWindow;
+      const origFetch = W.fetch;
+      let statusCalls = 0;
+      W.fetch = function (u, o) { if (String(u).indexOf('/api/attendance/status') >= 0) statusCalls += 1; return origFetch.call(W, u, o); };
+      await sleep(9000);   // 约 3 个 3 秒轮询周期
+      W.fetch = origFetch;
+      log('  · 9 秒内 /api/attendance/status 调用 ' + statusCalls + ' 次（正常应 ≤4：3 秒轮询 ≈3 次）');
+      check('A2) 已结束场次回看：/attendance/status 调用次数正常（无死循环，≤10 次/9 秒）',
+        statusCalls <= 10, { statusCalls, countdown: txt('#countdown') });
+      // 页面可能显示的是"另一场进行中的场次"（期间有夹具计划/真实计划触发）→ 此时不适用回看断言
+      const cdNow = txt('#countdown');
+      if (/分\d+秒/.test(cdNow) && !hidden('#sessionInfo')) {
+        skip('A2 倒计时显示「已截止」', '页面当前是进行中的场次（倒计时 ' + cdNow + '），不是回看的已结束场次');
+      } else {
+        check('A2) 倒计时显示「已截止」且场次条仍展示', cdNow === '已截止' || hidden('#sessionInfo'), cdNow);
+      }
+    } else {
+      skip('A2 死循环回归', '当前无回看中的已结束场次');
+    }
+    if (realActive) {
+      // 已有真实进行中场次时，「发起签到」按设计不可用（避免抢走正在登记的场次）→ 跳过而不是判失败
+      skip('A) 「发起签到」按钮可用', '当前有真实进行中场次，按钮按设计禁用');
+    } else {
+      const ok = await until(() => Q('#btnStart') && Q('#btnStart').disabled === false, 15000);
+      check('A) 「发起签到」按钮可用', ok);
+    }
+    if (!realActive) {
+      Q('#btnStart').click();
+      // 等"发起人"文案变成本次发起者（此前可能显示当天已结束场次的标签）
+      const named = await until(() => txt('#sessionStarter') === '发起：发起人班主任', 15000);
+      check('A) 发起后场次信息条显示「发起：发起人班主任」', named, txt('#sessionStarter'));
+      check('A) 起止时间同时显示', /开始：\d{2}:\d{2}/.test(txt('#sessionInfo')) && /截止：\d{2}:\d{2}/.test(txt('#sessionInfo')), txt('#sessionInfo'));
+
+      // ---------- B) 接口返回与库中一致 ----------
+      r = await japi('/api/attendance/status');
+      const s = r.data.session;
+      created.sessionIds.push(s.id);
+      check('B) 接口 session.createdByName = 发起人班主任', s && s.createdByName === '发起人班主任', s);
+      check('B) startSource=manual 且 deadlineMinutes 与页面选择一致（默认 30）',
+        s.startSource === 'manual' && s.deadlineMinutes === 30, { src: s.startSource, mins: s.deadlineMinutes });
+      check('B) 发起人 id / 角色 正确', s.createdBy === created.userIds[0] && s.createdByRole === 'teacher', s);
+
+      // ---------- C) 刷新页面后仍显示发起人 ----------
+      await loadPage('/dashboard');
+      const again = await until(() => !hidden('#sessionStarterWrap') && txt('#sessionStarter').indexOf('发起人班主任') >= 0, 15000);
+      check('C) 刷新后仍显示发起人（持久化到数据库）', again, txt('#sessionStarter'));
+    }
+
+    // ---------- D) 教师端入口 ----------
+    check('D) 教师端「发起签到」按钮可见', !hidden('#btnStart'));
+
+    // ---------- 清理 ----------
+    // 注意：前端没有"删除场次"接口，且场次一旦到期会被服务端懒执行 finalizeAbsent（全校补缺勤），
+    // 因此驱动结束后必须【立即】由外层脚本按下面的 SESSIONS= 输出删除场次与其记录。
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    await hardCleanup();
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^发起人班/.test(c.className));
+    check('清理：临时班级/账号已删除', leftClasses.length === 0, leftClasses.length);
+    log('SESSIONS=' + created.sessionIds.join(','));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

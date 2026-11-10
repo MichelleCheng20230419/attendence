@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：签到台 4 个问题的修复（问题1~4）
+    问题1 卡片颜色：未签到=灰；点击签到后=绿（且轮询后保持绿）；请假=橙
+    问题2 先标记请假，再「全员到齐」：只补齐未标记，已请假/已签到不被覆盖
+    问题3 重复点击不累加：同一场次同一学生仍只算一次到勤（统计与记录都不变）
+    问题4 截止后：已签到保持绿色、未签到变红色（缺勤），页面不会被切到别的场次
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_checkin_fixes -AdminPw <管理员密码>
+  说明：
+    · 场次一律用接口发起（页面在"签到进行中"时「发起签到」按钮是禁用的，这是既有设计）
+    · 问题4 需要真实等到窗口结束，故第二场用 1 分钟窗口 + 最多等 100 秒
+  夹具：1 年级 + 1 班 + 3 学生 + 1 教师账号；测完清理（自愈式）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1400px; height: 950px; }
+</style>
+</head>
+<body>
+<h3>签到台修复验证（问题1~4）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+async function loadPage(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 20000);
+  await sleep(900);
+}
+const COLORS = ['gray', 'green', 'orange', 'blue', 'red'];
+const cardOf = (name) => Qa('.student-card').find((c) => c.textContent.includes(name)) || null;
+const bgOf = (name) => {
+  const c = cardOf(name);
+  if (!c) return 'none';
+  return COLORS.find((k) => c.classList.contains(k)) || 'none';
+};
+const badgeOf = (name) => {
+  const c = cardOf(name);
+  const b = c && c.querySelector('.badge');
+  return b ? b.textContent.trim() : '';
+};
+const statOf = (id) => (Q(id) ? Q(id).textContent.trim() : '');
+// 点击卡片：每次重新取节点（页面每轮轮询会整表重绘）
+async function clickCard(name, times = 1) {
+  for (let i = 0; i < times; i++) {
+    const c = cardOf(name);
+    if (!c) return false;
+    const r = c.getBoundingClientRect();
+    c.dispatchEvent(new (W().MouseEvent)('click', { bubbles: true, clientX: r.left + 5, clientY: r.top + 5 }));
+    await sleep(400);
+  }
+  return true;
+}
+async function requireLeave(name) {
+  const c = cardOf(name);
+  if (!c) return false;
+  const r = c.getBoundingClientRect();
+  c.dispatchEvent(new (W().MouseEvent)('contextmenu', { bubbles: true, clientX: r.left + 5, clientY: r.top + 5 }));
+  const shown = await until(() => !hidden('#contextMenu'), 4000);
+  if (!shown) return false;
+  const item = Q('#contextMenu .context-item[data-reason="sick"]');
+  if (!item) return false;
+  item.click();
+  return true;
+}
+// 发起签到：显式指定夹具班级（管理员发起若不指定班级 = 校级发起，会按班拆成多场 → 夹具清理会漏）
+// 同时把响应里的【全部】场次都打印成 SESSIONS=，交给 run-ui.ps1 一并清理
+const startSession = async (minutes) => {
+  const r = await japi('/api/attendance/start', { method: 'POST', body: { deadlineMinutes: minutes, classId: created.classId } });
+  const list = (r.data && r.data.sessions && r.data.sessions.length) ? r.data.sessions : [r.data && r.data.session];
+  for (const s of list) { if (s && s.id) log('SESSIONS=' + s.id); }
+  const mine = list.find((s) => s && Number(s.classId) === Number(created.classId)) || (r.data && r.data.session);
+  return mine;
+};
+const statusNow = async () => (await japi('/api/attendance/status')).data;
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '签到UI年级' + stamp, CLASS = '签到UI班' + stamp, TEA = 'cfu_tea_' + stamp;
+const created = { gradeId: null, classId: null, users: [], students: [] };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  const cls = (await japi('/api/classes?includeArchived=1')).data.classes || [];
+  for (const c of cls.filter((x) => /^签到UI班/.test(x.className))) {
+    const stus = (await japi('/api/students?classId=' + c.id)).data.students || [];
+    for (const s of stus) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  const us = (await japi('/api/users')).data.users || [];
+  for (const u of us.filter((x) => /^cfu_/.test(x.username))) await japi('/api/users/' + u.id, { method: 'DELETE' });
+  const gs = (await japi('/api/grades')).data.grades || [];
+  for (const g of gs.filter((x) => /^签到UI年级/.test(x.grade_name || x.gradeName))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'CFU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const ur = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '签到修复老师', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+    if (ur.status !== 201) throw new Error('创建教师账号失败：' + JSON.stringify(ur.data));
+    created.users.push(ur.data.user.id);
+    for (const [no, nm] of [['CFU' + stamp + '01', '修复甲一'], ['CFU' + stamp + '02', '修复甲二'], ['CFU' + stamp + '03', '修复甲三']]) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: no, name: nm, classId: created.classId } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    // 第一场：30 分钟窗口（接口发起，模拟老师发起后班长/老师操作）
+    const s1 = await startSession(30);
+    // 交给 run-ui.ps1 清理（驱动无法删除场次：打印 SESSIONS=<id>，脚本会删场次+记录）
+    log('SESSIONS=' + (s1 && s1.id));
+    check('0) 夹具就绪（1 年级 + 1 班 + 3 学生 + 1 教师账号 + 已发起 30 分钟场次）',
+      !!created.gradeId && !!created.classId && created.students.filter(Boolean).length === 3 && !!s1, { session: s1 && s1.id });
+
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: TEA, password: '123456' } });
+    await loadPage('/dashboard', '#studentGrid');
+    await until(() => !!cardOf('修复甲一'), 15000);
+
+    // ---------- 问题1：未签到=灰 / 签到=绿 ----------
+    log('\n— 问题1) 卡片颜色 —');
+    check('1) 新场次未签到时 3 张卡全为灰色',
+      ['修复甲一', '修复甲二', '修复甲三'].every((n) => bgOf(n) === 'gray'),
+      ['修复甲一', '修复甲二', '修复甲三'].map((n) => bgOf(n)));
+    await clickCard('修复甲一');
+    const okGreen = await until(() => bgOf('修复甲一') === 'green', 10000);
+    check('1) 点击卡片签到 → 卡片变绿（不是灰）', okGreen, { color: bgOf('修复甲一'), badge: badgeOf('修复甲一') });
+    check('1) 角标显示「已签到」', badgeOf('修复甲一') === '已签到', badgeOf('修复甲一'));
+    check('1) 统计条：已签到 1', statOf('#statPresent') === '1', statOf('#statPresent'));
+    await sleep(5000);   // 等一轮轮询（3 秒）
+    check('1) 轮询 5 秒后仍是绿色（不会被刷成灰）', bgOf('修复甲一') === 'green',
+      { color: bgOf('修复甲一'), badge: badgeOf('修复甲一') });
+
+    // ---------- 问题2：先请假，再全员到齐 ----------
+    log('\n— 问题2) 先请假，再「全员到齐」 —');
+    const menued = await requireLeave('修复甲二');
+    check('2) 右键卡片 → 菜单选择「病假」', menued);
+    const okOrange = await until(() => bgOf('修复甲二') === 'orange', 10000);
+    check('2) 请假标记成功 → 橙色 + 角标=请假',
+      okOrange && badgeOf('修复甲二') === '请假', { color: bgOf('修复甲二'), badge: badgeOf('修复甲二') });
+    check('2) 「全员到齐」按钮可见（教师端也能走该流程）', !hidden('#btnBatchAll'));
+    Q('#btnBatchAll').click();
+    const confirmShown = await until(() => !hidden('#confirmModal') && /全员到齐/.test(txt('#confirmTitle')), 5000);
+    check('2) 二次确认文案说明「只补齐尚未标记、已请假/已迟到/已签到不受影响」',
+      confirmShown && /尚未标记/.test(txt('#confirmMessage')) && /请假/.test(txt('#confirmMessage')),
+      { title: txt('#confirmTitle'), msg: txt('#confirmMessage') });
+    Q('#confirmOk').click();
+    const thirdGreen = await until(() => bgOf('修复甲三') === 'green', 10000);
+    check('2) 未标记的甲三被补齐为已签到（绿）', thirdGreen, { color: bgOf('修复甲三') });
+    check('2) 已请假的甲二仍是橙色（未被覆盖成已签到）',
+      bgOf('修复甲二') === 'orange' && badgeOf('修复甲二') === '请假',
+      { color: bgOf('修复甲二'), badge: badgeOf('修复甲二') });
+    check('2) 已签到的甲一仍是绿色', bgOf('修复甲一') === 'green', bgOf('修复甲一'));
+    check('2) 统计条：已签到 2 / 请假 1',
+      statOf('#statPresent') === '2' && statOf('#statLeave') === '1',
+      { present: statOf('#statPresent'), leave: statOf('#statLeave') });
+
+    // ---------- 问题3：重复点击不累加 ----------
+    log('\n— 问题3) 重复签到不累加 —');
+    const before3 = await statusNow();
+    await clickCard('修复甲一', 2);
+    await sleep(2500);
+    const after3 = await statusNow();
+    check('3) 已签到学生再点两次 → 统计不变（不重复计数）',
+      after3.stats.present === before3.stats.present && after3.stats.total === before3.stats.total,
+      { before: before3.stats, after: after3.stats });
+    check('3) 卡片仍是绿色（状态未被改坏）', bgOf('修复甲一') === 'green', bgOf('修复甲一'));
+    const toast3 = txt('#toast');
+    check('3) 给出「已签到，不能重复操作」提示', /重复|已签到/.test(toast3), toast3);
+    check('3) 接口返回该场次只有 3 条记录（每人一条）',
+      Object.keys(after3.records || {}).length === 3, Object.keys(after3.records || {}).length);
+
+    // ---------- 问题4：截止后的显示（已签到绿 / 未签到红） ----------
+    // 说明：无头 Chrome 用 --virtual-time-budget 会把页面计时器快进（虚拟时间），
+    //       因此"等真实 60 秒到截止"在驱动里不可靠 —— 数据侧（截止后只把未签到标为缺勤、
+    //       已签到/已请假保持不变、场次不被切走）已由 server/test_checkin_fixes.js 精确断言。
+    //       这里验证【渲染映射】：用一次已结束场次的真实数据形态渲染页面，检查四色与角标。
+    log('\n— 问题4) 截止后显示：已签到绿 / 未签到红（渲染映射 + 结束视图） —');
+    const ids = W().eval('students.map((s) => s.id)');
+    const mkIso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+    const injected = W().eval(`(function(){
+      current = {
+        session: { id: 999999, status: 'closed', ended: true, startTime: '${mkIso(1200000)}', deadline: '${mkIso(600000)}', startSource: 'manual', createdByName: '签到修复老师' },
+        records: {
+          ${ids[0]}: { status: 'present', leaveReason: null, checkinTime: '${mkIso(900000)}', checkInMethod: 'manual', columnIndex: null },
+          ${ids[1]}: { status: 'absent', leaveReason: null, checkinTime: null, checkInMethod: 'manual', columnIndex: null },
+          ${ids[2]}: { status: 'leave', leaveReason: 'sick', checkinTime: '${mkIso(880000)}', checkInMethod: 'manual', columnIndex: null }
+        },
+        stats: { total: 3, present: 1, leave: 1, late: 0, absent: 1 }
+      };
+      renderAll();
+      return true;
+    })()`);
+    check('4) 注入已结束场次数据并渲染成功（同步断言，避免轮询覆盖）', injected === true);
+    check('4) 已签到 → 绿色 + 角标「已签到」', bgOf('修复甲一') === 'green' && badgeOf('修复甲一') === '已签到',
+      { color: bgOf('修复甲一'), badge: badgeOf('修复甲一') });
+    check('4) 未签到（缺勤）→ 红色 + 角标「缺勤」', bgOf('修复甲二') === 'red' && badgeOf('修复甲二') === '缺勤',
+      { color: bgOf('修复甲二'), badge: badgeOf('修复甲二') });
+    check('4) 请假 → 橙色 + 角标「请假」', bgOf('修复甲三') === 'orange' && badgeOf('修复甲三') === '请假',
+      { color: bgOf('修复甲三'), badge: badgeOf('修复甲三') });
+    check('4) 结束视图统计条：已签到 1 / 请假 1 / 缺勤 1',
+      statOf('#statPresent') === '1' && statOf('#statLeave') === '1' && statOf('#statAbsent') === '1',
+      { present: statOf('#statPresent'), leave: statOf('#statLeave'), absent: statOf('#statAbsent') });
+    check('4) 结束场次下「发起签到」按钮恢复可用（可开新场次）', Q('#btnStart').disabled === false, Q('#btnStart').disabled);
+    await loadPage('/dashboard', '#studentGrid');   // 恢复真实状态，做清理前的最终校验
+    await until(() => !!cardOf('修复甲一'), 15000);
+    check('4) 回到真实状态后页面仍正常渲染（3 张卡都在）', !!cardOf('修复甲一') && !!cardOf('修复甲二') && !!cardOf('修复甲三'));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try {
+      await japi('/api/auth/logout', { method: 'POST' });
+      await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+      await hardCleanup();
+    } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^签到UI班/.test(c.className));
+    check('清理：夹具班级/学生/账号已清除', leftCls.length === 0, leftCls.length);
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

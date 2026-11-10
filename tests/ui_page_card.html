@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：全站统一白色卡片布局（基准 = 签到计划页）
+  规范：<div class="container"> → <section class="page-card"> → 页头 / 工具栏 / 主体内容
+        · 卡片：白底 + 1px 边框 + 圆角 12px + 轻阴影
+        · 卡片与浅灰背景留白 24px（.container 的 padding）
+        · 卡片内边距 24px（窄屏 16px）；全部内容（返回按钮/标题/工具栏/表格）都在卡片内部
+        · 卡内不再套"白卡"（面板/筛选栏/小节盒子均无阴影、无白底）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_page_card.html public/_ui_page_card.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiCard --virtual-time-budget=300000 --dump-dom `
+         "http://localhost:3000/_ui_page_card.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_page_card.html
+  说明：本驱动只读（除登录外不改任何数据）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>全站统一白色卡片布局（基准：签到计划页）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const csEl = (e, prop) => (e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null);
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const rect = (s) => { const e = Q(s); return e ? e.getBoundingClientRect() : null; };
+const TRANSPARENT = (v) => /rgba?\(0, 0, 0, 0\)/.test(String(v));
+const themeColor = () => {
+  const hex = W().getComputedStyle(F().documentElement).getPropertyValue('--primary').trim() || '#4A90D9';
+  const m = hex.replace('#', '');
+  const n = parseInt(m.length === 3 ? m.split('').map((c) => c + c).join('') : m, 16);
+  return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`;
+};
+async function loadPage(url) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q('.container'), 25000);
+  await until(() => Q('.container > .page-card') || Q('.page-card'), 20000);
+  await sleep(900);
+}
+
+// 页面清单：url / 名称 / 页头选择器（null = 该页无页头）/ 主体内容选择器 / 额外小节选择器
+const PAGES = [
+  { url: '/dashboard', name: '签到操作台', head: null, content: '#studentGrid', extra: ['#dashActions'] },
+  { url: '/students', name: '学生管理', head: '.page-head', content: '#studentList', extra: ['.filter-bar'] },
+  { url: '/announcements', name: '叫号管理', head: '.page-head-bar', content: '#anBody', extra: ['#anPublishCard'] },
+  { url: '/random-call', name: '随机点名', head: '.page-head-bar', content: '.rc-controls', extra: ['#rcRecBody'] },
+  { url: '/performance', name: '课堂表现', head: '.page-head-bar', content: '#pfRecBody', extra: ['#pfLikeBody'] },
+  { url: '/homework', name: '作业统计', head: '.page-head', content: '#taskBody', extra: ['.filter-bar'] },
+  { url: '/homework-manage', name: '作业管理', head: '.page-head', content: '#taskBody', extra: ['.filter-bar'] },
+  { url: '/attendance-analysis', name: '考勤分析', head: '.page-head', content: '#statCards', extra: ['.filter-bar'] },
+  { url: '/admin/account-management', name: '账号管理', head: '.page-head', content: '#userList', extra: [] },
+  { url: '/admin/grade-management', name: '年级管理', head: '.page-head', content: '#gradeList', extra: [] },
+  { url: '/admin/class-management', name: '班级管理', head: '.page-head', content: '#classList', extra: [] },
+  { url: '/admin/academic-year-management', name: '学年管理', head: '.page-head', content: '#tabYears', extra: [] },
+  { url: '/admin/student-transfer', name: '学生异动', head: '.page-head', content: '#historyBody', extra: ['.stat-grid'] },
+  { url: '/profile', name: '个人中心', head: '.page-head', content: '.profile-grid', extra: [] },
+  { url: '/attendance/makeup', name: '补签', head: '.page-head', content: '#mkScroll', extra: ['.plan-info'] },
+  { url: '/inspection', name: '巡堂记录', head: '.page-head', content: '#issueBody', extra: ['#inspSummary'] },
+  { url: '/inspection/new', name: '记录问题', head: '.page-head', content: '#issueForm', extra: [] },
+  { url: '/inspection/detail?id=1', name: '问题详情', head: '.page-head', content: '#fbList', extra: ['#issueCard'] },
+  { url: '/admin/group-management', name: '小组管理', head: '.page-head', content: '#groupList', extra: [] },
+];
+
+// 卡内不允许再出现"白卡"的整行容器
+const FLAT_SELECTORS = ['.admin-panel', '.filter-bar', '.plan-table-wrap', '.dash-toolbar', '.plan-toolbar',
+  '.admin-head', '.an-card', '.pf-card', '.rc-card', '.plan-info'];
+
+(async () => {
+  try {
+    out.textContent = '0) 登录…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    check('0) 管理员登录成功', lg.status === 200);
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+
+    const signatures = [];
+    for (const p of PAGES) {
+      log('\n— ' + p.name + '（' + p.url + '）—');
+      await loadPage(p.url);
+      // 允许带查询串（如 /inspection/detail?id=1）：只比较路径部分
+      if (W().location.pathname !== p.url.split('?')[0]) { check(`① ${p.name} 打开成功（未被守卫重定向）`, false, W().location.pathname); continue; }
+
+      // ① 结构：.container 内只有一个 .page-card，页头与主体内容都在卡片内
+      const card = Q('.container > .page-card');
+      check(`① ${p.name}：.container 内是统一卡片 .page-card`, !!card);
+      const kids = Q('.container') ? [...Q('.container').children] : [];
+      check(`① ${p.name}：.container 内除卡片外无游离内容（子元素数 = 1）`, kids.length === 1, kids.map((k) => k.tagName + '.' + k.className).slice(0, 4));
+      if (p.head) {
+        const h = Q(p.head);
+        check(`① ${p.name}：页头（${p.head}）在卡片内部`, !!h && !!card && card.contains(h));
+        check(`① ${p.name}：返回按钮在卡片内部`, !!Q('#btnBack') && !!card && card.contains(Q('#btnBack')));
+        check(`② ${p.name}：页头与内容有分隔线（下边框 1px）`, csEl(h, 'border-bottom-width') === '1px', csEl(h, 'border-bottom-width'));
+        const b = rect('#btnBack'); const t = rect(p.head + ' .page-title'); const cr = card.getBoundingClientRect();
+        check(`② ${p.name}：返回(左) · 标题居中（标题中心 = 卡片内容区中心 ±2px）`,
+          !!b && !!t && b.left < t.left &&
+          Math.abs((t.left + t.width / 2) - (cr.left + cr.width / 2)) <= 2,
+          { back: b && Math.round(b.left), titleMid: t && Math.round(t.left + t.width / 2), cardMid: Math.round(cr.left + cr.width / 2) });
+      } else {
+        skip(`② ${p.name}：页头分隔线`, '该页无页头（根页面，导航栏即标题）');
+      }
+      const contentEl = Q(p.content);
+      check(`① ${p.name}：主体内容（${p.content}）在卡片内部`, !!contentEl && !!card && card.contains(contentEl));
+      for (const sel of p.extra) {
+        const el = Q(sel);
+        if (!el) { skip(`① ${p.name}：${sel} 在卡片内`, '该页无此元素'); continue; }
+        check(`① ${p.name}：${sel} 在卡片内部`, card.contains(el));
+      }
+
+      // ② 卡片样式：白底 / 圆角 12px / 阴影 / 内边距 24px
+      const cStyle = ['background-color', 'border-radius', 'box-shadow', 'padding-top', 'padding-left'].map((k) => csEl(card, k));
+      check(`② ${p.name}：卡片白底 + 圆角 12px + 有阴影`,
+        cStyle[0] === 'rgb(255, 255, 255)' && cStyle[1] === '12px' && cStyle[2] !== 'none', cStyle.slice(0, 3));
+      check(`② ${p.name}：卡片内边距 24px`, cStyle[3] === '24px' && cStyle[4] === '24px', cStyle.slice(3));
+      // 卡片与页面背景留白 24px（容器内边距）
+      check(`② ${p.name}：卡片与页面背景留白 24px（.container padding）`,
+        cs('.container', 'padding-left') === '24px' && cs('.container', 'padding-top') === '24px',
+        [cs('.container', 'padding-left'), cs('.container', 'padding-top')]);
+      const cr2 = card.getBoundingClientRect();
+      const ctr = rect('.container');
+      check(`② ${p.name}：卡片左边缘 = 容器内容区左边缘`,
+        !!cr2 && !!ctr && Math.abs(cr2.left - (ctr.left + 24)) <= 1,
+        { card: Math.round(cr2.left), containerInner: Math.round(ctr.left + 24) });
+      check(`② ${p.name}：卡片在页头下方（贴顶留白 24px）`,
+        !!cr2 && !!ctr && Math.abs(cr2.top - ctr.top) <= 25, { gap: Math.round(cr2.top - ctr.top) });
+      // 卡片浮在浅灰页面背景上（对比明显），且水平居中（左右留白一致）
+      const bgHex = W().getComputedStyle(F().documentElement).getPropertyValue('--bg').trim().replace('#', '');
+      const bgN = parseInt(bgHex.length === 3 ? bgHex.split('').map((c) => c + c).join('') : bgHex, 16);
+      const bgRgb = `rgb(${(bgN >> 16) & 255}, ${(bgN >> 8) & 255}, ${bgN & 255})`;
+      check(`② ${p.name}：页面背景为浅灰（${bgRgb}），与白色卡片形成对比`,
+        W().getComputedStyle(F().body).backgroundColor === bgRgb,
+        { body: W().getComputedStyle(F().body).backgroundColor, want: bgRgb });
+      check(`② ${p.name}：横向居中（左右留白差 ≤ 2px）`,
+        (() => { const de = F().documentElement; const l = cr2.left; const r = de.clientWidth - cr2.right;
+          return Math.abs(l - r) <= 2; })(),
+        (() => { const de = F().documentElement; return { left: Math.round(cr2.left), right: Math.round(de.clientWidth - cr2.right) }; })());
+      signatures.push({ page: p.name, sig: cStyle.join('|') });
+
+      // ③ 卡内不再套白卡：整行容器无白底 / 无阴影
+      for (const sel of FLAT_SELECTORS) {
+        const el = Q(sel);
+        if (!el || !card.contains(el)) continue;
+        const bg = csEl(el, 'background-color');
+        const sh = csEl(el, 'box-shadow');
+        check(`③ ${p.name}：卡内 ${sel} 不再自成白卡（无白底/无阴影）`,
+          TRANSPARENT(bg) && (sh === 'none' || !sh), { bg, sh });
+      }
+      const visibleCards = Qa('.page-card').filter((c) => {
+        let n = c; while (n && n.nodeType === 1) { const st = W().getComputedStyle(n); if (st.display === 'none') return false; n = n.parentElement; }
+        const r = c.getBoundingClientRect(); return r.width > 0 && r.height > 0;
+      });
+      check(`③ ${p.name}：当前可见的"主卡片"只有一张（可见 .page-card 数量 = 1）`,
+        visibleCards.length === 1, { visible: visibleCards.length, total: Qa('.page-card').length });
+      check(`③ ${p.name}：页面无横向溢出`,
+        (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })(),
+        (() => { const de = F().documentElement; return { sw: de.scrollWidth, cw: de.clientWidth }; })());
+      // 页头/工具栏等与卡片内容左边缘对齐（内边距 24px 生效）
+      if (p.head) {
+        const hb = rect('#btnBack');
+        check(`③ ${p.name}：返回按钮左边缘 = 卡片内容区左边缘`,
+          !!hb && Math.abs(hb.left - (cr2.left + 24)) <= 3, { back: hb && Math.round(hb.left), inner: Math.round(cr2.left + 24) });
+      }
+    }
+
+    // ④ 跨页一致性：所有页面卡片样式签名完全相同
+    const uniq = [...new Set(signatures.map((s) => s.sig))];
+    check(`④ 全部 ${signatures.length} 个页面的卡片样式完全一致（白底/圆角/阴影/内边距同一签名）`,
+      uniq.length === 1, uniq.length === 1 ? uniq[0] : uniq);
+
+    // ⑤ 签到计划页（基准页）也是同一张卡片
+    log('\n— 签到计划（基准页）—');
+    await loadPage('/dashboard');
+    const plansBtn = Q('#btnPlansView');
+    if (plansBtn) {
+      W().__nav && W().__nav.openGroup && W().__nav.openGroup('navGroupAttendance');
+      plansBtn.click();
+      await until(() => Q('#viewPlans') && !Q('#viewPlans').classList.contains('hidden'), 8000);
+      await sleep(400);
+      check('⑤ 签到计划页使用同一个 .page-card 卡片', !!Q('#viewPlans .page-card'));
+      check('⑤ 签到计划卡片样式与其它页面一致（白底/圆角12px/阴影/内边距24px）',
+        (() => { const c = Q('#viewPlans .page-card'); if (!c) return false;
+          return ['background-color', 'border-radius', 'box-shadow', 'padding-top', 'padding-left']
+            .map((k) => csEl(c, k)).join('|') === uniq[0]; })(),
+        (() => { const c = Q('#viewPlans .page-card'); return c ? ['background-color', 'border-radius', 'box-shadow', 'padding-top', 'padding-left'].map((k) => csEl(c, k)) : null; })());
+      check('⑤ 计划页页头（返回/标题/按钮）在卡片内部',
+        !!Q('#viewPlans .page-card .page-head') && !!Q('#viewPlans .page-card #btnBackAttendance') && !!Q('#viewPlans .page-card #btnAddPlan'));
+      check('⑤ 计划页表格在卡片内部', !!Q('#viewPlans .page-card .plan-table-wrap #planList'));
+      const pb = rect('#viewPlans #btnBackAttendance'); const pt = rect('#viewPlans .page-title'); const pc = Q('#viewPlans .page-card');
+      const pcr = pc && pc.getBoundingClientRect();
+      check('⑤ 计划页：返回(左) · 标题居中',
+        !!pb && !!pt && !!pcr && pb.left < pt.left && Math.abs((pt.left + pt.width / 2) - (pcr.left + pcr.width / 2)) <= 2,
+        { back: pb && Math.round(pb.left), titleMid: pt && Math.round(pt.left + pt.width / 2) });
+      Q('#btnBackAttendance').click();
+      await sleep(400);
+    } else {
+      check('⑤ 签到计划入口存在', false);
+    }
+
+    // ⑥ 签到操作台：操作条也在卡片内部，且与主体内容同宽
+    check('⑥ 签到操作台：操作条在卡片内部', (() => { const c = Q('#viewAttendance .page-card'); return !!c && c.contains(Q('.dash-toolbar')); })());
+    check('⑥ 签到操作台：操作条与卡片内容区左右对齐',
+      (() => { const c = Q('#viewAttendance .page-card'); const t = rect('.dash-toolbar'); if (!c || !t) return false;
+        const r = c.getBoundingClientRect(); return Math.abs(t.left - (r.left + 24)) <= 2 && Math.abs((r.right - 24) - t.right) <= 2; })());
+    check('⑥ 签到操作台：统计条与座位/名单在卡片内部',
+      (() => { const c = Q('#viewAttendance .page-card'); return !!c && c.contains(Q('.stats-bar')) && c.contains(Q('#studentGrid')); })());
+
+    // ⑦ 窄屏：卡片内边距 16px、无横向溢出
+    log('\n— 窄屏（560px）—');
+    fr.style.width = '560px'; fr.style.height = '1000px';
+    await sleep(600);
+    await loadPage('/students');
+    check('⑦ 窄屏：卡片内边距收敛为 16px', cs('.page-card', 'padding-top') === '16px', cs('.page-card', 'padding-top'));
+    check('⑦ 窄屏：无横向溢出', (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })(),
+      (() => { const de = F().documentElement; return { sw: de.scrollWidth, cw: de.clientWidth }; })());
+    check('⑦ 窄屏：页头仍在卡片内部', (() => { const c = Q('.page-card'); return !!c && c.contains(Q('.page-head')) && c.contains(Q('#btnBack')); })());
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

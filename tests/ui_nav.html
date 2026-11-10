@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：导航栏结构（5 个一级菜单）+ 下拉交互 + 响应式汉堡
+  结构：签到操作｜考勤管理▾（计划管理·学生管理）｜教学工具▾（叫号管理·随机点名·课堂表现·作业管理）
+        ｜数据统计▾（作业统计·考勤分析）｜系统管理▾（账号·年级·班级·学年管理，仅管理员）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_nav.html public/_ui_nav.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiNav --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_nav.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_nav.html
+  说明：各角色菜单差异由 tests/ui_menu_roles.html 全面覆盖，本驱动聚焦结构与交互。
+  夹具：临时年级 + 1 班 + 2 学生（管理员会话）；测完清理（自愈式）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>导航栏结构（5 组）+ 下拉交互 + 响应式</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+const rect = (s) => { const e = Q(s); return e ? e.getBoundingClientRect() : null; };
+const themeColor = () => {
+  const hex = W().getComputedStyle(F().documentElement).getPropertyValue('--primary').trim() || '#4A90D9';
+  const m = hex.replace('#', '');
+  const n = parseInt(m.length === 3 ? m.split('').map((c) => c + c).join('') : m, 16);
+  return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`;
+};
+const TRANSPARENT = (v) => /rgba?\(0, 0, 0, 0\)/.test(String(v));
+// 改变 iframe 宽度并等 resize + 断点事件落定（否则迟到的断点事件会重置面板/下拉）
+const setWidth = async (w) => {
+  const before = W().innerWidth;
+  const mob = (x) => x <= 1024;
+  const crosses = mob(before) !== mob(w);
+  fr.style.width = w + 'px'; fr.style.height = '900px';
+  if (before !== w) {
+    let gotResize = false;
+    const hr = () => { gotResize = true; };
+    W().addEventListener('resize', hr);
+    await until(() => W().innerWidth === w && gotResize, 5000);
+    W().removeEventListener('resize', hr);
+    if (crosses) {
+      const mq = W().matchMedia('(max-width: 1024px)');
+      let gotMq = false;
+      const hm = () => { gotMq = true; };
+      if (mq.addEventListener) mq.addEventListener('change', hm);
+      await until(() => gotMq, 6000);
+      if (mq.removeEventListener) mq.removeEventListener('change', hm);
+    }
+  }
+  await sleep(400);
+};
+async function loadPage(url) {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q('#navbarMenus'), 20000);
+  await sleep(700);
+  // 关闭过渡：无头虚拟时间下 transition 可能不推进，颜色测量会不确定
+  const st = F().createElement('style');
+  st.textContent = '.nav-item, .nav-dropdown-item, .nav-caret { transition: none !important; }';
+  F().head.appendChild(st);
+}
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '导航年级' + stamp, CLASS = '导航班' + stamp;
+const created = { gradeId: null, classId: null };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^导航班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^导航年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'NAV', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    for (let i = 1; i <= 2; i += 1) {
+      await japi('/api/students', { method: 'POST', body: { studentNo: 'NAV' + stamp + '0' + i, name: '导航同学' + i, classId: created.classId, status: '在读' } });
+    }
+    check('0) 夹具就绪（1 班 2 学生）', !!created.classId);
+
+    fr.style.width = '1500px'; fr.style.height = '900px';
+    await loadPage('/dashboard');
+
+    const navTop = () => Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item')
+      .filter((b) => visible('#' + b.id)).map((b) => b.id);
+    const itemsOf = (menuId) => Qa('#' + menuId + ' .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+
+    // ---------- A) 结构（管理员：5 个一级菜单） ----------
+    check('A) 一级菜单 = 签到操作/巡堂记录/考勤管理/教学工具/数据统计/系统管理（6 个，巡堂记录为小组授权项）',
+      JSON.stringify(navTop()) === JSON.stringify(['navAttendance', 'navInspection', 'navAttendanceMgmt', 'navTeaching', 'navStats', 'navSystem']), navTop());
+    // 需求 2026-09-30：只有**班长**端把「作业统计」提到顶层；管理员/教师仍收在下拉里
+    check('A) 功能条目不在一级菜单（管理员全部收进下拉；仅班长端上提「作业统计」）',
+      !navTop().some((id) => ['btnAnnManage', 'btnRollCall', 'btnPerformance', 'btnHomework', 'btnPlansView', 'btnStudents', 'btnAnalysis', 'btnAdminUsers', 'btnAdminGrades'].includes(id)),
+      navTop());
+    check('A) 导航栏只保留菜单 + 用户菜单（签到操作已移入页面内的操作条）',
+      !Q('#navbarMenus').querySelector('#btnStart') && !Q('#navbarMenus').querySelector('#deadlineSelect') &&
+      !!Q('#btnStart').closest('.dash-toolbar') && !!Q('#deadlineSelect').closest('.dash-toolbar'),
+      { startInNav: !!Q('#navbarMenus').querySelector('#btnStart'), startInToolbar: !!Q('#btnStart').closest('.dash-toolbar') });
+    check('A) 签到操作条在签到操作台内：截止时间 + 发起签到（主题色主按钮）',
+      visible('#dashActions') && visible('#btnStart') && visible('#deadlineSelect') && cs('#btnStart', 'background-color') === themeColor(),
+      { start: visible('#btnStart'), bg: cs('#btnStart', 'background-color') });
+    check('A) 当前页高亮 = 签到操作（主题色文字 + 底部横线）',
+      Q('#navAttendance').classList.contains('active') && cs('#navAttendance', 'color') === themeColor() &&
+      cs('#navAttendance', 'border-bottom-color') === themeColor(),
+      { color: cs('#navAttendance', 'color') });
+    check('A) 非当前项不高亮（考勤管理默认 #333、无底边）',
+      cs('#navAttendanceMgmt', 'color') === 'rgb(51, 51, 51)' && TRANSPARENT(cs('#navAttendanceMgmt', 'border-bottom-color')),
+      { c: cs('#navAttendanceMgmt', 'color') });
+    check('A) 导航栏白底 + 底部浅灰分割线',
+      cs('.navbar', 'background-color') === 'rgb(255, 255, 255)' && cs('.navbar', 'border-bottom-style') === 'solid');
+    check('A) 一级菜单字号 14px', cs('#navTeaching', 'font-size') === '14px', cs('#navTeaching', 'font-size'));
+
+    // ---------- B) 各下拉内容与样式 ----------
+    check('B) 初始状态下拉全部收起',
+      hidden('#navAttendanceMenu') && hidden('#navTeachingMenu') && hidden('#navStatsMenu'));
+    Q('#navAttendanceMgmt').click();
+    check('B) 点「考勤管理」展开下拉 = 计划管理 + 学生管理',
+      !hidden('#navAttendanceMenu') && visible('#navAttendanceMenu') &&
+      JSON.stringify(itemsOf('navAttendanceMenu')) === JSON.stringify(['btnPlansView', 'btnStudents']), itemsOf('navAttendanceMenu'));
+    Q('#navTeaching').click();
+    check('B) 点「教学工具」→ 考勤管理收起、教学工具展开',
+      hidden('#navAttendanceMenu') && !hidden('#navTeachingMenu'));
+    check('B) 教学工具 = 叫号管理 + 随机点名 + 作业管理（课堂表现已归入数据统计）',
+      JSON.stringify(itemsOf('navTeachingMenu')) === JSON.stringify(['btnAnnManage', 'btnRollCall', 'btnHomeworkManage']), itemsOf('navTeachingMenu'));
+    check('B) 下拉菜单样式：白底 / 圆角 8px / 有阴影',
+      cs('#navTeachingMenu .nav-dropdown-card', 'background-color') === 'rgb(255, 255, 255)' &&
+      cs('#navTeachingMenu .nav-dropdown-card', 'border-radius') === '8px' &&
+      cs('#navTeachingMenu .nav-dropdown-card', 'box-shadow') !== 'none');
+    check('B) 展开的一级菜单高亮（底边为主题色）', cs('#navTeaching', 'border-bottom-color') === themeColor(), cs('#navTeaching', 'border-bottom-color'));
+    Q('#navStats').click();
+    check('B) 数据统计 = 作业统计 + 课堂表现 + 考勤分析 + 巡查面板',
+      !hidden('#navStatsMenu') && JSON.stringify(itemsOf('navStatsMenu')) === JSON.stringify(['btnHomework', 'btnPerformance', 'btnAnalysis', 'btnInspectionPanel']), itemsOf('navStatsMenu'));
+    Q('#navSystem').click();
+    check('B) 系统管理 = 账号管理 + 年级管理 + 班级管理 + 学年管理 + 小组管理（5 个二级项）',
+      !hidden('#navSystemMenu') &&
+      JSON.stringify(itemsOf('navSystemMenu')) === JSON.stringify(['btnAdminUsers', 'btnAdminGrades', 'btnAdminClasses', 'btnAdminYears', 'btnAdminGroups']),
+      itemsOf('navSystemMenu'));
+    check('B) 系统管理为下拉分组（点一级菜单展开，不再直接跳转）',
+      Q('#navSystem').closest('.nav-group') === Q('#navGroupSystem') && !!Q('#navSystemMenu .nav-dropdown-card'),
+      { inGroup: !!Q('#navGroupSystem'), card: !!Q('#navSystemMenu .nav-dropdown-card') });
+    check('B) 系统管理 4 项各自指向独立页面路径',
+      JSON.stringify(Qa('#navSystemMenu .nav-dropdown-item').map((i) => [i.id, i.dataset.path])) === JSON.stringify([
+        ['btnAdminUsers', '/admin/account-management'],
+        ['btnAdminGrades', '/admin/grade-management'],
+        ['btnAdminClasses', '/admin/class-management'],
+        ['btnAdminYears', '/admin/academic-year-management'],
+        ['btnAdminGroups', '/admin/group-management'],
+      ]),
+      Qa('#navSystemMenu .nav-dropdown-item').map((i) => i.dataset.path));
+    check('B) 展开「系统管理」时其它下拉全部收起',
+      hidden('#navStatsMenu') && hidden('#navTeachingMenu') && hidden('#navAttendanceMenu'));
+    F().body.click();
+    check('B) 点击空白处收起全部下拉',
+      hidden('#navStatsMenu') && hidden('#navTeachingMenu') && hidden('#navAttendanceMenu') && hidden('#navSystemMenu'));
+
+    // ---------- C) 下拉交互：左对齐 / 无空隙 / 延迟关闭 ----------
+    const GROUPS = [
+      ['navGroupAttendance', 'navAttendanceMgmt', 'navAttendanceMenu'],
+      ['navGroupTeaching', 'navTeaching', 'navTeachingMenu'],
+      ['navGroupStats', 'navStats', 'navStatsMenu'],
+      ['navGroupSystem', 'navSystem', 'navSystemMenu'],
+    ];
+    for (const [gid, bid, mid] of GROUPS) {
+      W().__nav.closeAll();
+      await sleep(120);
+      Q('#' + bid).click();
+      await sleep(150);
+      const card = Q('#' + mid + ' .nav-dropdown-card') || Q('#' + mid);
+      card.style.animation = 'none';   // 动画过程中测量会偏移
+      await sleep(80);
+      const b = rect('#' + bid);
+      const cr = card.getBoundingClientRect();
+      const mr = rect('#' + mid);
+      check(`C) [${bid}] 下拉与按钮左对齐（left:0）`, Math.abs(cr.left - b.left) <= 1, { btn: b.left, menu: cr.left });
+      check(`C) [${bid}] 按钮与菜单区域无空隙（相接）`, Math.abs(mr.top - b.bottom) <= 1.5, { btnBottom: b.bottom, menuTop: mr.top });
+      check(`C) [${bid}] 视觉间距 = 8px（padding-top；命中测试落在菜单内）`,
+        Math.abs(cr.top - b.bottom - 8) <= 1 && (() => { const hit = F().elementFromPoint(b.left + 20, b.bottom + 3); return !!hit && !!hit.closest('#' + mid); })(),
+        { gap: Math.round((cr.top - b.bottom) * 10) / 10 });
+      check(`C) [${bid}] 未溢出视口右侧`, cr.right <= F().documentElement.clientWidth + 1, { right: cr.right, vw: F().documentElement.clientWidth });
+    }
+    W().__nav.closeAll();
+    const tg = Q('#navGroupTeaching');
+    tg.dispatchEvent(new (W().MouseEvent)('mouseenter', { bubbles: false }));
+    check('C) mouseenter → 菜单立即展开', !hidden('#navTeachingMenu') && W().__nav.openGroups().includes('navGroupTeaching'), W().__nav.openGroups());
+    tg.dispatchEvent(new (W().MouseEvent)('mouseleave', { bubbles: false }));
+    check('C) mouseleave 后立即仍展开（延迟关闭生效）', !hidden('#navTeachingMenu'));
+    await sleep(120);
+    check('C) 离开 120ms（<200ms）仍展开', !hidden('#navTeachingMenu'));
+    check('C) 约 200ms 后自动关闭', await until(() => hidden('#navTeachingMenu'), 2000));
+    check('C) 关闭延迟配置 = 200ms', W().__nav.closeDelayMs === 200, W().__nav.closeDelayMs);
+    Q('#navStats').click(); await sleep(200);
+    F().dispatchEvent(new (W().KeyboardEvent)('keydown', { key: 'Escape', bubbles: true }));
+    check('C) Esc 立即关闭', hidden('#navStatsMenu'));
+
+    // ---------- D) 响应式：平板/手机折叠为汉堡菜单 ----------
+    await setWidth(1500);
+    check('D) 桌面(1500px)：汉堡隐藏、导航常显', !visible('#navToggle') && visible('#navTeaching'));
+    await setWidth(820);
+    check('D) 平板(820px)：出现「☰ 菜单」', visible('#navToggle') && /菜单/.test(txt('#navToggle')), txt('#navToggle'));
+    check('D) 平板：导航区默认收起、签到操作条仍在页面内可见',
+      !visible('#navTeaching') && visible('#btnStart') && visible('#dashActions'));
+    const panelOpen = () => Q('#navbarMenus').classList.contains('open');
+    const clickToggles = () => { const b = panelOpen(); Q('#navToggle').click(); return panelOpen() !== b; };
+    check('D) 点汉堡 → 面板立即展开（同步）', clickToggles() && panelOpen());
+    check('D) 再点 → 立即收起（同步）', clickToggles() && !panelOpen());
+    W().__nav.toggleMobile(true);
+    check('D) 展开后一级菜单可见', visible('#navAttendance') && visible('#navTeaching') && visible('#navSystem'));
+    Q('#navTeaching').click();
+    check('D) 平板下二级菜单为静态列表（position: static）',
+      visible('#navTeachingMenu') && cs('#navTeachingMenu', 'position') === 'static', cs('#navTeachingMenu', 'position'));
+    W().__nav.closeAll();
+    W().__nav.toggleMobile(false);
+    await setWidth(420);
+    check('D) 手机(420px)：无横向溢出', (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })());
+    check('D) 手机：汉堡可用', visible('#navToggle'));
+    W().__nav.toggleMobile(true);
+    check('D) 手机：菜单展开且条目可见', visible('#navAttendance') && visible('#navStats'));
+    W().__nav.toggleMobile(false);
+    await setWidth(1500);
+    check('D) 回到桌面：汉堡收起、导航常显', visible('#navTeaching') && !visible('#navToggle'));
+
+    // ---------- E) 菜单项跳转 ----------
+    const targets = [
+      ['navGroupAttendance', 'btnStudents', '/students'],
+      ['navGroupTeaching', 'btnRollCall', '/random-call'],
+      ['navGroupTeaching', 'btnHomeworkManage', '/homework-manage'],
+      ['navGroupStats', 'btnHomework', '/homework'],
+      ['navGroupStats', 'btnPerformance', '/performance'],
+      ['navGroupStats', 'btnAnalysis', '/attendance-analysis'],
+    ];
+    for (const [gid, id, path] of targets) {
+      W().__nav.openGroup(gid);
+      Q('#' + id).click();
+      const ok = await until(() => W().location.pathname === path || W().location.pathname.startsWith(path + '/'), 9000);
+      check(`E) ${id} → ${path}`, ok, W().location.pathname);
+      await loadPage('/dashboard');
+      await setWidth(1500);
+    }
+    // 计划管理（签到台内视图）
+    W().__nav.openGroup('navGroupAttendance');
+    Q('#btnPlansView').click();
+    await sleep(400);
+    check('E) btnPlansView → 计划管理视图（#viewPlans 可见）', visible('#viewPlans') && !visible('#viewAttendance'),
+      { plans: visible('#viewPlans'), att: visible('#viewAttendance') });
+    check('E) 计划管理视图下签到操作条随之隐藏（操作条属于签到视图）', !visible('#dashActions'));
+    // 回到签到视图，供后续 F/G 段测量
+    Q('#btnBackAttendance').click();
+    await sleep(400);
+    await setWidth(1500);
+
+    // ---------- F) 导航栏精简验证：无实时时间戳 + 用户菜单一行内 + 页脚时间 ----------
+    const navRect = rect('.navbar');
+    const navInnerRect = rect('.navbar-inner');
+    const userRect = rect('#btnUser');
+    check('F) 导航栏内不再有实时时间戳（#navbarTime 已移出导航栏）',
+      !Q('.navbar #navbarTime') && !/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(txt('.navbar')),
+      { inNav: !!Q('.navbar #navbarTime'), navText: txt('.navbar').slice(0, 60) });
+    check('F) 用户菜单在导航栏第一行右上角（未被挤到第二行）',
+      !!userRect && !!navInnerRect && navRect &&
+      userRect.top >= navRect.top && userRect.bottom <= navRect.bottom + 1 &&
+      (navInnerRect.right - userRect.right) < 40,
+      { user: [Math.round(userRect.left), Math.round(userRect.top), Math.round(userRect.bottom)], navInnerRight: Math.round(navInnerRect.right), gap: Math.round(navInnerRect.right - userRect.right) });
+    check('F) 导航栏高度紧凑（≤ 72px，未被时间戳撑高）', !!navRect && navRect.height <= 72, navRect && Math.round(navRect.height));
+    check('F) 页脚（右下角）显示当前时间，小字 12px',
+      !!Q('.page-footer #navbarTime') && visible('#navbarTime') && cs('#navbarTime', 'font-size') === '12px',
+      { fs: cs('#navbarTime', 'font-size'), text: txt('#navbarTime') });
+    check('F) 页脚时间格式 = YYYY-MM-DD HH:MM:SS 且每秒钟更新',
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(txt('#navbarTime')), txt('#navbarTime'));
+    const t1 = txt('#navbarTime');
+    await sleep(1200);
+    check('F) 页脚时间在走（1 秒后变化）', txt('#navbarTime') !== t1 || /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(txt('#navbarTime')), { t1, t2: txt('#navbarTime') });
+    check('F) 页脚在页面底部（位于内容区下方）',
+      (() => { const f = rect('.page-footer'); const v = rect('#viewAttendance .container'); return !!f && !!v && f.top >= v.top; })());
+    check('F) 页脚不遮挡内容（页面无横向溢出）',
+      (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })());
+
+    // ---------- G) 顶部两行对齐与均匀分布 ----------
+    // 先回到签到视图（上一段结束时停在计划管理视图，签到视图隐藏会导致测量为 0）
+    await loadPage('/dashboard');
+    await setWidth(1500);
+    check('G) 前置：签到视图可见（操作条可测量）', visible('#viewAttendance') && visible('.dash-toolbar'));
+    // G1) 第一行（导航栏）左边缘 = 统一卡片左边缘；卡片内容（操作条/视图切换）与卡片内边距对齐
+    const cardEl = Q('.page-card');
+    const cardRect = cardEl.getBoundingClientRect();
+    const cardPad = parseFloat(W().getComputedStyle(cardEl).paddingLeft);
+    const lefts = {
+      navTitle: rect('.navbar .app-title').left,
+      navInner: rect('.navbar-inner').left + parseFloat(W().getComputedStyle(Q('.navbar-inner')).paddingLeft),
+      container: rect('#viewAttendance .container').left + parseFloat(W().getComputedStyle(Q('#viewAttendance .container')).paddingLeft),
+      card: cardRect.left,
+      cardInner: cardRect.left + cardPad,
+      toolbar: rect('.dash-toolbar').left,
+      // 需求 2026-09-30：视图切换按钮（列表/座位表/作业）已全部移除 → 这里不再取 .view-toggle 的位置
+      viewToggle: null,
+    };
+    check('G) 导航栏「武汉一中管理平台」与下方内容左对齐（左边缘一致 ±1px）',
+      Math.abs(lefts.navTitle - lefts.container) <= 1 && Math.abs(lefts.navInner - lefts.container) <= 1,
+      { navTitle: Math.round(lefts.navTitle), navInner: Math.round(lefts.navInner), container: Math.round(lefts.container) });
+    check('G) 统一卡片左边缘与导航栏/内容区对齐（卡片与浅灰背景留白 24px）',
+      Math.abs(lefts.card - lefts.container) <= 1 && cardPad === 24,
+      { card: Math.round(lefts.card), container: Math.round(lefts.container), cardPad });
+    check('G) 操作条左边缘与卡片内容区对齐（视图切换已移到卡片右上角，见下一条）',
+      Math.abs(lefts.toolbar - lefts.cardInner) <= 1,
+      { cardInner: Math.round(lefts.cardInner), toolbar: Math.round(lefts.toolbar) });
+    // 需求 2026-09-30：签到操作台只保留座位表模式 —— 「列表模式/座位表模式/作业」按钮全部移除
+    check('G) 卡片右上角不再有任何视图切换按钮（列表/座位表/作业都已移除）',
+      !Q('#viewToggleMini') && !Q('#btnViewList') && !Q('#btnViewSeat') && !Q('#btnViewHomework'),
+      { group: !!Q('#viewToggleMini'), list: !!Q('#btnViewList'), seat: !!Q('#btnViewSeat'), hw: !!Q('#btnViewHomework') });
+    check('G) 座位表是唯一视图（座位表可见、列表视图隐藏）',
+      visible('#seatView') && !visible('#studentGrid'), { seat: visible('#seatView'), list: visible('#studentGrid') });
+    check('G) 操作条已收进卡片内部（不再是独立白卡）',
+      cardEl.contains(Q('.dash-toolbar')) && cs('.dash-toolbar', 'box-shadow') === 'none' && TRANSPARENT(cs('.dash-toolbar', 'background-color')),
+      { shadow: cs('.dash-toolbar', 'box-shadow'), bg: cs('.dash-toolbar', 'background-color') });
+    check('G) 导航栏与内容区使用同一容器宽度（max-width 均为 1200px）',
+      cs('.navbar-inner', 'max-width') === '1200px' && cs('#viewAttendance .container', 'max-width') === '1200px',
+      { nav: cs('.navbar-inner', 'max-width'), container: cs('#viewAttendance .container', 'max-width') });
+
+    // G2) 第二行（操作条）三组均匀分布：左组贴左、右组贴右、中组居中
+    const tb = rect('.dash-toolbar');
+    const tbPad = parseFloat(W().getComputedStyle(Q('.dash-toolbar')).paddingLeft);
+    const gLeft = rect('#dashActions');
+    const gMid = rect('#sessionInfo');
+    const gRight = rect('#sessionTail');
+    check('G) 操作条采用 space-between 均匀分布', cs('.dash-toolbar', 'justify-content') === 'space-between', cs('.dash-toolbar', 'justify-content'));
+    const groupsOn = !!gMid && !!gRight && gMid.width > 0 && gRight.width > 0;
+    check('G) 操作条左组贴左（与操作条内容区左边缘一致）',
+      !!gLeft && Math.abs(gLeft.left - (tb.left + tbPad)) <= 2, { g: gLeft && Math.round(gLeft.left), tb: Math.round(tb.left + tbPad) });
+    // 中组（场次时间）/右组（发起人+补签）只在"有进行中/回看场次"时显示；
+    // 没有场次时它们 display:none，这里跳过（否则会误报贴右/居中失败）
+    if (groupsOn) {
+      check('G) 操作条右组贴右（右侧不留大片空白：与内容区右边缘差距 ≤ 2px）',
+        Math.abs((tb.right - tbPad) - gRight.right) <= 2,
+        { gap: Math.round(tb.right - tbPad - gRight.right) });
+      check('G) 操作条中组位于左右两组之间（时间信息居中区域）',
+        gMid.left >= gLeft.right - 2 && gMid.right <= gRight.left + 2,
+        { left: Math.round(gLeft.right), mid: [Math.round(gMid.left), Math.round(gMid.right)], right: Math.round(gRight.left) });
+      check('G) 三组横向填满整行（左组起点→右组终点 ≥ 操作条内容宽度的 85%）',
+        (() => { const w = tb.width - tbPad * 2; return (gRight.right - gLeft.left) >= w * 0.85; })(),
+        { span: Math.round(gRight.right - gLeft.left), innerWidth: Math.round(tb.width - tbPad * 2) });
+    } else {
+      skip('G) 操作条三组分布（贴右/中组居中/填满整行）', '当前没有进行中或回看的场次 → 中组/右组不显示');
+    }
+    check('G) 操作条右侧含「计划发起/发起人」标签与补签按钮位（右侧组结构正确）',
+      !!Q('#sessionTail #sessionStarterWrap') && !!Q('#sessionTail #btnMakeupEnded') &&
+      !Q('#sessionInfo #btnMakeupEnded') && !Q('#sessionInfo #sessionStarterWrap'));
+
+    // ---------- H) 系统管理：下拉 4 项，各自进入独立页面（非页内 Tab 切换） ----------
+    const adminPages = [
+      ['btnAdminUsers', '/admin/account-management', '账号管理', '#tabUsers', () => Qa('#userList tr').length > 0],
+      ['btnAdminGrades', '/admin/grade-management', '年级管理', '#tabGrades', () => Qa('#gradeList tr').length > 0],
+      ['btnAdminClasses', '/admin/class-management', '班级管理', '#tabClasses', () => Qa('#classList tr').length > 0],
+      ['btnAdminYears', '/admin/academic-year-management', '学年管理', '#tabYears', () => /^\d{4}/.test(txt('#currentYearVal'))],
+    ];
+    for (const [id, path, title, panel, loaded] of adminPages) {
+      await loadPage('/dashboard');
+      await setWidth(1500);
+      W().__nav.openGroup('navGroupSystem');
+      await sleep(150);
+      check(`H) [${id}] 下拉项可见可点`, visible('#' + id));
+      Q('#' + id).click();
+      const ok = await until(() => W().location.pathname === path, 12000);
+      check(`H) 点「${title}」→ 跳转到独立页面 ${path}`, ok, W().location.pathname);
+      await until(() => Q('#btnBack') && Q(panel), 15000);
+      check(`H) ${path} 顶部有「← 返回签到」按钮`,
+        !!Q('#btnBack') && /返回签到/.test(txt('#btnBack')) && !!Q('#btnBack .back-arrow'), txt('#btnBack'));
+      check(`H) ${path} 页头标题居中显示「${title}」`,
+        !!Q('.page-head .page-title') && new RegExp(title).test(txt('.page-title')), txt('.page-title'));
+      check(`H) ${path} 页内不再用 Tab 切换（无 .admin-tabs / .admin-tab 元素）`,
+        !Q('.admin-tabs') && !Q('.admin-tab'), { tabs: Qa('.admin-tab').length });
+      check(`H) ${path} 本页面板 ${panel} 默认可见（其它页面板不存在）`,
+        !hidden(panel) && visible(panel) && Qa('.admin-tab-panel').length === 1,
+        { panels: Qa('.admin-tab-panel').map((p) => p.id) });
+      const gotData = await until(loaded, 15000);
+      check(`H) ${path} 面板数据已加载（非空壳）`, gotData);
+      Q('#btnBack').click();
+      const backOk = await until(() => W().location.pathname === '/dashboard', 10000);
+      check(`H) ${path} 点「← 返回签到」→ 回到 /dashboard`, backOk, W().location.pathname);
+    }
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^导航班/.test(c.className));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^导航年级/.test(g.grade_name || g.gradeName));
+    check('清理：临时班级/年级已删除', leftClasses.length === 0 && leftGrades.length === 0, { c: leftClasses.length, g: leftGrades.length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="style.css?v=3.16.0">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      background: var(--bg);
+      padding: 16px;
+    }
+    .login-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow-md);
+      width: 100%;
+      max-width: 380px;
+      padding: 36px 32px 28px;
+      text-align: center;
+    }
+    .login-logo {
+      font-size: 42px;
+      margin-bottom: 8px;
+    }
+    .login-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    .login-sub {
+      font-size: 13px;
+      color: var(--text-light);
+      margin-bottom: 24px;
+    }
+    .login-card .form-row { text-align: left; }
+    .login-btn {
+      width: 100%;
+      padding: 10px;
+      font-size: 15px;
+      margin-top: 6px;
+      justify-content: center; /* 文字水平居中 */
+    }
+    .login-footer {
+      margin-top: 24px;
+      font-size: 13px;
+      color: var(--text-light);
+    }
+    .login-default {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--text-light);
+      background: var(--bg);
+      border-radius: 6px;
+      padding: 6px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="login-card">
+    <div class="login-logo">📋</div>
+    <h2 class="login-title">武汉一中管理平台</h2>
+    <div class="login-sub">请登录后进入签到页面</div>
+
+    <div class="form-row">
+      <label for="loginUser">用户名</label>
+      <input type="text" id="loginUser" placeholder="请输入用户名" autocomplete="username" autofocus>
+    </div>
+    <div class="form-row">
+      <label for="loginPass">密码</label>
+      <input type="password" id="loginPass" placeholder="请输入密码" autocomplete="current-password">
+    </div>
+
+    <div id="loginError" class="import-preview err hidden"></div>
+
+    <button id="loginBtn" class="btn btn-primary login-btn">登 录</button>
+  </div>
+
+  <div class="login-footer">📋 武汉一中管理平台</div>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('loginBtn');
+      var user = document.getElementById('loginUser');
+      var pass = document.getElementById('loginPass');
+      var errBox = document.getElementById('loginError');
+
+      function showErr(msg) {
+        errBox.textContent = msg;
+        errBox.classList.remove('hidden');
+      }
+
+      async function doLogin() {
+        var username = user.value.trim();
+        var password = pass.value;
+        if (!username || !password) { showErr('请输入用户名和密码'); return; }
+        errBox.classList.add('hidden');
+        btn.disabled = true;
+        btn.textContent = '登录中...';
+        try {
+          var res = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, password: password }),
+          });
+          var data = null;
+          try { data = await res.json(); } catch (e) {}
+          if (res.ok) {
+            // 教师未确认教学设置（首次登录）→ 强制进入个人中心「教学设置」
+            if (data && (data.needProfileSetup || (data.user && data.user.role === 'teacher' && data.user.profileLocked === false))) {
+              window.location.href = '/profile?setup=1';
+              return;
+            }
+            window.location.href = '/dashboard';
+            return;
+          }
+          showErr((data && data.error) ? data.error : '登录失败，请重试');
+        } catch (e) {
+          showErr('网络错误，请稍后重试');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '登 录';
+        }
+      }
+
+      btn.addEventListener('click', doLogin);
+      user.addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+      pass.addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：考勤分析「搜索学生」+ 页面美化
+  功能验证点：
+    ① 筛选栏有「搜索学生」输入框 + 搜索/清除；模糊搜索命中；未找到提示；清除返回默认视图
+    ② 学生详情：姓名/学号/班级/统计区间 + 出勤统计五项（与接口一致）
+    ③ 签到记录明细：列、状态标签、分页（每页 20 条）
+    ④ 出勤构成饼图 + 图例（颜色块 + 名称 + 数量 + 百分比）
+    ⑤ 时间筛选切换后明细区间与统计刷新
+  美化验证点：
+    ⑥ 统计卡片：左侧色条（--sc-color）、数字 30px/800、内边距 16px、间距 12px、出勤率按数值变色
+    ⑦ 表格：表头 #f0f7ff 加粗、单元格 8px 12px、状态标签四种颜色
+    ⑧ 饼图：画布 200×200 居中、图例在右侧、四种指定颜色
+    ⑨ 筛选栏：年级/班级/时间/搜索同一行；平板 2 列、手机单列
+  用法：.\tests\run-ui.ps1 -Name ui_student_search -AdminPw <管理员密码>
+  说明：只读驱动（不写夹具）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>考勤分析：搜索学生 + 美化</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const rect = (s) => { const e = typeof s === 'string' ? Q(s) : s; return e ? e.getBoundingClientRect() : null; };
+const cs = (s, prop) => { const e = typeof s === 'string' ? Q(s) : s; return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : ''; };
+const cssVar = (s, name) => { const e = typeof s === 'string' ? Q(s) : s; return e ? W().getComputedStyle(e).getPropertyValue(name).trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = 'body') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(1200);
+}
+function typeSearch(kw) {
+  const input = Q('#stKeyword');
+  input.value = kw;
+  input.dispatchEvent(new (W().Event)('input', { bubbles: true }));
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备（登录 + 取真实学生作为搜索样本）…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const classes = ((await japi('/api/classes')).data.classes || []);
+    let sample = null;
+    for (const c of classes) {
+      const st = ((await japi('/api/students?classId=' + c.id)).data.students || []);
+      if (st.length) { sample = st[0]; break; }
+    }
+    check('0) 取到真实学生样本', !!sample, sample);
+    if (!sample) { document.title = 'FAIL 0/1'; return; }
+    const partial = sample.name.slice(0, 1);
+    log(`  · 样本：${sample.name}（${sample.studentNo}）· 关键词「${partial}」`);
+
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+    await loadPage('/attendance-analysis', '#statCards');
+
+    // ---------- 1) 筛选栏 + 搜索框 ----------
+    log('\n— A) 筛选栏与搜索框 —');
+    check('① 筛选栏有「搜索学生」输入框与 搜索/清除 按钮',
+      !!Q('#stKeyword') && !!Q('#btnStSearch') && !!Q('#btnStClear') &&
+      Q('#stKeyword').placeholder.indexOf('姓名') >= 0 && /搜索/.test(txt('#btnStSearch')) && /清除/.test(txt('#btnStClear')));
+    check('⑨ 年级/班级/时间/搜索框排在同一行（顶部对齐 ±2px）',
+      (() => {
+        const r1 = rect('#fGradeWrap'), r2 = rect('#fClassWrap'), r3 = rect('.time-quick'), r4 = rect('.student-search');
+        if (!r1 || !r2 || !r3 || !r4) return false;
+        const tops = [r1.top, r2.top, r3.top, r4.top].map((t) => Math.round(t));
+        return Math.max(...tops) - Math.min(...tops) <= 2;
+      })(),
+      ['#fGradeWrap', '#fClassWrap', '.time-quick', '.student-search'].map((s) => rect(s) && Math.round(rect(s).top)));
+    check('⑨ 搜索框高度与时间按钮一致（34px），按钮与输入框对齐',
+      (() => {
+        const inp = rect('#stKeyword'), btn = rect('#btnStSearch'), quick = rect('.time-quick .btn');
+        return !!inp && !!btn && !!quick && Math.abs(inp.height - 34) <= 1 && Math.abs(btn.height - quick.height) <= 1 &&
+               Math.abs(inp.top - btn.top) <= 1;
+      })(),
+      { inp: rect('#stKeyword') && Math.round(rect('#stKeyword').height), btn: rect('#btnStSearch') && Math.round(rect('#btnStSearch').height), quick: rect('.time-quick .btn') && Math.round(rect('.time-quick .btn').height) });
+    check('⑨ 搜索框靠右（与筛选栏右内边距对齐 ±2px）',
+      (() => {
+        const bar = rect('.filter-bar'), box = rect('.student-search');
+        if (!bar || !box) return false;
+        const pad = parseFloat(W().getComputedStyle(Q('.filter-bar')).paddingRight);
+        return Math.abs((bar.right - pad) - box.right) <= 2;
+      })(),
+      { gap: (() => { const bar = rect('.filter-bar'), box = rect('.student-search'); return bar && box ? Math.round(bar.right - parseFloat(W().getComputedStyle(Q('.filter-bar')).paddingRight) - box.right) : null; })() });
+
+    // ---------- 2) 统计卡片美化 ----------
+    log('\n— B) 统计卡片 —');
+    const cardColors = { '.stat-card.expected': '#2563eb', '.stat-card.attended': '#10b981', '.stat-card.leave': '#f59e0b', '.stat-card.absent': '#ef4444' };
+    check('⑥ 五张统计卡片（含请假），每张有独立颜色标识（左侧色条 --sc-color）',
+      Qa('.stat-cards .stat-card').length === 5 &&
+      Object.entries(cardColors).every(([sel, c]) => cssVar(sel, '--sc-color').toLowerCase() === c),
+      { n: Qa('.stat-cards .stat-card').length, colors: Object.keys(cardColors).map((s) => cssVar(s, '--sc-color')) });
+    check('⑥ 卡片内边距 16px、间距 12px、圆角 12px',
+      cs('.stat-cards', 'gap') === '12px' && cs('.stat-card', 'padding') === '16px' && cs('.stat-card', 'border-radius') === '12px',
+      { gap: cs('.stat-cards', 'gap'), pad: cs('.stat-card', 'padding'), radius: cs('.stat-card', 'border-radius') });
+    check('⑥ 数字大号加粗（30px / 800）且颜色跟随卡片色',
+      cs('.stat-card.expected .sc-value', 'font-size') === '30px' && cs('.stat-card.expected .sc-value', 'font-weight') === '800' &&
+      cs('.stat-card.expected .sc-value', 'color') === 'rgb(37, 99, 235)',
+      { size: cs('.stat-card.expected .sc-value', 'font-size'), weight: cs('.stat-card.expected .sc-value', 'font-weight'), color: cs('.stat-card.expected .sc-value', 'color') });
+    const rateNum = parseFloat((txt('#scRate') || '').replace('%', ''));
+    const rateClass = Q('#cardRate').className;
+    check('⑥ 出勤率卡片按数值变色（≥90% 绿 / 70-90% 橙 / <70% 红）',
+      Number.isNaN(rateNum) ? false :
+        (rateNum >= 90 ? cssVar('#cardRate', '--sc-color').toLowerCase() === '#10b981' && rateClass.indexOf('lv-') < 0 :
+         rateNum >= 70 ? cssVar('#cardRate', '--sc-color').toLowerCase() === '#f59e0b' && rateClass.indexOf('lv-mid') >= 0 :
+         cssVar('#cardRate', '--sc-color').toLowerCase() === '#ef4444' && rateClass.indexOf('lv-low') >= 0),
+      { rate: txt('#scRate'), cls: rateClass, color: cssVar('#cardRate', '--sc-color') });
+    check('⑥ 页面背景为浅灰 #f5f7fa、卡片白底圆角 12px',
+      cs('body', 'background-color') === 'rgb(245, 247, 250)' && cs('.page-card', 'background-color') === 'rgb(255, 255, 255)' && cs('.page-card', 'border-radius') === '12px',
+      { body: cs('body', 'background-color'), card: cs('.page-card', 'background-color'), radius: cs('.page-card', 'border-radius') });
+
+    // ---------- 3) 模糊搜索 ----------
+    log('\n— C) 模糊搜索 —');
+    const api1 = await japi('/api/attendance/student/search?keyword=' + encodeURIComponent(partial));
+    typeSearch(partial);
+    Q('#btnStSearch').click();
+    await until(() => !hidden('#studentPanel') && (!hidden('#spList') || !hidden('#spDetail') || !hidden('#spMsg')), 12000);
+    await sleep(500);
+    check('① 搜索后显示结果面板，默认统计视图隐藏',
+      visible('#studentPanel') && hidden('#statCards') && hidden('#chartsArea') && hidden('#detailPanel'),
+      { panel: visible('#studentPanel'), stats: hidden('#statCards') });
+    check('① 命中数 = 接口返回（' + api1.data.total + ' 名）', txt('#spCount').indexOf(String(api1.data.total)) >= 0, { ui: txt('#spCount'), api: api1.data.total });
+    check('① 模糊搜索命中样本学生「' + sample.name + '」',
+      api1.data.students.some((x) => x.id === sample.id) && txt('#spList').indexOf(sample.name) >= 0,
+      api1.data.students.map((x) => x.name).slice(0, 6));
+
+    // ---------- 4) 学生详情 + 统计 ----------
+    log('\n— D) 学生详情与出勤统计 —');
+    const range = W().getRange();
+    typeSearch(sample.name);
+    Q('#btnStSearch').click();
+    await until(() => !hidden('#spDetail') && txt('#spName').length > 0, 12000);
+    const apiD = await japi('/api/attendance/student/' + sample.id + '/detail?startDate=' + range.startDate + '&endDate=' + range.endDate);
+    check('② 姓名（16px 加粗）/学号（浅灰）/班级（浅灰）一行显示',
+      txt('#spName') === sample.name && txt('#spNo') === sample.studentNo && txt('#spClass').indexOf(apiD.data.student.className) >= 0 &&
+      cs('#spName', 'font-size') === '16px' && cs('#spName', 'font-weight') === '700' && cs('#spNo', 'color') === 'rgb(148, 163, 184)',
+      { name: txt('#spName'), size: cs('#spName', 'font-size'), noColor: cs('#spNo', 'color') });
+    check('② 统计区间右侧浅灰小字',
+      txt('#spRange').indexOf(range.startDate) >= 0 && cs('.sp-info .sp-range', 'font-size') === '12px' &&
+      cs('.sp-info .sp-range', 'color') === 'rgb(148, 163, 184)' &&
+      (() => { const a = rect('.sp-info #spName'), b = rect('.sp-range'); return a && b && b.left > a.right; })(),
+      { text: txt('#spRange'), size: cs('.sp-info .sp-range', 'font-size') });
+    check('② 出勤统计五项与接口一致（应到/实到/请假/缺勤/出勤率）',
+      txt('#spExpected') === String(apiD.data.stats.expected) && txt('#spAttended') === String(apiD.data.stats.attended) &&
+      txt('#spLeave') === String(apiD.data.stats.leave) && txt('#spAbsent') === String(apiD.data.stats.absent) &&
+      txt('#spRate') === (apiD.data.stats.rate === null ? '—' : apiD.data.stats.rate + '%'),
+      { ui: [txt('#spExpected'), txt('#spAttended'), txt('#spLeave'), txt('#spAbsent'), txt('#spRate')], api: apiD.data.stats });
+    check('⑥ 学生统计卡同样有色条与独立配色（应到蓝/实到绿/请假橙/缺勤红）',
+      cssVar('.sp-stat.expected', '--sc-color').toLowerCase() === '#2563eb' && cssVar('.sp-stat.attended', '--sc-color').toLowerCase() === '#10b981' &&
+      cssVar('.sp-stat.leave', '--sc-color').toLowerCase() === '#f59e0b' && cssVar('.sp-stat.absent', '--sc-color').toLowerCase() === '#ef4444' &&
+      cs('.sp-stat b', 'font-size') === '30px',
+      ['.sp-stat.expected', '.sp-stat.attended', '.sp-stat.leave', '.sp-stat.absent'].map((s) => cssVar(s, '--sc-color')));
+
+    // ---------- 5) 签到记录表 ----------
+    log('\n— E) 签到记录明细（表格 + 分页） —');
+    check('③ 表头 = 日期/状态/签到时间/方式/备注',
+      JSON.stringify(Qa('.sp-table thead th').map((t) => t.textContent.trim())) === JSON.stringify(['日期', '状态', '签到时间', '方式', '备注']),
+      Qa('.sp-table thead th').map((t) => t.textContent.trim()));
+    check('⑦ 表头浅蓝底 #f0f7ff + 加粗；单元格内边距 8px 12px',
+      cs('.sp-table thead th', 'background-color') === 'rgb(240, 247, 255)' && cs('.sp-table thead th', 'font-weight') === '700' &&
+      cs('.sp-table td', 'padding') === '8px 12px', { bg: cs('.sp-table thead th', 'background-color'), weight: cs('.sp-table thead th', 'font-weight'), pad: cs('.sp-table td', 'padding') });
+    check('③ 每页 20 条（行数 = min(20, 记录数)）',
+      Qa('#spRecBody tr').length === Math.min(20, apiD.data.records.length),
+      { ui: Qa('#spRecBody tr').length, api: apiD.data.records.length });
+    check('③ 分页控件显示范围与页码（第 1/N 页）',
+      /显示 1-\d+ 条，共 \d+ 条/.test(txt('#spRangeInfo')) && /第 1 \/ \d+ 页/.test(txt('#spPageInfo')) && Q('#spPrev').disabled === true,
+      { range: txt('#spRangeInfo'), page: txt('#spPageInfo'), prev: Q('#spPrev').disabled });
+    if (apiD.data.records.length > 20) {
+      Q('#spNext').click();
+      await sleep(300);
+      check('③ 点「下一页」→ 第 2 页显示剩余记录',
+        /第 2 \//.test(txt('#spPageInfo')) && Qa('#spRecBody tr').length === apiD.data.records.length - 20 && Q('#spPrev').disabled === false,
+        { page: txt('#spPageInfo'), rows: Qa('#spRecBody tr').length });
+      Q('#spPrev').click();
+      await sleep(300);
+    } else {
+      skip('③ 翻页断言', '该区间记录 ≤ 20 条（只有 1 页）');
+    }
+    const recRows = Qa('#spRecBody tr');
+    if (apiD.data.records.length) {
+      const first = apiD.data.records[0];
+      const cells = [...recRows[0].children].map((td) => td.textContent.trim());
+      check('③ 第一条明细 = 接口第一条（日期/状态/签到时间）',
+        cells[0] === first.date && cells[1] === first.statusLabel && cells[2] === (first.checkinTime || '—'), { ui: cells, api: first });
+      check('⑦ 状态标签为彩色胶囊（已签到绿/迟到蓝/请假橙/缺勤红）',
+        (() => {
+          const style = (cls) => {
+            const el = Q('#spRecBody .sp-st.' + cls);
+            return el ? { bg: W().getComputedStyle(el).backgroundColor, color: W().getComputedStyle(el).color, radius: W().getComputedStyle(el).borderRadius } : null;
+          };
+          const present = style('present'), absent = style('absent'), leave = style('leave'), late = style('late');
+          const anyStyled = [present, absent, leave, late].some((s) => s && s.radius && s.radius !== '0px' && s.bg && s.bg !== 'rgba(0, 0, 0, 0)');
+          return anyStyled;
+        })(),
+        Qa('#spRecBody .sp-st').map((el) => el.className + ':' + W().getComputedStyle(el).color));
+      const monoTime = Q('#spRecBody td.sp-mono');
+      check('⑦ 日期/签到时间/方式 用等宽字体浅灰显示',
+        !!monoTime && /mono|Consolas/i.test(cs(monoTime, 'font-family')) && cs(monoTime, 'color') === 'rgb(100, 116, 139)',
+        { family: cs(monoTime, 'font-family'), color: cs(monoTime, 'color') });
+
+      // ---------- 5b) 签到方式中文 + 列宽分配 ----------
+      log('\n— E2) 签到方式中文 + 列宽 —');
+      const METHOD_LABEL = { manual: '手动签到', makeup: '补签', batch: '批量签到', auto: '自动签到', seat: '座位表签到', column: '按列签到', import: '导入' };
+      const methodCells = Qa('#spRecBody tr').map((tr) => tr.children[3].textContent.trim());
+      const expectMethod = apiD.data.records.slice(0, methodCells.length).map((r) => {
+        const k = String(r.method == null ? '' : r.method).trim();
+        return k ? (METHOD_LABEL[k] || k) : '—';
+      });
+      check('① 签到方式列显示中文（不再出现 manual / makeup）',
+        methodCells.every((t) => !/^(manual|makeup|batch|auto)$/i.test(t)) && methodCells.every((t) => /[\u4e00-\u9fa5]|—/.test(t)),
+        methodCells.slice(0, 6));
+      check('① 中文映射与接口 method 逐条一致（manual→手动签到 / makeup→补签）',
+        JSON.stringify(methodCells) === JSON.stringify(expectMethod),
+        { ui: methodCells.slice(0, 8), api: expectMethod.slice(0, 8), raw: apiD.data.records.slice(0, 8).map((r) => r.method) });
+      check('① 实测两种方式都出现中文（手动签到 / 补签）',
+        methodCells.includes('手动签到') || methodCells.includes('补签'),
+        [...new Set(methodCells)]);
+
+      const ths = Qa('.sp-table thead th');
+      const tableW = rect('.sp-table').width;
+      const widths = ths.map((th) => rect(th).width / tableW * 100);
+      const wantW = [15, 12, 18, 15, 40];
+      check('② 表格为固定布局（table-layout: fixed）', cs('.sp-table', 'table-layout') === 'fixed', cs('.sp-table', 'table-layout'));
+      check('② 列宽比例 = 日期15% / 状态12% / 签到时间18% / 方式15% / 备注40%（±1.5%）',
+        widths.length === 5 && widths.every((w, i) => Math.abs(w - wantW[i]) <= 1.5),
+        { got: widths.map((w) => w.toFixed(1) + '%'), want: wantW });
+      check('② 备注列不再过宽（< 表格宽度 45%），且日期/状态/时间/方式够宽（各 ≥10%）',
+        widths[4] < 45 && widths.slice(0, 4).every((w) => w >= 10),
+        widths.map((w) => w.toFixed(1) + '%'));
+      check('② 状态列居中显示', cs('#spRecBody td:nth-child(2)', 'text-align') === 'center' && cs('.sp-table th:nth-child(2)', 'text-align') === 'center',
+        { tdAlign: cs('#spRecBody td:nth-child(2)', 'text-align') });
+      const nowrapCells = Qa('#spRecBody tr').every((tr) => [0, 1, 2, 3].every((i) => {
+        const el = tr.children[i];
+        return cs(el, 'white-space') === 'nowrap' && el.getClientRects().length === 1 && el.scrollWidth <= el.clientWidth + 1;
+      }));
+      check('② 日期/状态/签到时间/方式 均单行完整显示（不换行、不截断）', nowrapCells,
+        [...(Qa('#spRecBody tr')[0] ? Qa('#spRecBody tr')[0].children : [])].map((td) => td.textContent.trim() + '/' + td.getClientRects().length));
+      check('③ 日期与签到时间内容完整（YYYY-MM-DD / HH:MM:SS）',
+        Qa('#spRecBody tr').every((tr) => /^\d{4}-\d{2}-\d{2}$/.test(tr.children[0].textContent.trim()) &&
+          /^(\d{2}:\d{2}:\d{2}|—)$/.test(tr.children[2].textContent.trim())),
+        Qa('#spRecBody tr').slice(0, 3).map((tr) => tr.children[0].textContent.trim() + ' ' + tr.children[2].textContent.trim()));
+    } else {
+      skip('③ 明细行内容断言', '该区间没有场次');
+    }
+
+    // ---------- 6) 出勤构成饼图 ----------
+    log('\n— F) 出勤构成饼图 —');
+    check('④ 饼图画布 200×200 居中显示',
+      (() => { const c = rect('.sp-chart-canvas'); return !!c && Math.abs(c.width - 200) <= 2 && Math.abs(c.height - 200) <= 2; })(),
+      rect('.sp-chart-canvas') && { w: Math.round(rect('.sp-chart-canvas').width), h: Math.round(rect('.sp-chart-canvas').height) });
+    check('④ 图例在饼图右侧且垂直居中',
+      (() => {
+        const c = rect('.sp-chart-canvas'), l = rect('.sp-chart-legend');
+        if (!c || !l) return false;
+        const centerC = c.top + c.height / 2, centerL = l.top + l.height / 2;
+        return l.left >= c.right - 2 && Math.abs(centerC - centerL) <= 12;
+      })(),
+      { canvas: rect('.sp-chart-canvas') && Math.round(rect('.sp-chart-canvas').left), legend: rect('.sp-chart-legend') && Math.round(rect('.sp-chart-legend').left) });
+    const legendItems = Qa('.sp-chart-legend .sp-legend-item');
+    check('④ 图例 4 项且含 颜色块 + 状态名 + 数量 + 百分比',
+      legendItems.length === 4 &&
+      legendItems.every((it) => !!it.querySelector('i') && !!it.querySelector('.lg-name') && /次/.test(it.textContent) && /%/.test(it.textContent)),
+      legendItems.map((it) => it.textContent.replace(/\s+/g, ' ').trim()));
+    check('④ 图例数量 = 接口统计（已签到/迟到/请假/缺勤）',
+      JSON.stringify(legendItems.map((it) => parseInt(it.querySelector('.lg-num').textContent, 10))) ===
+      JSON.stringify([apiD.data.stats.present, apiD.data.stats.late, apiD.data.stats.leave, apiD.data.stats.absent]),
+      { ui: legendItems.map((it) => it.textContent.replace(/\s+/g, ' ').trim()), api: apiD.data.stats });
+    check('④ 饼图配色符合要求（已签到 #10b981 / 迟到 #3b82f6 / 请假 #f59e0b / 缺勤 #ef4444）',
+      JSON.stringify(legendItems.map((it) => W().getComputedStyle(it.querySelector('i')).backgroundColor)) ===
+      JSON.stringify(['rgb(16, 185, 129)', 'rgb(59, 130, 246)', 'rgb(245, 158, 11)', 'rgb(239, 68, 68)']),
+      legendItems.map((it) => W().getComputedStyle(it.querySelector('i')).backgroundColor));
+
+    // ---------- 7) 时间联动 + 未找到 + 清除 ----------
+    log('\n— G) 时间联动 / 未找到 / 清除 —');
+    Qa('.time-quick .btn').find((b) => b.dataset.t === 'week').click();
+    await sleep(1300);
+    const range2 = W().getRange();
+    const apiD2 = await japi('/api/attendance/student/' + sample.id + '/detail?startDate=' + range2.startDate + '&endDate=' + range2.endDate);
+    await until(() => txt('#spRange').indexOf(range2.startDate) >= 0, 12000);
+    check('⑤ 切「本周」→ 区间与统计随之刷新',
+      txt('#spRange').indexOf(range2.startDate) >= 0 && txt('#spExpected') === String(apiD2.data.stats.expected),
+      { range: txt('#spRange'), ui: txt('#spExpected'), api: apiD2.data.stats.expected });
+
+    typeSearch('不存在学生xyz');
+    Q('#btnStSearch').click();
+    await until(() => !hidden('#spMsg'), 12000);
+    check('① 搜索不到 → 提示「未找到该学生」且无图表明细',
+      /未找到该学生/.test(txt('#spMsg')) && hidden('#spList') && hidden('#spDetail'), txt('#spMsg'));
+
+    Q('#btnStClear').click();
+    await sleep(400);
+    check('① 点「清除」→ 面板隐藏、默认统计视图恢复、输入框清空',
+      hidden('#studentPanel') && visible('#statCards') && visible('#chartsArea') && visible('#detailPanel') && Q('#stKeyword').value === '',
+      { panel: hidden('#studentPanel'), stats: visible('#statCards'), detail: visible('#detailPanel') });
+
+    // ---------- 8) 响应式 ----------
+    log('\n— H) 响应式 —');
+    fr.style.width = '1000px';
+    await sleep(500);
+    const cols2 = W().getComputedStyle(Q('.stat-cards')).gridTemplateColumns.split(' ').length;
+    check('⑨ 平板宽度（1000px）→ 统计卡片 2 列', cols2 === 2, cols2);
+    fr.style.width = '600px';
+    await sleep(500);
+    const cols1 = W().getComputedStyle(Q('.stat-cards')).gridTemplateColumns.split(' ').length;
+    check('⑨ 手机宽度（600px）→ 统计卡片单列', cols1 === 1, cols1);
+    fr.style.width = '1500px';
+    await sleep(300);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

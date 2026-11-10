@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：签到操作台「📋 批量请假」（当天全天请假）
+    ① 「全员到齐」旁边有「📋 批量请假」按钮（DOM 顺序：全员到齐 → 批量请假 → 按列签到）
+    ② 教师/班主任可看到；学生端看不到
+    ③ 点击弹出弹窗：标题 + 日期（今天）+ 搜索框 + 全选 + 学生列表（每人一个 病假/事假 下拉）
+    ④ 未勾选 → 该行下拉置灰；勾选后 → 可选
+    ⑤ 「全选」→ 勾选当前列表全部学生；搜索可按姓名/学号过滤
+    ⑥ 确认 → 弹窗关闭 + 提示；被请假学生卡片变橙色（请假）+ 顶部「请假」统计增加
+    ⑦ 再次打开 → 已请假的学生默认勾选且事由保留（可修改 / 取消）
+    ⑧ 改事由（病假→事假）→ 接口与卡片事由同步更新
+    ⑨ 取消勾选后确认 → 该学生不再请假（卡片不再是橙色）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_batch_leave -AdminPw <管理员密码>
+  夹具：1 年级 + 1 班 + 3 学生 + 教师/班长/学生账号；测完自愈清理（含自己发起的场次）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>签到操作台：📋 批量请假（当天全天请假）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const cs = (el, p) => { const e = (typeof el === 'string') ? Q(el) : el; return e ? W().getComputedStyle(e).getPropertyValue(p).trim() : ''; };
+const fire = (el, type) => el.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(900);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+const blRows = () => Qa('#blList .bl-row').map((row) => ({
+  id: Number(row.dataset.id),
+  text: row.textContent.replace(/\s+/g, ' ').trim(),
+  checked: row.querySelector('[data-role="check"]').checked,
+  reason: row.querySelector('[data-role="reason"]').value,
+  disabled: row.querySelector('[data-role="reason"]').disabled,
+  selected: row.querySelector('[data-role="reason"]').disabled === false,
+}));
+const cardOf = (id) => Qa('.student-card').find((c) => Number(c.dataset.studentId) === id);
+const cardClasses = () => Qa('.student-card').map((c) => c.className.replace('student-card ', ''));
+const leaveCount = () => Number(txt('#statLeave') || 0);
+const statOf = (sel) => Number(txt(sel) || 0);
+function selectReason(rowSel, value) {
+  const row = Q(rowSel);
+  if (!row) return false;
+  const sel = row.querySelector('[data-role="reason"]');
+  sel.value = value;
+  fire(sel, 'change');
+  return true;
+}
+function toggleCheck(id, on) {
+  const row = Qa('#blList .bl-row').find((r) => Number(r.dataset.id) === id);
+  if (!row) return false;
+  const cb = row.querySelector('[data-role="check"]');
+  cb.checked = on;
+  fire(cb, 'change');
+  return true;
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '批假UI年级' + stamp, CLASS = '批假UI班' + stamp;
+const TEA = 'blu_tea_' + stamp, MON = 'blu_mon_' + stamp, STU = 'blu_stu_' + stamp;
+const created = { gradeId: null, classId: null, students: [], users: [], sessionId: null, ownSession: false };
+
+async function hardCleanup() {
+  // 先用夹具教师取消当天请假（教师范围=本班），再切管理员删夹具
+  try {
+    await asUser(TEA);
+    const ids = created.students.filter(Boolean);
+    if (ids.length) await japi('/api/attendance/leave/batch', { method: 'POST', body: { items: [], cancels: ids } });
+  } catch (_) {}
+  await asUser('admin');
+  // 自己发起的场次：结束并删除（夹具学生的记录随场次一并删除）
+  if (created.ownSession && created.sessionId) {
+    await japi('/api/attendance/sessions/' + created.sessionId + '/close', { method: 'POST' });
+    await japi('/api/attendance/sessions/' + created.sessionId, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^批假UI班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) {
+      await japi('/api/students/' + s.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^blu_/.test(x.username))) {
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^批假UI年级/.test(x.grade_name || x.gradeName || ''))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    // run-ui.ps1 会把本文件里的 123456 替换成真实管理员密码
+    const first = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (first.status !== 200) throw new Error('管理员登录失败：' + first.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'BLU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    for (let i = 1; i <= 3; i += 1) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: 'BLU' + stamp + String(i).padStart(2, '0'), name: '批假同学' + i, classId: created.classId, status: '在读' } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    for (const [u, role, name] of [[TEA, 'teacher', '批假UI老师'], [MON, 'monitor', '批假UI班长'], [STU, 'student', '批假UI学生']]) {
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role, realName: name, classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+      created.users.push(r.data.user.id);
+    }
+    created.students = created.students.filter(Boolean);
+    check('0) 夹具就绪（1 年级 + 1 班 + 3 学生 + 教师/班长/学生账号）',
+      !!created.gradeId && !!created.classId && created.students.length === 3 && created.users.length === 3,
+      { students: created.students.length, users: created.users.length });
+
+    // 需要一个进行中的场次（复用真实的；没有就自己发一场，测完删掉）
+    await asUser(TEA);
+    let st = (await japi('/api/attendance/status')).data.session;
+    if (st && st.status === 'active') {
+      created.sessionId = st.id;
+      log('  · 复用当前进行中的场次 #' + st.id + '（不发起新场次）');
+    } else {
+      const s = await japi('/api/attendance/start', { method: 'POST', body: { deadlineMinutes: 60 } });
+      created.sessionId = s.data.session.id;
+      created.ownSession = true;
+      log('SESSIONS=' + created.sessionId);
+      log('  · 本驱动发起场次 #' + created.sessionId);
+    }
+    check('0) 场次就绪 #' + created.sessionId, Number.isInteger(created.sessionId), created.sessionId);
+
+    // ---------- ① 按钮位置与可见性 ----------
+    fr.style.width = '1500px'; fr.style.height = '1100px';
+    await load('/dashboard', '.student-card');
+    await until(() => !hidden('#btnBatchAll'), 15000);
+    const order = ['#btnBatchAll', '#btnBatchLeave', '#btnBatchColumn', '#btnSeatAuto', '#btnSeatReset', '#btnSeatSave']
+      .map((s) => Q(s)).filter(Boolean).map((e) => e.id);
+    check('① 操作区出现「📋 批量请假」按钮（文本含"批量请假"）',
+      !!Q('#btnBatchLeave') && /批量请假/.test(txt('#btnBatchLeave')), txt('#btnBatchLeave'));
+    check('① 位置在「全员到齐」右侧、「按列签到」左侧（与需求按钮顺序一致）',
+      JSON.stringify(order) === JSON.stringify(['btnBatchAll', 'btnBatchLeave', 'btnBatchColumn', 'btnSeatAuto', 'btnSeatReset', 'btnSeatSave']),
+      order);
+    check('① 教师端按钮可见（未隐藏）', !hidden('#btnBatchLeave'));
+    // 班长端可见
+    await asUser(MON);
+    await load('/dashboard', '.student-card');
+    check('① 班长端按钮可见', !hidden('#btnBatchLeave'));
+    // 学生端不可见
+    await asUser(STU);
+    await load('/dashboard', '#statLeave');
+    await sleep(600);
+    check('① 学生端按钮不可见（只读）', hidden('#btnBatchLeave'));
+
+    // ---------- ② 弹窗结构 ----------
+    await asUser(TEA);
+    await load('/dashboard', '.student-card');
+    await until(() => !hidden('#btnBatchAll'), 15000);
+    Q('#btnBatchLeave').click();
+    const opened = await until(() => !hidden('#batchLeaveModal') && Qa('#blList .bl-row').length >= 3, 15000);
+    check('② 点击后弹出「📋 批量请假」弹窗并加载学生列表（3 名夹具学生）',
+      opened && /批量请假/.test(txt('#batchLeaveModal h3')), { opened, rows: Qa('#blList .bl-row').length });
+    const today = new Date();
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    check('② 弹窗标题区显示日期（今天）',
+      txt('#blDate').includes(todayStr) && /今天/.test(txt('#blDate')), txt('#blDate'));
+    check('② 有搜索框与「全选」复选框', !!Q('#blSearch') && !!Q('#blSelectAll'));
+    const rows0 = blRows();
+    const optsOK = Qa('#blList .bl-row select').every((s) => [...s.options].map((o) => o.textContent.trim()).join('/') === '病假/事假');
+    check('② 每名学生后面有「病假/事假」下拉框',
+      rows0.length === 3 && optsOK && rows0.every((r) => r.reason === 'sick'),
+      { rows: rows0.map((r) => [r.id, r.reason]), optsOK });
+    check('② 初始状态：都未勾选、下拉框置灰、已选 0 人',
+      rows0.every((r) => !r.checked && r.disabled) && txt('#blCount') === '已选 0 人',
+      { rows: rows0.map((r) => [r.checked, r.disabled]), count: txt('#blCount') });
+
+    // ---------- ③ 勾选 → 下拉可选 ----------
+    toggleCheck(created.students[0], true);
+    await sleep(200);
+    let rows1 = blRows();
+    const r0 = rows1.find((r) => r.id === created.students[0]);
+    const r1 = rows1.find((r) => r.id === created.students[1]);
+    check('③ 勾选后该行下拉框可选（disabled=false）、未勾选的行仍置灰',
+      r0 && r0.checked && r0.disabled === false && r1 && !r1.checked && r1.disabled === true,
+      { checked: r0 && r0.disabled, unchecked: r1 && r1.disabled });
+    check('③ 「已选」人数随之更新', txt('#blCount') === '已选 1 人', txt('#blCount'));
+
+    // ---------- ④ 全选 ----------
+    Q('#blSelectAll').checked = true;
+    fire(Q('#blSelectAll'), 'change');
+    await sleep(200);
+    check('④ 点「全选」→ 3 行全部勾选、下拉全部可选、已选 3 人',
+      blRows().every((r) => r.checked && r.disabled === false) && txt('#blCount') === '已选 3 人',
+      { rows: blRows().map((r) => r.checked), count: txt('#blCount') });
+    Q('#blSelectAll').checked = false;
+    fire(Q('#blSelectAll'), 'change');
+    await sleep(200);
+    check('④ 取消「全选」→ 全部取消勾选', blRows().every((r) => !r.checked) && txt('#blCount') === '已选 0 人', txt('#blCount'));
+
+    // ---------- ⑤ 搜索过滤 ----------
+    Q('#blSearch').value = '不存在的学生XYZ';
+    fire(Q('#blSearch'), 'input');
+    await sleep(200);
+    check('⑤ 搜索不存在的关键字 → 列表显示"没有匹配的学生"（不报错）',
+      /没有匹配的学生/.test(txt('#blList')), txt('#blList').slice(0, 40));
+    Q('#blSearch').value = '批假同学2';
+    fire(Q('#blSearch'), 'input');
+    await sleep(200);
+    check('⑤ 搜索姓名 → 只显示匹配的 1 行', blRows().length === 1 && /批假同学2/.test(blRows()[0].text), blRows());
+    Q('#blSearch').value = '';
+    fire(Q('#blSearch'), 'input');
+    await sleep(200);
+    check('⑤ 清空搜索 → 恢复 3 行', blRows().length === 3, blRows().length);
+
+    // ---------- ⑥ 确认请假 ----------
+    const leaveBefore = leaveCount();
+    toggleCheck(created.students[0], true);   // 病假（默认）
+    await sleep(150);
+    toggleCheck(created.students[1], true);
+    await sleep(150);
+    selectReason('.bl-row[data-id="' + created.students[1] + '"]', 'personal');
+    await sleep(150);
+    check('⑥ 为第 2 名学生选择「事假」', blRows().find((r) => r.id === created.students[1]).reason === 'personal', blRows());
+    Q('#blOk').click();
+    const closed = await until(() => hidden('#batchLeaveModal'), 15000);
+    check('⑥ 点「确认请假」→ 弹窗关闭', closed);
+    check('⑥ 提示文案包含登记人数', /已登记 2 人当天请假/.test(txt('#toast')), txt('#toast'));
+    const orange = await until(() => {
+      const c1 = cardOf(created.students[0]);
+      const c2 = cardOf(created.students[1]);
+      return c1 && c1.classList.contains('orange') && c2 && c2.classList.contains('orange');
+    }, 15000);
+    check('⑥ 被请假学生卡片变橙色（请假）', orange,
+      Qa('.student-card').map((c) => [c.dataset.studentId, c.className, c.textContent.trim().slice(0, 6)]));
+    check('⑥ 卡片底色为请假橙（#FFFBF0）+ 徽章文案「请假」',
+      cs(cardOf(created.students[0]), 'background-color') === 'rgb(255, 251, 240)' &&
+      /请假/.test(cardOf(created.students[0]).textContent),
+      { bg: cs(cardOf(created.students[0]), 'background-color'), text: cardOf(created.students[0]).textContent.replace(/\s+/g, ' ').trim() });
+    check('⑥ 第 3 名学生未请假（卡片不是橙色）',
+      cardOf(created.students[2]) && !cardOf(created.students[2]).classList.contains('orange'),
+      cardOf(created.students[2]) && cardOf(created.students[2]).className);
+    await until(() => leaveCount() === leaveBefore + 2, 12000);
+    check('⑥ 顶部「请假」统计增加 2（' + leaveBefore + ' → ' + leaveCount() + '）',
+      leaveCount() === leaveBefore + 2, { before: leaveBefore, after: leaveCount() });
+    const apiRecs = (await japi('/api/attendance/status?sessionId=' + created.sessionId)).data.records || {};
+    check('⑥ 接口口径一致：这 2 人为 leave，事由分别是 sick / personal',
+      apiRecs[created.students[0]] && apiRecs[created.students[0]].status === 'leave' && apiRecs[created.students[0]].leaveReason === 'sick' &&
+      apiRecs[created.students[1]] && apiRecs[created.students[1]].status === 'leave' && apiRecs[created.students[1]].leaveReason === 'personal',
+      { s1: apiRecs[created.students[0]], s2: apiRecs[created.students[1]] });
+
+    // ---------- ⑦ 重新打开：状态保留 ----------
+    Q('#btnBatchLeave').click();
+    await until(() => !hidden('#batchLeaveModal') && Qa('#blList .bl-row').length >= 3, 15000);
+    let rows2 = blRows();
+    check('⑦ 重新打开弹窗：已请假的 2 人默认勾选，事由与上次一致',
+      rows2.find((r) => r.id === created.students[0]).checked &&
+      rows2.find((r) => r.id === created.students[0]).reason === 'sick' &&
+      rows2.find((r) => r.id === created.students[1]).checked &&
+      rows2.find((r) => r.id === created.students[1]).reason === 'personal' &&
+      txt('#blCount') === '已选 2 人',
+      { rows: rows2.map((r) => [r.id, r.checked, r.reason]), count: txt('#blCount') });
+
+    // ---------- ⑧ 改事由：病假 → 事假 ----------
+    selectReason('.bl-row[data-id="' + created.students[0] + '"]', 'personal');
+    await sleep(150);
+    Q('#blOk').click();
+    await until(() => hidden('#batchLeaveModal'), 12000);
+    const rec1 = (await japi('/api/attendance/status?sessionId=' + created.sessionId)).data.records || {};
+    check('⑧ 改事由后接口事由同步为事假（卡片仍为请假橙色）',
+      rec1[created.students[0]] && rec1[created.students[0]].status === 'leave' && rec1[created.students[0]].leaveReason === 'personal' &&
+      cardOf(created.students[0]).classList.contains('orange'),
+      { rec: rec1[created.students[0]], cls: cardOf(created.students[0]).className });
+
+    // ---------- ⑨ 取消请假 ----------
+    Q('#btnBatchLeave').click();
+    await until(() => !hidden('#batchLeaveModal') && Qa('#blList .bl-row').length >= 3, 15000);
+    toggleCheck(created.students[1], false);      // 取消第 2 人的勾选 → 取消请假
+    await sleep(150);
+    check('⑨ 取消勾选后「已选」变为 1 人', txt('#blCount') === '已选 1 人', txt('#blCount'));
+    Q('#blOk').click();
+    await until(() => hidden('#batchLeaveModal'), 12000);
+    check('⑨ 提示含"已取消 1 人请假"', /已取消 1 人请假/.test(txt('#toast')), txt('#toast'));
+    const gone = await until(() => {
+      const c = cardOf(created.students[1]);
+      return c && !c.classList.contains('orange');
+    }, 15000);
+    check('⑨ 该学生不再是请假（卡片恢复未签到灰）', gone,
+      cardOf(created.students[1]) && cardOf(created.students[1]).className + ' / ' + cardOf(created.students[1]).textContent.replace(/\s+/g, ' ').trim());
+    const rec2 = (await japi('/api/attendance/status?sessionId=' + created.sessionId)).data.records || {};
+    check('⑨ 接口口径：该学生本场次已无请假记录（回到待签）',
+      !rec2[created.students[1]] || rec2[created.students[1]].status !== 'leave', rec2[created.students[1]]);
+    check('⑨ 另一名学生（已改成事假）仍为请假',
+      rec2[created.students[0]] && rec2[created.students[0]].status === 'leave' && rec2[created.students[0]].leaveReason === 'personal',
+      rec2[created.students[0]]);
+
+    // ---------- ⑩ 当天"全天"口径：新场次自动带请假 ----------
+    if (!created.ownSession) {
+      skip('⑩ 新场次自动带请假', '当前复用的是真实进行中场次（不改动真实数据），该口径由服务端用例覆盖');
+    } else {
+      await japi('/api/attendance/sessions/' + created.sessionId + '/close', { method: 'POST' });
+      await japi('/api/attendance/sessions/' + created.sessionId, { method: 'DELETE' });
+      const s2 = await japi('/api/attendance/start', { method: 'POST', body: { deadlineMinutes: 30 } });
+      const sid2 = s2.data.session.id;
+      created.sessionId = sid2;      // 交给清理
+      log('SESSIONS=' + sid2);
+      const recs2 = (await japi('/api/attendance/status?sessionId=' + sid2)).data.records || {};
+      check('⑩ 当天新场次里，已登记全天请假的学生自动记为请假（三档都不需要签到）',
+        recs2[created.students[0]] && recs2[created.students[0]].status === 'leave',
+        recs2[created.students[0]]);
+      await japi('/api/attendance/sessions/' + sid2 + '/close', { method: 'POST' });
+      await japi('/api/attendance/sessions/' + sid2, { method: 'DELETE' });
+    }
+
+    // ---------- ⑪ 班长端同步（用户反馈：教师批量请假后班长端请假仍是 0、卡片不变橙） ----------
+    //   前置：让"当天有 2 人请假"（⑨ 取消过第 2 人 → 这里重新登记为病假）
+    await japi('/api/attendance/leave/batch', { method: 'POST', body: { items: [{ studentId: created.students[1], reason: 'sick' }], cancels: [] } });
+    //   (a) 有进行中场次时（教师手动发起；此场次由本驱动负责清理）
+    const s3 = await japi('/api/attendance/start', { method: 'POST', body: { deadlineMinutes: 30 } });
+    const sid3 = s3.data.session.id;
+    created.sessionId = sid3;
+    created.ownSession = true;
+    log('SESSIONS=' + sid3);
+    await asUser(MON);
+    await load('/dashboard', '.student-card');
+    const monOk1 = await until(() => leaveCount() === 2 && cardOf(created.students[0])
+      && cardOf(created.students[0]).classList.contains('orange')
+      && cardOf(created.students[1]) && cardOf(created.students[1]).classList.contains('orange'), 15000);
+    check('⑪ 班长端（有进行中场次）：请假统计=2、两名被请假学生卡片橙色', monOk1,
+      { leave: leaveCount(), cards: cardClasses() });
+    check('⑪ 班长端卡片角标标明事由（请假·病假/事假）',
+      /请假·/.test(txt('body')), Qa('.student-card').map((c) => c.textContent.replace(/\s+/g, ' ').trim()).slice(0, 2));
+    //   (b) 删掉该场次 → 模拟"本班当前没有进行中的签到"（班级隔离后很常见）
+    //       注意：真实库里可能还有"全部班级"计划触发的场次（对所有人都相关）→ 页面仍可能显示某一场次，
+    //       此时本用例的关键断言是：**这 2 人依然算请假（橙色），不会被显示成缺勤**
+    await asUser('admin');
+    await japi('/api/attendance/sessions/' + sid3 + '/close', { method: 'POST' });
+    await japi('/api/attendance/sessions/' + sid3, { method: 'DELETE' });
+    created.sessionId = null;
+    created.ownSession = false;
+    await asUser(MON);
+    await load('/dashboard', '.student-card');
+    const monOk2 = await until(() => leaveCount() === 2
+      && cardOf(created.students[0]) && cardOf(created.students[0]).classList.contains('orange')
+      && cardOf(created.students[1]) && cardOf(created.students[1]).classList.contains('orange'), 15000);
+    check('⑪ 没有本班场次（或仅剩全校场次）时，班长端仍显示请假=2、卡片橙色（本次修复点）', monOk2,
+      { sessionHidden: hidden('#sessionInfo'), leave: leaveCount(), cards: cardClasses() });
+    check('⑪ 班长端统计自洽：这 2 人算请假、不算缺勤（请假+缺勤+已签到+迟到=总人数）',
+      statOf('#statLeave') === 2 &&
+      statOf('#statLeave') + statOf('#statAbsent') + statOf('#statPresent') + statOf('#statLate') === Number(txt('#statTotal') || 0),
+      { total: txt('#statTotal'), leave: statOf('#statLeave'), absent: statOf('#statAbsent'), present: statOf('#statPresent') });
+    await load('/dashboard', '.student-card');
+    const monOk3 = await until(() => leaveCount() === 2 && cardOf(created.students[1])
+      && cardOf(created.students[1]).classList.contains('orange'), 15000);
+    check('⑪ 刷新页面后状态保持（请假=2、卡片仍橙色）', monOk3, { leave: leaveCount(), cards: cardClasses() });
+    const apiMon = (await japi('/api/attendance/status')).data;
+    check('⑪ 接口返回 dayLeaves 摘要且 2 人都是 leave（班长端轮询即可同步）',
+      apiMon.dayLeaves && apiMon.dayLeaves.count === 2 && apiMon.records[created.students[0]]
+      && apiMon.records[created.students[0]].status === 'leave' && apiMon.records[created.students[0]].dayLeave === true,
+      { dayLeaves: apiMon.dayLeaves, rec: apiMon.records[created.students[0]], stats: apiMon.stats });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^批假UI班/.test(c.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^blu_/.test(u.username));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^批假UI年级/.test(g.grade_name || ''));
+    const leftLeaves = ((await japi('/api/attendance/leave/batch')).data.students || []).filter((s) => /^BLU/.test(s.studentNo || ''));
+    check('清理：夹具年级/班级/学生/账号已清除，当天请假登记已取消',
+      leftCls.length === 0 && leftUsers.length === 0 && leftGrades.length === 0 && leftLeaves.length === 0,
+      { classes: leftCls.length, users: leftUsers.length, grades: leftGrades.length, students: leftLeaves.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

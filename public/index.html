@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>武汉一中管理平台</title>
+  <link rel="stylesheet" href="style.css?v=3.16.0">
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份，内容与行为完全一致） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <!-- 视图一：签到主页面（统计 + 学生卡片） -->
+  <div id="viewAttendance">
+    <div class="container">
+      <!-- 统一页面卡片：操作条 / 统计 / 学生卡片全部在卡片内部 -->
+      <section class="page-card">
+      <!-- 视图（需求 2026-09-30）：签到操作台**只有座位表模式**（所有角色一致）
+           · 「列表模式 / 座位表模式」切换按钮与右上角的「📝 作业」按钮均已移除
+             （班长的作业入口统一走**导航栏 → 📝 作业统计**）
+           · 作业录入台仍可直达：/dashboard?view=homework -->
+      <!-- 签到操作条：左（截止时间+发起签到）｜中（开始/截止/剩余）｜右（发起人+补签） -->
+      <div class="dash-toolbar">
+        <div class="dash-toolbar-main" id="dashActions">
+          <label class="dash-field" for="deadlineSelect">签到截止
+            <select id="deadlineSelect" class="select-inline" title="签到截止时间">
+              <option value="5">5 分钟</option>
+              <option value="10">10 分钟</option>
+              <option value="30" selected>30 分钟（默认）</option>
+              <option value="45">45 分钟</option>
+              <option value="60">60 分钟</option>
+            </select>
+          </label>
+          <!-- 管理员：切换要查看/操作的班级（默认全校视角；切换后签到数据立即按该班刷新）
+               注意：这里刻意做成"无可见文字标签 + 限宽"的紧凑下拉 —— 操作条是一行三段式布局
+               （左操作 / 中时间 / 右发起人+补签），多一个带文字标签的下拉会把整行挤到换行。 -->
+          <span class="dash-field hidden" id="adminClassWrap">
+            <select id="adminClassSelect" class="select-inline" style="max-width:118px"
+                    title="管理员：选择要查看/操作的班级（默认全校视角）">
+              <option value="">全校（不分班）</option>
+            </select>
+          </span>
+          <button id="btnStart" class="btn btn-primary">＋ 发起签到</button>
+          <button id="btnLikeRanking" class="btn btn-secondary hidden" title="查看本班点赞排行榜（只读）">👍 点赞排行</button>
+          <button id="btnFullscreen" class="btn btn-secondary hidden" title="全屏模式（希沃白板）">⛶ 全屏</button>
+        </div>
+        <!-- 中间：场次时间信息（进行中 / 已结束回看时显示） -->
+        <div id="sessionInfo" class="session-strip hidden">
+          <span>开始：<b id="startTime">--</b></span>
+          <span>截止：<b id="deadlineTime">--</b></span>
+          <span class="countdown-wrap">剩余：<b id="countdown">--</b></span>
+        </div>
+        <!-- 右侧：发起人 + 补签 -->
+        <div class="dash-toolbar-tail hidden" id="sessionTail">
+          <span id="sessionStarterWrap" class="session-starter hidden">👤 <b id="sessionStarter">--</b></span>
+          <button id="btnMakeupEnded" class="btn btn-secondary btn-sm hidden" title="对已结束场次进行补签">✏️ 补签</button>
+        </div>
+      </div>
+
+      <!-- 无进行中签到时的提示（班级隔离后，别的班的签到不会显示 → 这里明确说明"当前没有"） -->
+      <div id="noSessionTip" class="no-session-tip hidden"></div>
+
+      <!-- 每天自动签到（v35 · 路线 B）：早自习 / 晚自修 两块 + 整场保存
+           进页面默认"全员已签到"（绿色），只点掉没来的人；点「保存」把整场写库（不限时，无倒计时/截止） -->
+      <div id="autoBar" class="auto-session-bar hidden">
+        <div class="auto-slots" id="autoSlots" role="tablist" aria-label="今天两次签到"></div>
+        <span class="auto-hint" id="autoHint">不限时：随时可录入，点卡片取消未到，右键标请假</span>
+        <span class="spacer"></span>
+        <span class="auto-dirty hidden" id="autoDirty">● 有未保存的修改</span>
+        <button id="autoSave" class="btn btn-primary btn-sm" type="button">💾 保存本场</button>
+      </div>
+
+      <!-- 实时统计 -->
+      <section class="stats-bar" id="statsBar">
+        <div class="stat"><span class="dot gray"></span><span class="stat-label">总人数</span><b id="statTotal">0</b></div>
+        <div class="stat"><span class="dot green"></span><span class="stat-label">已签到</span><b id="statPresent">0</b></div>
+        <div class="stat"><span class="dot orange"></span><span class="stat-label">请假</span><b id="statLeave">0</b></div>
+        <div class="stat"><span class="dot blue"></span><span class="stat-label">迟到</span><b id="statLate">0</b></div>
+        <div class="stat"><span class="dot red"></span><span class="stat-label">缺勤</span><b id="statAbsent">0</b></div>
+      </section>
+
+      <!-- 学生卡片（列表模式） -->
+      <main>
+        <div id="studentGrid" class="student-grid"></div>
+        <div id="emptyTip" class="empty-tip hidden">暂无学生数据，请检查数据库</div>
+      </main>
+
+      <!-- 座位表模式 -->
+      <div id="seatView" class="hidden">
+        <div class="podium">📚 讲 台</div>
+        <div class="seat-toolbar">
+          <label>行数
+            <select id="seatRows">
+              <option value="4" selected>4 行</option>
+              <option value="5">5 行</option>
+              <option value="6">6 行</option>
+              <option value="7">7 行</option>
+              <option value="8">8 行</option>
+              <option value="9">9 行</option>
+              <option value="10">10 行</option>
+            </select>
+          </label>
+          <label>列数
+            <select id="seatCols">
+              <option value="4" selected>4 列</option>
+              <option value="5">5 列</option>
+              <option value="6">6 列</option>
+              <option value="7">7 列</option>
+              <option value="8">8 列</option>
+              <option value="9">9 列</option>
+              <option value="10">10 列</option>
+            </select>
+          </label>
+          <label>布局模式
+            <select id="seatMode">
+              <option value="标准">标准</option>
+              <option value="左对齐">左对齐</option>
+              <option value="右对齐">右对齐</option>
+              <option value="居中">居中</option>
+              <option value="左右分列">左右分列</option>
+              <option value="自定义">自定义</option>
+            </select>
+          </label>
+          <span class="spacer"></span>
+          <button id="btnBatchAll" class="btn btn-primary batch-btn hidden" title="把本班尚未标记的学生标记为已签到（已请假/已迟到/已签到的不受影响，需二次确认）">👥 全员到齐</button>
+          <button id="btnBatchLeave" class="btn btn-warning batch-btn hidden" title="批量登记当天全天请假（病假/事假）：登记后当天所有场次都记为请假，不再需要签到">📋 批量请假</button>
+          <button id="btnBatchColumn" class="btn btn-primary batch-btn hidden" title="按座位列补齐未标记的学生（已标记的不受影响）">📶 按列签到</button>
+          <button id="btnSeatAuto" class="btn btn-secondary" title="按学号顺序重新排列（不保存）">↻ 自动排列</button>
+          <button id="btnSeatReset" class="btn btn-secondary" title="清空座位并按学号排列（保存到数据库）">🗑 重置座位</button>
+          <button id="btnSeatSave" class="btn btn-primary" title="保存当前座位布局到数据库">💾 保存座位</button>
+        </div>
+        <div id="seatReadonlyTip" class="seat-readonly-tip hidden">⚠️ 座位布局由班主任统一管理，班长不可调整</div>
+        <div id="seatCapacityTip" class="seat-capacity-tip hidden">⚠️ 座位数不足以容纳所有学生，请增加行数或列数</div>
+        <div id="seatGrid" class="seat-grid"></div>
+        <div id="unseatedPanel" class="unseated-panel hidden">
+          <span class="unseated-title">📋 未排座学生（拖入空位入座）：</span>
+          <span id="unseatedList" class="unseated-list"></span>
+        </div>
+        <div id="seatStats" class="seat-stats"></div>
+      </div>
+
+      <!-- 作业统计（班长端：作业列表 + 录入提交情况） -->
+      <div id="homeworkView" class="hidden">
+        <!-- 子视图一：作业列表（默认显示"今天"，可按日期快速切换） -->
+        <div id="hwListView">
+          <div class="hw-toolbar">
+            <label>学科
+              <select id="hwSubject">
+                <option value="">全部</option>
+                <option>语文</option><option>数学</option><option>英语</option><option>物理</option>
+                <option>化学</option><option>生物</option><option>历史</option><option>政治</option>
+                <option>地理</option><option>其他</option>
+              </select>
+            </label>
+            <span class="hw-quick" id="hwQuick">
+              <button type="button" class="hw-quick-btn active" data-range="today">今天</button>
+              <button type="button" class="hw-quick-btn" data-range="yesterday">昨天</button>
+              <button type="button" class="hw-quick-btn" data-range="week">本周</button>
+              <button type="button" class="hw-quick-btn" data-range="custom">自定义</button>
+            </span>
+            <label id="hwDateWrap">日期 <input type="date" id="hwDate"></label>
+            <span id="hwRangeWrap" class="hw-range-wrap hidden">
+              <input type="date" id="hwFrom">
+              <span>~</span>
+              <input type="date" id="hwTo">
+              <button type="button" id="hwApplyRange" class="btn btn-primary btn-sm">查询</button>
+            </span>
+            <span class="hw-counts">
+              <span id="hwScopeLabel" style="color:var(--text-light)"></span>
+              作业 <b id="hwTaskCount">0</b> 份 · 已交 <b id="hwSubmitted">0</b> 人次 · 未交 <b id="hwNotSubmitted">0</b> 人次
+            </span>
+          </div>
+          <div id="hwReadonlyTip" class="seat-readonly-tip hidden">👀 只读：作业提交录入由班长操作</div>
+          <div class="hw-panel">
+            <div class="hw-table-wrap">
+              <table class="plan-table">
+                <thead>
+                  <tr>
+                    <th>学科</th>
+                    <th>作业标题</th>
+                    <th>发布老师</th>
+                    <th>截止时间</th>
+                    <th>已交 / 未交</th>
+                    <th>收作业状态</th>
+                    <th class="th-actions">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="hwTaskList"></tbody>
+              </table>
+            </div>
+            <div id="hwTaskEmpty" class="empty-tip-small hidden">本班暂无作业（由任课老师在「作业管理」中发布）</div>
+          </div>
+        </div>
+
+        <!-- 子视图二：录入提交情况（座位表模式：点击卡片切换已交/未交） -->
+        <div id="hwEntryView" class="hidden">
+          <div class="hw-toolbar">
+            <button id="hwBackList" class="btn btn-secondary">← 返回作业列表</button>
+            <span class="hw-entry-title" id="hwEntryTitle">--</span>
+            <span class="hw-counts">已交 <b id="hwEntrySubmitted">0</b> 人 · 未交 <b id="hwEntryNotSubmitted">0</b> 人</span>
+            <span class="spacer"></span>
+            <span id="hwDirty" class="hw-dirty hidden">● 有未保存修改</span>
+            <button id="hwEntryAll" class="btn btn-primary" title="将本班所有在读学生标记为已交">✅ 全选已交</button>
+            <button id="hwEntrySave" class="btn btn-primary" title="保存提交情况">💾 保存</button>
+          </div>
+          <div class="podium">📚 讲 台</div>
+          <div id="hwColButtons" class="hw-col-buttons"></div>
+          <div id="hwSeatGrid" class="seat-grid"></div>
+          <div id="hwUnseatedPanel" class="unseated-panel hidden">
+            <span class="unseated-title">📋 未排座学生（点击切换已交/未交）：</span>
+            <span id="hwUnseatedList" class="unseated-list"></span>
+          </div>
+          <div id="hwEntryStats" class="seat-stats"></div>
+        </div>
+      </div>
+      </section><!-- /.page-card -->
+    </div>
+  </div>
+
+  <!-- 视图二：签到计划管理页（独立页面） -->
+  <div id="viewPlans" class="hidden">
+    <div class="container">
+      <section class="page-card">
+        <div class="plans-header page-head">
+          <button id="btnBackAttendance" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+          <h2 class="page-title">📅 签到计划</h2>
+          <div class="plans-header-actions">
+            <button id="btnAddPlan" class="btn btn-primary">＋ 添加计划</button>
+            <button id="btnBatchPlan" class="btn btn-secondary">批量生成</button>
+          </div>
+        </div>
+        <div id="planActiveBanner" class="plan-active-banner hidden"></div>
+
+        <!-- 每页显示 + 状态筛选 + 范围信息 -->
+        <div class="plan-toolbar">
+          <div class="plan-filters">
+            <span class="plan-page-size">
+              每页显示
+              <select id="planPageSize">
+                <option value="10">10 条</option>
+                <option value="20" selected>20 条</option>
+                <option value="50">50 条</option>
+              </select>
+            </span>
+            <span class="plan-status-filter">
+              状态
+              <select id="planStatusFilter">
+                <option value="open" selected>签到中 + 待签到（默认）</option>
+                <option value="">全部</option>
+                <option value="pending">待签到</option>
+                <option value="active">签到中</option>
+                <option value="ended">已结束</option>
+              </select>
+            </span>
+          </div>
+          <span id="planRangeInfo" class="plan-range-info">显示 0-0 条，共 0 条</span>
+        </div>
+
+        <div class="plan-table-wrap">
+          <table class="plan-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>时间</th>
+                <th>时长</th>
+                <th>班级</th>
+                <th>状态</th>
+                <th class="th-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="planList"></tbody>
+          </table>
+        </div>
+
+        <!-- 分页导航 -->
+        <div class="plan-pagination">
+          <button id="planPrev" class="btn btn-secondary btn-sm">上一页</button>
+          <span id="planPageInfo">第 1 / 1 页</span>
+          <button id="planNext" class="btn btn-secondary btn-sm">下一页</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- 提示浮层 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- 右键请假菜单（第四步） -->
+  <div id="contextMenu" class="context-menu hidden">
+    <div class="context-title" id="contextTitle">选择操作</div>
+    <div class="context-item context-absent hidden" id="contextAbsentPresent">✅ 修改为已签到</div>
+    <div class="context-item context-absent hidden" id="contextAbsentLeave">🟠 修改为请假</div>
+    <div class="context-item" data-reason="sick">🤒 病假</div>
+    <div class="context-item" data-reason="personal">📋 事假</div>
+    <div class="context-item" data-reason="official">🏛️ 公假</div>
+    <div class="context-item context-actions hidden" id="contextCancelCheckin">❌ 取消签到</div>
+    <div class="context-item context-actions hidden" id="contextRemark">📝 备注</div>
+    <div class="context-item context-clear hidden" id="contextClear" title="座位表模式：清空该学生座位">🗑 清空座位</div>
+    <div class="context-item context-cancel" id="contextCancel">取消</div>
+  </div>
+
+  <!-- 学生管理弹窗（删除） -->
+  <div id="manageModal" class="modal hidden">
+    <div class="modal-box manage-box">
+      <h3>🗑 学生管理</h3>
+      <p class="hint">点击学生右侧"删除"按钮移除该学生（历史签到记录将保留）。</p>
+      <div id="manageList" class="manage-list"></div>
+      <div class="modal-actions">
+        <button id="manageClose" class="btn btn-secondary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 添加签到计划弹窗 -->
+  <div id="planModal" class="modal hidden">
+    <div class="modal-box plan-box">
+      <h3>📅 添加签到计划</h3>
+      <div class="plan-tabs">
+        <button type="button" class="plan-tab active" data-mode="single">单日</button>
+        <button type="button" class="plan-tab" data-mode="multi">批量勾选</button>
+        <button type="button" class="plan-tab" data-mode="weekly">每周循环</button>
+      </div>
+
+      <!-- 单日 -->
+      <div class="plan-mode" id="planModeSingle">
+        <div class="form-row">
+          <label>签到日期 *</label>
+          <input type="date" id="planDate">
+        </div>
+      </div>
+
+      <!-- 批量勾选 -->
+      <div class="plan-mode hidden" id="planModeMulti">
+        <div class="form-row">
+          <label>勾选未来日期（31 天内）</label>
+          <div id="multiDates" class="date-check-grid"></div>
+        </div>
+      </div>
+
+      <!-- 每周循环 -->
+      <div class="plan-mode hidden" id="planModeWeekly">
+        <div class="form-row">
+          <label>每周星期几 *</label>
+          <div id="weekdayPick" class="weekday-pick"></div>
+        </div>
+        <div class="form-row">
+          <label>日期范围 *</label>
+          <div class="range-row">
+            <input type="date" id="weeklyFrom">
+            <span>~</span>
+            <input type="date" id="weeklyTo">
+          </div>
+        </div>
+      </div>
+
+      <!-- 公共设置 -->
+      <div class="form-row">
+        <label>签到时间 *（到点自动发起签到）</label>
+        <input type="time" id="planTime" value="08:00">
+      </div>
+      <div class="form-row">
+        <label>时长（分钟）*</label>
+        <input type="number" id="planDuration" value="10" min="1" max="180">
+      </div>
+      <div class="form-row">
+        <label>适用范围 *（教师创建的计划只对本班生效）</label>
+        <select id="planClass"><option value="">全部班级</option></select>
+      </div>
+      <div id="planError" class="import-preview err hidden"></div>
+      <div id="planPreview" class="import-preview"></div>
+      <div class="modal-actions">
+        <button id="planCancel" class="btn btn-secondary">取消</button>
+        <button id="planSubmit" class="btn btn-primary">添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用确认弹窗 -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3 id="confirmTitle">提示</h3>
+      <p id="confirmMessage" class="confirm-message"></p>
+      <div class="modal-actions">
+        <button id="confirmCancel" class="btn btn-secondary">取消</button>
+        <button id="confirmOk" class="btn btn-danger">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 📋 批量请假弹窗（当天全天请假：多选学生 + 逐个选择病假/事假） -->
+  <div id="batchLeaveModal" class="modal hidden">
+    <div class="modal-box bl-box">
+      <h3>📋 批量请假 <span class="bl-date" id="blDate">—</span></h3>
+      <p class="hint" id="blHint">勾选学生并为每人选择请假类型；确认后这些学生当天全天记为请假（当天所有场次都不需要签到）。已签到/迟到的学生不会被改动。</p>
+      <div class="bl-search-row">
+        <input type="search" id="blSearch" placeholder="🔍 输入姓名或学号筛选…" autocomplete="off">
+        <label class="bl-select-all"><input type="checkbox" id="blSelectAll"> 全选</label>
+      </div>
+      <div class="bl-list" id="blList"><div class="bl-empty">加载中…</div></div>
+      <div class="bl-footer">
+        <span class="bl-count" id="blCount">已选 0 人</span>
+        <span class="spacer"></span>
+        <button id="blCancel" class="btn btn-secondary">取消</button>
+        <button id="blOk" class="btn btn-primary">确认请假</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 按列签到弹窗（班长） -->
+  <div id="columnModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3>📶 按列签到</h3>
+      <p class="hint" id="columnModalHint">选择要签到的列</p>
+      <div class="form-row">
+        <select id="columnModalSelect"></select>
+      </div>
+      <div class="modal-actions">
+        <button id="columnModalCancel" class="btn btn-secondary">取消</button>
+        <button id="columnModalOk" class="btn btn-primary">确认签到</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 首次登录强制修改密码弹窗 -->
+  <div id="pwdModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3>🔒 首次登录，请修改密码</h3>
+      <div class="form-row"><label>原密码 *</label><input type="password" id="pwdOld" autocomplete="current-password"></div>
+      <div class="form-row"><label>新密码 *（至少 6 位）</label><input type="password" id="pwdNew" autocomplete="new-password"></div>
+      <div class="form-row"><label>确认新密码 *</label><input type="password" id="pwdNew2" autocomplete="new-password"></div>
+      <div id="pwdError" class="import-preview err hidden"></div>
+      <div class="modal-actions">
+        <button id="pwdLogout" class="btn btn-secondary">退出登录</button>
+        <button id="pwdSubmit" class="btn btn-primary">确认修改</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 📢 叫号弹窗（班长端：接收老师发布的叫号，语音播报 + 标记已处理） -->
+  <div id="annModal" class="modal hidden">
+    <div class="modal-box ann-box">
+      <h3>📢 叫号通知 <span id="annClassTag" class="ann-class-tag"></span>
+        <button id="annSpeakAll" class="btn btn-secondary btn-sm" title="重新播报全部未处理叫号">🔊 重新播报</button>
+      </h3>
+      <p class="hint" id="annHint">老师发布的叫号会自动语音播报（每 30 秒自动刷新）</p>
+      <div id="annList" class="ann-list"><div class="ann-empty">加载中…</div></div>
+      <div class="modal-actions">
+        <button id="annClose" class="btn btn-secondary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 🎲 随机点名弹窗（班长 / 教师 / 管理员） -->
+  <!-- 🎲 随机点名已改为独立页面 /random-call（签到操作台顶部按钮跳转） -->
+
+  <!-- 页脚：当前时间（原导航栏实时时钟移到这里，小字右下角，不挤占导航栏空间） -->
+  <footer class="page-footer">
+    <span id="navbarTime" class="footer-time">--</span>
+  </footer>
+
+  <script src="navbar.js?v=3.20.0"></script>
+<script src="app.js?v=3.35.0"></script>
+</body>
+</html>

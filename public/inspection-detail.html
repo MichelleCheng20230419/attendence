@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>问题详情 - 巡堂记录 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 巡堂记录：问题详情页（统一页面卡片模板 + 充足留白与层级）
+       区块间距：页头 → 信息卡 → 反馈记录 → 添加反馈，均为 24px */
+    .info-card {
+      border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 24px;                      /* 卡片内边距 24px */
+      background: #FCFDFE;
+    }
+    /* 字段行：行距 1.8；标签浅灰 13px；值深色 14px */
+    .info-row { display: flex; gap: 16px; font-size: 14px; line-height: 1.8; }
+    .info-row + .info-row { margin-top: 6px; }
+    .info-row .k { flex: 0 0 88px; width: 88px; font-size: 13px; color: var(--text-light); line-height: 1.8; }
+    .info-row .v { flex: 1 1 auto; min-width: 0; font-size: 14px; color: var(--text); line-height: 1.8; word-break: break-word; white-space: pre-wrap; }
+    .st { display: inline-block; padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .st.pending { background: #FFF1F0; color: #CF1322; border: 1px solid #FFCCC7; }
+    .st.processing { background: #FFF7E6; color: #AD6800; border: 1px solid #FFE58F; }
+    .st.resolved { background: #F6FFED; color: #237804; border: 1px solid #B7EB8F; }
+    .prio.urgent { color: #CF1322; font-weight: 700; }
+
+    /* 照片缩略图：120×90，点击放大 */
+    .thumbs { display: flex; gap: 12px; flex-wrap: wrap; padding-top: 4px; }
+    .thumbs img {
+      width: 120px; height: 90px; object-fit: cover; border-radius: 8px;
+      border: 1px solid var(--border); cursor: zoom-in; background: #f5f7fa;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .thumbs img:hover { border-color: var(--primary); box-shadow: 0 2px 10px rgba(74,144,217,.22); }
+    .thumbs-empty { font-size: 13px; color: var(--text-light); line-height: 1.8; }
+
+    /* 反馈记录 / 添加反馈：与上一区块间距 24px */
+    .fb-section { margin-top: 24px; }
+    .section-title { font-size: 15px; font-weight: 800; margin: 0 0 12px; }
+    .fb-list { display: flex; flex-direction: column; gap: 12px; }        /* 反馈之间 12px */
+    .fb-item {
+      border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px;
+      background: #F7F9FC;                                                /* 独立卡片：浅灰背景 */
+    }
+    .fb-head { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-light); flex-wrap: wrap; line-height: 1.6; }
+    .fb-head b { color: var(--text); font-size: 14px; font-weight: 700; }
+    .fb-head .fb-time { font-variant-numeric: tabular-nums; }
+    .fb-sol { margin-top: 10px; font-size: 14px; line-height: 1.8; white-space: pre-wrap; color: var(--text); }
+    .fb-empty {
+      color: var(--text-light); font-size: 14px; padding: 20px 18px; text-align: center;
+      border: 1px dashed var(--border); border-radius: 8px; background: #FCFDFE;
+    }
+
+    /* 添加反馈表单 */
+    .fb-form { border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; background: #FCFDFE; }
+    .fb-form .form-row { margin-bottom: 16px; }                           /* 字段间距 16px */
+    .fb-form label { display: block; font-size: 13px; font-weight: 600; color: var(--text-light); margin-bottom: 8px; }
+    .fb-form select, .fb-form textarea {
+      font-size: 14px; padding: 10px 12px; border: 1px solid var(--border);
+      border-radius: 8px; background: #fff; font-family: inherit; outline: none;
+    }
+    .fb-form select { width: 200px; max-width: 100%; }                    /* 是否解决：宽 200px */
+    .fb-form textarea { width: 100%; height: 120px; min-height: 120px; resize: vertical; line-height: 1.8; }
+    .fb-form select:focus, .fb-form textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(74,144,217,.14); }
+    .fb-actions { display: flex; justify-content: flex-end; }              /* 提交按钮右对齐 */
+    .deny-tip { border-radius: 10px; padding: 12px 16px; font-size: 14px; border: 1px solid #FFE58F; background: #FFFBE6; color: #AD6800; margin-top: 12px; }
+    .err-box { border-radius: 10px; padding: 10px 14px; font-size: 13px; margin-bottom: 14px; border: 1px solid #FFCCC7; background: #FFF1F0; color: #CF1322; }
+
+    .insp-lightbox { position: fixed; inset: 0; background: rgba(17, 24, 39, .82); z-index: 80; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .insp-lightbox img { max-width: 92vw; max-height: 86vh; min-width: 200px; min-height: 150px; object-fit: contain; border-radius: 10px; background: #fff; }
+    .insp-lightbox .lb-close { position: absolute; top: 18px; right: 24px; color: #fff; font-size: 22px; cursor: pointer; background: rgba(255,255,255,.14); border: none; width: 42px; height: 42px; border-radius: 50%; }
+
+    @media (max-width: 720px) {
+      .info-row { gap: 12px; }
+      .info-row .k { flex: 0 0 72px; width: 72px; }
+      .thumbs img { width: 100px; height: 75px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头：返回巡堂记录(左) · 标题居中 -->
+      <div class="page-head">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回巡堂记录</button>
+        <h2 class="page-title">📋 问题详情</h2>
+      </div>
+
+      <div id="errBox" class="err-box hidden"></div>
+
+      <!-- 问题信息 -->
+      <div class="info-card" id="issueCard">
+        <div class="info-row"><span class="k">日期</span><span class="v" id="dDate">--</span></div>
+        <div class="info-row"><span class="k">班级</span><span class="v" id="dClass">--</span></div>
+        <div class="info-row"><span class="k">问题类型</span><span class="v" id="dCategory">--</span></div>
+        <div class="info-row"><span class="k">紧急程度</span><span class="v" id="dPriority">--</span></div>
+        <div class="info-row"><span class="k">问题描述</span><span class="v" id="dDesc">--</span></div>
+        <div class="info-row"><span class="k">照片</span><span class="v"><span class="thumbs" id="dPhotos"><span class="thumbs-empty">无</span></span></span></div>
+        <div class="info-row"><span class="k">状态</span><span class="v" id="dStatus">--</span></div>
+        <div class="info-row"><span class="k">记录人</span><span class="v" id="dCreator">--</span></div>
+      </div>
+
+      <!-- 反馈记录（与信息卡间距 24px） -->
+      <div class="fb-section">
+        <div class="section-title">📝 反馈记录</div>
+        <div class="fb-list" id="fbList"></div>
+      </div>
+
+      <!-- 添加反馈（与反馈记录间距 24px） -->
+      <div class="fb-section">
+        <div class="section-title">➕ 添加反馈</div>
+        <div class="fb-form" id="fbForm">
+          <div class="form-row">
+            <label>是否解决</label>
+            <select id="fbStatus"></select>
+          </div>
+          <div class="form-row">
+            <label>解决方案</label>
+            <textarea id="fbSolution" maxlength="2000" placeholder="请填写解决方案..."></textarea>
+          </div>
+          <div class="fb-actions">
+            <button type="button" class="btn btn-primary" id="btnSubmitFb">提交反馈</button>
+          </div>
+        </div>
+        <div id="fbDeny" class="deny-tip hidden">🔒 你的账号没有「添加反馈」权限，请联系管理员在「小组管理」中授权。</div>
+      </div>
+    </section>
+  </div>
+
+  <div id="lightbox" class="insp-lightbox hidden">
+    <button class="lb-close" id="lbClose">✕</button>
+    <img id="lbImg" alt="照片">
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/inspection-common.js?v=3.12.0"></script>
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/inspection-detail.js?v=3.12.0"></script>
+</body>
+</html>

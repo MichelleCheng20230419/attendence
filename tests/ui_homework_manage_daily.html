@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：每日作业显示在「作业管理」页（不是只显示在签到操作台/作业统计页）
+    需求：
+      1) 系统每天 0 点自动为每个班发布当天各科「每日作业」条目（定时任务；本驱动用接口直接触发验证展示层）
+      2) 班主任在「作业管理」页就能看到当天各科作业（自动 + 手动并存），列显示 已交/未交 + 提交率
+      3) 点某一科 → 查看未交名单
+      4) 班长在「作业统计」录入后，班主任端「作业管理」页同步更新
+    验证点：
+      A) 作业管理页默认日期=今天；列表出现 6 行「每日作业」（理科班 = 语数英物化生），带「每日作业」标签
+         列头含「已交 / 未交」，汇总卡有「其中每日作业」= 6；未录入时状态显示「待提交」
+      B) 点某科「查看未交名单」→ 弹出提交情况（卡片 + 未交名单含 2 名学生）
+      C) 班长录入数学（取消 1 人）→ 班主任端刷新后该行 已交 1 / 未交 1、提交率 50%、状态不再是「待提交」
+      D) 手动作业与每日作业并存（同一天同一学科两条）；勾选「只看我发布的」只剩手动作业
+      E) 「今天 / 全部日期」快捷筛选可用
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_homework_manage_daily -AdminPw <管理员密码>
+  夹具：1 个临时年级 + 1 个理科班（6 科）+ 2 名学生 + 班主任/班长账号；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>每日作业显示在「作业管理」页（含班长录入后同步）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', redirect: 'manual',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => { const e = Q(s); return !!e && !e.classList.contains('hidden') && e.offsetParent !== null; };
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(1200);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+const fire = (el, type) => el.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+// 作业管理列表行：班级/学科/标题/截止时间/已交-未交/提交率/状态/操作
+const mgRows = () => Qa('#taskBody tr').map((tr) => {
+  const td = [...tr.querySelectorAll('td')].map((x) => x.textContent.replace(/\s+/g, ' ').trim());
+  return {
+    cells: td,
+    className: td[0] || '', subject: (td[1] || '').trim(), title: td[2] || '',
+    daily: /每日作业/.test(td[2] || ''),
+    pair: td[4] || '', rate: td[5] || '', status: td[6] || '',
+    detailBtn: tr.querySelector('.js-detail') ? tr.querySelector('.js-detail').textContent.trim() : '',
+    hasEdit: !!tr.querySelector('.js-edit'),
+  };
+});
+const todayStr = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '作业管理年级' + stamp;
+const CLASS = '作业管理理科班' + stamp;
+const HEAD = 'hmd_head_' + stamp, MON = 'hmd_mon_' + stamp;
+const PUB_TITLE = '【并存】手动作业' + stamp;
+const created = { gradeId: null, classId: null, students: [], users: [] };
+
+async function hardCleanup() {
+  await asUser('admin');
+  if (created.classId) {
+    const d = await japi('/api/homework/tasks?classId=' + created.classId + '&from=2020-01-01&to=2099-12-31');
+    for (const t of ((d.data && d.data.tasks) || [])) await japi('/api/homework/tasks/' + t.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^作业管理理科班/.test(x.className))) {
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^hmd_/.test(x.username))) {
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^作业管理年级/.test(x.grade_name || x.gradeName || ''))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'HMD', academicYear: year } })).data.id;
+    // 理科班 → 每天 6 科（语文/数学/英语/物理/化学/生物）
+    const cls = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeId: created.gradeId, academicYear: year, stream: '理科', electiveSubjects: [] } })).data;
+    created.classId = cls.id;
+    check('0) 夹具班级就绪（理科班 → 6 科）', cls.effectiveSubjects && cls.effectiveSubjects.length === 6, cls.effectiveSubjects);
+    for (const [no, nm] of [['HMD' + stamp + '01', '管作甲'], ['HMD' + stamp + '02', '管作乙']]) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: no, name: nm, classId: created.classId, status: '在读' } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    // 班主任（有学科，可发布作业）+ 班长
+    const rh = await japi('/api/users', { method: 'POST', body: { username: HEAD, password: '123456', role: 'teacher', realName: '管作班主任', subject: '语文', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.users.push(rh.data.user.id);
+    const rm = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '管作班长', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+    created.users.push(rm.data.user.id);
+    check('0) 夹具就绪（1 班 + 2 学生 + 班主任/班长）', created.students.filter(Boolean).length === 2 && created.users.length === 2);
+    // 用"定时任务同款"的生成接口把当天各科条目准备好（等价于 0 点自动发布后的状态）
+    const ens = await japi('/api/homework/daily/ensure', { method: 'POST', body: { classId: created.classId } });
+    check('0) 当天每日作业条目已生成（6 科）', ens.status === 200 && ens.data.subjects.length === 6, ens.data && ens.data.subjects);
+
+    // ============================================================
+    // A) 班主任在「作业管理」页看到当天各科（自动作业）
+    // ============================================================
+    log('\n— A) 作业管理页：当天 6 科每日作业 —');
+    await asUser(HEAD);
+    await load('/homework-manage', '#taskBody');
+    await until(() => mgRows().length >= 6, 20000);
+    check('A) 默认日期 = 今天', (Q('#fDate') || {}).value === todayStr(), (Q('#fDate') || {}).value);
+    check('A) 列头含「已交 / 未交」', /已交\s*\/\s*未交/.test(txt('.admin-table thead')), txt('.admin-table thead'));
+    let rows = mgRows();
+    const dailyRows = rows.filter((r) => r.daily);
+    check('A) 列表出现 6 行「每日作业」（理科班 = 语数英物化生）', dailyRows.length === 6, rows.map((r) => r.subject + (r.daily ? '(每日)' : '')));
+    check('A) 每日作业行：学科 = 语文/数学/英语/物理/化学/生物',
+      dailyRows.map((r) => r.subject).join(',') === '语文,数学,英语,物理,化学,生物', dailyRows.map((r) => r.subject));
+    check('A) 每行显示 已交 / 未交（0 / 2）与提交率（0%）',
+      dailyRows.every((r) => /^0\s*\/\s*2$/.test(r.pair) && r.rate === '0%'), dailyRows[0] && dailyRows[0].cells);
+    check('A) 未录入时状态显示「待提交」', dailyRows.every((r) => /待提交/.test(r.status)), dailyRows.map((r) => r.status));
+    check('A) 每日作业行没有「编辑 / 删除」（系统自动生成，不可手改）',
+      dailyRows.every((r) => !r.hasEdit && /查看未交名单/.test(r.detailBtn)), dailyRows[0] && { edit: dailyRows[0].hasEdit, btn: dailyRows[0].detailBtn });
+    check('A) 汇总卡显示「作业数 / 其中每日作业」（其中每日作业 = 6）',
+      /其中每日作业/.test(txt('body')) && txt('#scDaily') === '6', { tasks: txt('#scTasks'), daily: txt('#scDaily') });
+
+    // ============================================================
+    // B) 点某科 → 查看未交名单
+    // ============================================================
+    log('\n— B) 点某一科 → 查看未交名单 —');
+    const mathRow = dailyRows.find((r) => r.subject === '数学');
+    const mathTr = Qa('#taskBody tr').find((tr) => /数学/.test(tr.textContent) && /每日作业/.test(tr.textContent));
+    mathTr.querySelector('.js-detail').click();
+    await until(() => !hidden('#detailModal') && Qa('#detailBody tr').length >= 2, 15000);
+    check('B) 弹出提交情况弹窗（标题 + 统计卡 + 明细）',
+      /作业提交情况/.test(txt('#detailTitle')) && Qa('#hwStatCards .hw-stat-card').length === 4,
+      { title: txt('#detailTitle'), cards: Qa('#hwStatCards .hw-stat-card').length });
+    check('B) 明细=全班 2 人（未交 2 人，状态"未交"）',
+      Qa('#detailBody tr').length === 2 && Qa('#detailBody tr').every((tr) => /未交/.test(tr.textContent)),
+      Qa('#detailBody tr').map((tr) => tr.textContent.replace(/\s+/g, ' ').trim()));
+    check('B) 统计卡：应交 2 / 已交 0 / 未交 2',
+      Qa('#hwStatCards .hw-stat-card').map((c) => c.querySelector('.hsc-value').textContent.trim()).join(',') === '2,0,2,0%',
+      Qa('#hwStatCards .hw-stat-card').map((c) => c.textContent.replace(/\s+/g, ' ').trim()));
+    Q('#detailClose').click();
+    await sleep(300);
+
+    // ============================================================
+    // C) 班长录入 → 班主任端同步
+    // ============================================================
+    log('\n— C) 班长录入后班主任端同步 —');
+    await asUser(MON);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6, 20000);
+    await sleep(600);
+    // 找数学行 → 进入录入 → 取消 1 人（1/2 已交）
+    const monMath = Qa('#hwTaskList tr').find((tr) => /数学/.test(tr.textContent) && /每日作业/.test(tr.textContent));
+    monMath.querySelector('.hw-entry').click();
+    await until(() => !hidden('#hwEntryView') && Qa('#hwSeatGrid .hw-card').length === 2, 20000);
+    Qa('#hwSeatGrid .hw-card')[0].click();      // 默认全"已交" → 取消第 1 人 → 1/2
+    await sleep(300);
+    Q('#hwEntrySave').click();
+    await until(() => /已保存|保存失败/.test(txt('#toast')) || hidden('#hwDirty'), 15000);
+    check('C) 班长录入数学（1/2 已交）并保存', true);
+    // 班主任端刷新后应看到最新提交情况
+    await asUser(HEAD);
+    await load('/homework-manage', '#taskBody');
+    await until(() => mgRows().length >= 6, 20000);
+    rows = mgRows();
+    const mathAfter = rows.find((r) => r.daily && r.subject === '数学');
+    check('C) 班主任端「作业管理」页数学行同步为 已交 1 / 未交 1、提交率 50%',
+      !!mathAfter && /^1\s*\/\s*1$/.test(mathAfter.pair) && mathAfter.rate === '50%', mathAfter && mathAfter.cells);
+    check('C) 已录入的科目状态不再是「待提交」', !!mathAfter && !/待提交/.test(mathAfter.status), mathAfter && mathAfter.status);
+    check('C) 未录入的其它科仍是「待提交」（不会被误判）',
+      rows.filter((r) => r.daily && r.subject !== '数学').every((r) => /待提交/.test(r.status)),
+      rows.filter((r) => r.daily).map((r) => [r.subject, r.status]));
+
+    // ============================================================
+    // D) 手动作业与每日作业并存
+    // ============================================================
+    log('\n— D) 手动发布的作业与每日作业并存 —');
+    const pub = await japi('/api/homework/tasks', {
+      method: 'POST', body: { classIds: [created.classId], subject: '语文', title: PUB_TITLE, deadline: `${todayStr()} 21:00` },
+    });
+    check('D) 班主任手动发布一条语文作业 → 201', pub.status === 201, pub.data);
+    await load('/homework-manage', '#taskBody');
+    await until(() => mgRows().length >= 7, 20000);
+    rows = mgRows();
+    const chinese = rows.filter((r) => r.subject === '语文');
+    check('D) 同一天同一学科两条并存：一条「每日作业」+ 一条手动发布',
+      chinese.length === 2 && chinese.some((r) => r.daily) && chinese.some((r) => !r.daily),
+      chinese.map((r) => ({ title: r.title, daily: r.daily })));
+    check('D) 手动作业可编辑/删除；自动作业不可（各自操作按钮不同）',
+      chinese.find((r) => !r.daily).hasEdit === true && chinese.find((r) => r.daily).hasEdit === false);
+    // 「只看我发布的」→ 语义 = 只按发布人过滤（不再包含每日作业）
+    let cb = Q('#fMine');
+    cb.checked = true; fire(cb, 'change');
+    await until(() => mgRows().length >= 1 && !mgRows().some((r) => r.daily), 15000);
+    await sleep(600);
+    const mineRows = mgRows().filter((r) => r.title);
+    check('D) 勾选「只看我发布的」→ 只剩手动发布的那条（每日作业被过滤）',
+      mineRows.length === 1 && mineRows[0].title.includes(PUB_TITLE) && !mineRows[0].hasEdit === false,
+      mineRows.map((r) => r.title));
+    cb.checked = false; fire(cb, 'change');
+    await until(() => mgRows().filter((r) => r.daily).length >= 6, 15000);
+
+    // ============================================================
+    // E) 快捷筛选：今天 / 全部日期
+    // ============================================================
+    log('\n— E) 今天 / 全部日期 快捷筛选 —');
+    // 诊断：同时用接口核对"不带日期"时的返回（页面应与之保持一致）
+    const noDateApi = await japi('/api/homework/tasks?includeDaily=1');
+    const noDateTasks = (noDateApi.data && noDateApi.data.tasks) || [];
+    Q('#btnAllDates').click();
+    await until(() => (Q('#fDate') || {}).value === '', 15000);
+    await until(() => mgRows().filter((r) => r.daily).length >= 6, 15000);
+    await sleep(800);
+    const eRows = mgRows().filter((r) => r.title);
+    check('E) 点「全部日期」→ 日期清空且仍有当天 6 科每日作业',
+      (Q('#fDate') || {}).value === '' && eRows.filter((r) => r.daily).length >= 6,
+      { date: (Q('#fDate') || {}).value, daily: eRows.filter((r) => r.daily).length,
+        rows: eRows.map((r) => r.title + (r.daily ? '(D)' : '')), mine: (Q('#fMine') || {}).checked,
+        apiNoDate: noDateTasks.length, apiDaily: noDateTasks.filter((t) => t.isDaily).length,
+        apiStatus: noDateApi.status, apiErr: noDateApi.data && noDateApi.data.error });
+    Q('#btnToday').click();
+    await until(() => (Q('#fDate') || {}).value === todayStr() && mgRows().some((r) => r.daily), 15000);
+    await sleep(800);
+    check('E) 点「今天」→ 日期回到今天且列表仍有每日作业',
+      (Q('#fDate') || {}).value === todayStr() && mgRows().filter((r) => r.daily).length >= 6,
+      { date: (Q('#fDate') || {}).value, daily: mgRows().filter((r) => r.daily).length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^作业管理理科班/.test(x.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^hmd_/.test(u.username));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^作业管理年级/.test(g.grade_name || g.gradeName || ''));
+    check('清理：夹具班级/账号/年级已清除',
+      leftCls.length === 0 && leftUsers.length === 0 && leftGrades.length === 0,
+      { classes: leftCls.length, users: leftUsers.length, grades: leftGrades.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

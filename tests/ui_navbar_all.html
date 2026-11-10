@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：全站统一顶部导航栏（每个页面都有、内容一致、菜单可点）
+  背景：此前只有签到操作台有完整导航栏，学生管理/考勤分析等页面只有"精简版"（标题+用户菜单），
+        叫号管理/课堂表现/随机点名完全没有导航栏 —— 现统一为由 navbar.js 渲染的同一份导航栏。
+  验证点：
+    □ 每个页面都有顶部导航栏（不只是签到操作台）
+    □ 导航栏内容一致：系统标题 + 版本号 + 5 个一级菜单 + 右上角用户菜单
+    □ 5 个页面级菜单项/分组在 15 个页面上完全一致（同一份组件）
+    □ 菜单可正常点击（一级项跳转、下拉展开、菜单项跳转、用户菜单）
+    □ 按角色显示（班主任/任课老师无"系统管理"；班长为顶层三项；学生只有"签到操作"）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_navbar_all.html public/_ui_navbar_all.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiNb --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_navbar_all.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_navbar_all.html
+  夹具：临时年级 + 1 班 + 班主任/任课老师/班长/学生账号（自愈式清理，且断言真实表行数不变）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>全站统一顶部导航栏（每页都有 · 内容一致 · 可点击）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const csEl = (e, prop) => (e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null);
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const rect = (s) => { const e = Q(s); return e ? e.getBoundingClientRect() : null; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#navbarMenus') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 25000);
+  await sleep(700);
+}
+// 一级菜单（可见）
+const topMenus = () => Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item')
+  .filter((b) => visible('#' + b.id)).map((b) => b.id);
+// 下拉内可见条目
+const itemsOf = (menuId) => Qa('#' + menuId + ' .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+async function asUser(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '导航栏年级' + stamp, CLASS = '导航栏班' + stamp;
+const HEAD = 'nb_head_' + stamp, SUBJ = 'nb_subj_' + stamp, MON = 'nb_mon_' + stamp, STU = 'nb_stu_' + stamp;
+const created = { gradeId: null, classId: null, userIds: [] };
+let realBefore = null;
+
+async function snapshotReal() {
+  const snap = async (p) => { try { const r = await japi(p); return r.status === 200; } catch (_) { return false; } };
+  const users = (await japi('/api/users')).data;
+  const classes = (await japi('/api/classes')).data;
+  return {
+    users: ((users && users.users) || []).length,
+    classes: ((classes && classes.classes) || []).length,
+  };
+}
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^nb_/.test(x.username))) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^导航栏班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^导航栏年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+// 需要验证导航栏的页面（全站，登录页除外）
+const PAGES = [
+  ['/dashboard', '签到操作台'], ['/students', '学生管理'], ['/announcements', '叫号管理'],
+  ['/random-call', '随机点名'], ['/performance', '课堂表现'], ['/homework', '作业统计'],
+  ['/homework-manage', '作业管理'], ['/attendance-analysis', '考勤分析'],
+  ['/admin/account-management', '账号管理'], ['/admin/grade-management', '年级管理'],
+  ['/admin/class-management', '班级管理'], ['/admin/academic-year-management', '学年管理'],
+  ['/admin/student-transfer', '学生异动'], ['/profile', '个人中心'], ['/attendance/makeup', '补签'],
+];
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshotReal();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'NB', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const mkUser = async (u, role) => {
+      // force: true —— 同一班已有班主任时，再建带该班的教师账号会返回 409 needConfirm
+      // （P0 起该冲突校验真正生效：页面会弹"班主任冲突"确认框，驱动直接确认覆盖）
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role, realName: u, classId: created.classId, force: true } });
+      const id = r.data && r.data.user && r.data.user.id;
+      if (!id) log('  · 创建账号失败 ' + u + ' ' + JSON.stringify(r.data));
+      if (id) created.userIds.push(id);
+      return id;
+    };
+    await mkUser(HEAD, 'teacher');
+    await mkUser(SUBJ, 'teacher');
+    await mkUser(MON, 'monitor');
+    await mkUser(STU, 'student');
+    // 班主任带本班、任课老师带本班（学科数学）
+    const users = (await japi('/api/users')).data.users || [];
+    const idOf = (u) => (users.find((x) => x.username === u) || {}).id;
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: idOf(HEAD), classes: [{ classId: created.classId, isHeadTeacher: true }] } });
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: idOf(SUBJ), classes: [{ classId: created.classId, isHeadTeacher: false }] } });
+    check('0) 夹具就绪（年级 + 1 班 + 班主任/任课老师/班长/学生）',
+      !!created.gradeId && !!created.classId && created.userIds.length === 4, created);
+
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+    await asUser('admin');
+
+    // ---------- A) 每个页面都有顶部导航栏，且内容完全一致 ----------
+    log('\n— A) 15 个页面都有统一导航栏 —');
+    const sigs = [];
+    const menuSignatures = [];
+    for (const [url, label] of PAGES) {
+      await loadPage(url);
+      if (W().location.pathname !== url) { check(`A) [${label}] 打开成功`, false, W().location.pathname); continue; }
+      const nav = Q('header.navbar') || Q('.navbar');
+      check(`A) [${label}] 有顶部导航栏（header.navbar）`, !!nav);
+      check(`A) [${label}] 导航栏在页面最上方（第一个元素 / 页头之下零偏移）`,
+        !!nav && nav.getBoundingClientRect().top <= 1 && nav.getBoundingClientRect().top < (rect('.page-card') || { top: 1e9 }).top,
+        { navTop: nav && Math.round(nav.getBoundingClientRect().top), cardTop: rect('.page-card') && Math.round(rect('.page-card').top) });
+      check(`A) [${label}] 导航栏通栏（宽度 = 视口宽度）`,
+        (() => { const r = nav && nav.getBoundingClientRect(); return !!r && Math.abs(r.width - F().documentElement.clientWidth) <= 1; })(),
+        (() => { const r = nav && nav.getBoundingClientRect(); return r ? { nav: Math.round(r.width), vw: F().documentElement.clientWidth } : null; })());
+      check(`A) [${label}] 含系统标题「📋 武汉一中管理平台」`,
+        !!Q('.navbar .app-title') && /武汉一中管理平台/.test(txt('.navbar .app-title')), txt('.navbar .app-title'));
+      check(`A) [${label}] 含版本号标签 #verTag（v3.14.0）`,
+        !!Q('#verTag') && /^v\d+\.\d+\.\d+$/.test(txt('#verTag')), txt('#verTag'));
+      check(`A) [${label}] 含导航菜单容器 #navbarMenus`, !!Q('#navbarMenus'));
+      check(`A) [${label}] 含 6 个一级菜单（签到操作/巡堂记录/考勤管理/教学工具/数据统计/系统管理）`,
+        JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navInspection', 'navAttendanceMgmt', 'navTeaching', 'navStats', 'navSystem']),
+        topMenus());
+      check(`A) [${label}] 含右上角用户菜单（用户名 + 个人中心/帮助文档/退出登录）`,
+        !!Q('#btnUser') && !!Q('#userInfo') && txt('#userInfo').length > 0 && !!Q('#userDropdown') &&
+        !!Q('#menuProfile') && !!Q('#menuHelp') && !!Q('#menuLogout'),
+        { user: txt('#userInfo'), dropdown: !!Q('#userDropdown') });
+      check(`A) [${label}] 移动端汉堡按钮 #navToggle 存在`, !!Q('#navToggle'));
+      // 记录签名：菜单 HTML 结构（班长上提会影响层级，故用"可见项集合"作签名）
+      menuSignatures.push({ label, sig: JSON.stringify(Qa('#navbarMenus > .nav-item, #navbarMenus > .nav-group > .nav-item').map((b) => b.id)) });
+      sigs.push({
+        label,
+        navHtml: (Q('.navbar-inner') || { innerHTML: '' }).innerHTML.replace(/\s+/g, ' ').length,
+        groups: Qa('#navbarMenus .nav-group').map((g) => g.id).join(','),
+      });
+    }
+    const uniqSigs = [...new Set(sigs.map((s) => s.groups))];
+    check(`A) 15 个页面的导航栏菜单结构完全一致（分组集合唯一）`, uniqSigs.length === 1, uniqSigs);
+    const uniqMenus = [...new Set(menuSignatures.map((m) => m.sig))];
+    check(`A) 15 个页面的一级菜单项完全一致`, uniqMenus.length === 1, uniqMenus);
+
+    // ---------- B) 菜单可点：一级项跳转 ----------
+    log('\n— B) 菜单可正常点击 —');
+    await loadPage('/students');
+    check('B) [学生管理] 当前页高亮 = 学生管理（所在分组触发按钮高亮）',
+      Q('#btnStudents').classList.contains('active') && Q('#navAttendanceMgmt').classList.contains('active'),
+      { item: Q('#btnStudents').className, group: Q('#navAttendanceMgmt').className });
+    W().__nav.openGroup('navGroupAttendance');
+    await sleep(200);
+    check('B) [学生管理] 点「考勤管理」→ 下拉展开且含计划管理/学生管理',
+      !hidden('#navAttendanceMenu') && JSON.stringify(itemsOf('navAttendanceMenu')) === JSON.stringify(['btnPlansView', 'btnStudents']),
+      itemsOf('navAttendanceMenu'));
+    Q('#navAttendance').click();
+    const backDash = await until(() => W().location.pathname === '/dashboard', 12000);
+    check('B) [学生管理] 点「签到操作」→ 回到 /dashboard', backDash, W().location.pathname);
+
+    // 下拉菜单项跳转（跨页面）
+    W().__nav.openGroup('navGroupTeaching');
+    await sleep(200);
+    Q('#btnAnnManage').click();
+    const toAnn = await until(() => W().location.pathname === '/announcements', 12000);
+    check('B) [签到操作台] 「教学工具 → 叫号管理」→ /announcements', toAnn, W().location.pathname);
+
+    await loadPage('/students');
+    W().__nav.openGroup('navGroupSystem');
+    await sleep(200);
+    Q('#btnAdminYears').click();
+    const toYears = await until(() => W().location.pathname === '/admin/academic-year-management', 12000);
+    check('B) [学生管理] 「系统管理 → 学年管理」→ /admin/academic-year-management', toYears, W().location.pathname);
+
+    // 用户菜单可点：个人中心
+    await loadPage('/students');
+    Q('#btnUser').click();
+    await sleep(250);
+    check('B) [学生管理] 点右上角用户名 → 用户下拉展开', !hidden('#userDropdown'));
+    Q('#menuProfile').click();
+    const toProfile = await until(() => W().location.pathname === '/profile', 12000);
+    check('B) [学生管理] 点「个人中心」→ /profile', toProfile, W().location.pathname);
+
+    // 原本没有导航栏/用户菜单的页面（叫号管理 / 随机点名 / 课堂表现）：用户菜单同样可用
+    for (const [u, label] of [['/announcements', '叫号管理'], ['/random-call', '随机点名'], ['/performance', '课堂表现']]) {
+      await loadPage(u);
+      check(`B) [${label}] 顶部用户菜单存在且显示当前用户`, !!Q('#btnUser') && txt('#userInfo').length > 0, txt('#userInfo'));
+      Q('#btnUser').click();
+      await sleep(250);
+      const opened = !hidden('#userDropdown');
+      check(`B) [${label}] 点右上角用户名 → 用户下拉展开（组件接管，页面脚本无需自己绑定）`, opened);
+      check(`B) [${label}] 用户下拉含 个人中心 / 帮助文档 / 退出登录`,
+        visible('#menuProfile') && visible('#menuHelp') && visible('#menuLogout'));
+      Q('#btnUser').click();
+      await sleep(200);
+      check(`B) [${label}] 再点 → 用户下拉收起`, hidden('#userDropdown'));
+    }
+
+    // 计划管理 / 叫号提醒：签到操作台内就地响应（不刷新）
+    await loadPage('/dashboard');
+    W().__nav.openGroup('navGroupAttendance');
+    await sleep(200);
+    Q('#btnPlansView').click();
+    const plansOn = await until(() => visible('#viewPlans'), 8000);
+    check('B) [签到操作台] 点「计划管理」→ 页内切到计划视图', plansOn && !visible('#viewAttendance'));
+    Q('#btnBackAttendance').click();
+    await sleep(400);
+    check('B) [签到操作台] 「返回签到」→ 回到签到视图', visible('#viewAttendance') && !visible('#viewPlans'));
+
+    // 从别的页面点「计划管理」→ 直达 /dashboard?view=plans
+    await loadPage('/students');
+    W().__nav.openGroup('navGroupAttendance');
+    await sleep(200);
+    Q('#btnPlansView').click();
+    const plansDirect = await until(() => W().location.pathname === '/dashboard' && visible('#viewPlans'), 12000);
+    check('B) [学生管理] 点「计划管理」→ 打开 /dashboard 并直接进入计划视图', plansDirect, W().location.pathname);
+
+    // ---------- C) 角色：导航栏按角色显示（非签到操作台页面同样生效） ----------
+    log('\n— C) 角色显示 —');
+    await asUser(HEAD);           // 班主任
+    await loadPage('/students');
+    check('C) [班主任 / 学生管理] 导航栏可见，一级菜单 = 前 4 个（无系统管理）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navAttendanceMgmt', 'navTeaching', 'navStats']) && !visible('#navSystem'),
+      topMenus());
+    check('C) [班主任 / 学生管理] 系统管理分组隐藏', hidden('#navGroupSystem'));
+    check('C) [班主任 / 学生管理] 用户名为班主任本人', /nb_head_/.test(txt('#userInfo')), txt('#userInfo'));
+
+    await asUser(SUBJ);           // 任课老师
+    await loadPage('/homework-manage');
+    check('C) [任课老师 / 作业管理] 导航栏可见，系统管理不可见',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'navAttendanceMgmt', 'navTeaching', 'navStats']) && !visible('#navSystem'),
+      topMenus());
+
+    await asUser(MON);            // 班长
+    await loadPage('/dashboard');
+    check('C) [班长 / 签到操作台] 一级菜单 = 签到操作 + 叫号提醒 + 随机点名 + 点赞排行（顶层四项）',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'btnHomework', 'btnAnnouncements', 'btnRollCall', 'navLikesRanking']), topMenus());
+    check('C) [班长] 导航栏含叫号角标元素', !!Q('#annBadge'));
+    await loadPage('/random-call');
+    check('C) [班长 / 随机点名] 导航栏同样存在且为顶层四项（非签到台页面一致）',
+      !!Q('#navbarMenus') && JSON.stringify(topMenus()) === JSON.stringify(['navAttendance', 'btnHomework', 'btnAnnouncements', 'btnRollCall', 'navLikesRanking']), topMenus());
+    check('C) [班长 / 随机点名] 用户名为班长本人', /nb_mon_/.test(txt('#userInfo')), txt('#userInfo'));
+
+    await asUser(STU);            // 学生
+    await loadPage('/dashboard');
+    check('C) [学生 / 签到操作台] 一级菜单只有签到操作',
+      JSON.stringify(topMenus()) === JSON.stringify(['navAttendance']), topMenus());
+    check('C) [学生] 四个分组全部隐藏',
+      hidden('#navGroupAttendance') && hidden('#navGroupTeaching') && hidden('#navGroupStats') && hidden('#navGroupSystem'));
+
+    // ---------- D) 移动端：汉堡菜单（子页面同样可用） ----------
+    log('\n— D) 移动端 —');
+    await asUser('admin');
+    fr.style.width = '420px'; fr.style.height = '900px';
+    await sleep(500);
+    await loadPage('/students');
+    check('D) [学生管理 420px] 汉堡按钮可见、导航菜单默认收起',
+      visible('#navToggle') && !visible('#navTeaching'));
+    Q('#navToggle').click();
+    await sleep(300);
+    check('D) [学生管理 420px] 点汉堡 → 菜单展开且一级项可见',
+      Q('#navbarMenus').classList.contains('open') && visible('#navAttendance') && visible('#navStats'));
+    Q('#navToggle').click();
+    await sleep(200);
+    check('D) [学生管理 420px] 再点 → 收起', !Q('#navbarMenus').classList.contains('open'));
+    check('D) [学生管理 420px] 无横向溢出',
+      (() => { const de = F().documentElement; return de.scrollWidth <= de.clientWidth + 1; })());
+    fr.style.width = '1500px';
+    await sleep(400);
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^nb_/.test(u.username));
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^导航栏班/.test(c.className));
+    check('清理：临时账号/班级已删除', leftUsers.length === 0 && leftClasses.length === 0,
+      { u: leftUsers.length, c: leftClasses.length });
+    const realAfter = await snapshotReal();
+    check('清理：真实用户/班级数量未变', JSON.stringify(realBefore) === JSON.stringify(realAfter), { before: realBefore, after: realAfter });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

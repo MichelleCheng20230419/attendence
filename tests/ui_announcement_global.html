@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：班长端「叫号提醒」**全局**语音播报（不依赖当前页面）
+    2026-09-30 架构修复：播报原写在 app.js（只在签到操作台加载）→ 班长切到别的页面收不到；
+    现在放到 navbar.js（每个页面都加载）：班长登录后任意页面每 30 秒轮询 /api/announcements/inbox，
+    发现 is_played=false 的新叫号 → 语音播报 → 标记已播报（同一叫号不重复播）。
+  覆盖：
+    ① 班长停在**非签到操作台**页面（/random-call）时，老师发布叫号 → 自动播报（无需手动点「叫号提醒」）
+    ② 播报后该叫号被标记 is_played=true（收件箱 unplayed 为空）
+    ③ 同一叫号不重复播报（再次触发轮询，播报次数不增加）
+    ④ 「叫号提醒」手动查看（签到操作台弹窗）仍可用、记录正常显示
+  用法：.\tests\run-ui.ps1 -Name ui_announcement_global -AdminPw <管理员密码>
+  夹具：1 年级 + 1 班 + 1 学生 + 老师 + 班长（测完自愈清理）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1400px; height: 900px; }
+</style>
+</head>
+<body>
+<h3>班长端叫号播报：全局监听（任意页面都播报）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(1200);
+}
+async function asUser(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + ': ' + r.status);
+  return r.data.user;
+}
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '全局叫号年级' + stamp;
+const CLASS = '全局叫号班' + stamp;
+const MON = 'ang_mon_' + stamp, TEA = 'ang_tea_' + stamp;
+const created = { gradeId: null, classId: null, students: [], users: [] };
+
+async function hardCleanup() {
+  await asUser('admin');
+  const cids = ((await japi('/api/classes?includeArchived=1')).data.classes || [])
+    .filter((c) => /^全局叫号班/.test(c.className)).map((c) => c.id);
+  for (const c of cids) {
+    for (const a of (((await japi('/api/announcements?classId=' + c)).data || {}).announcements || [])) {
+      await japi('/api/announcements/' + a.id, { method: 'DELETE' });
+    }
+    for (const s of (((await japi('/api/students?classId=' + c)).data || {}).students || [])) {
+      await japi('/api/students/' + s.id, { method: 'DELETE' });
+    }
+    await japi('/api/classes/' + c + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^ang_/.test(x.username))) {
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^全局叫号年级/.test(x.grade_name || x.gradeName || ''))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await asUser('admin');
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'ANG', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const stu = (await japi('/api/students', { method: 'POST', body: { studentNo: 'ANG' + stamp + '01', name: '全局叫号同学', classId: created.classId, status: '在读' } })).data;
+    const stuId = stu && (stu.student ? stu.student.id : stu.id);
+    created.students.push(stuId);
+    let r = await japi('/api/users', { method: 'POST', body: { username: TEA, password: '123456', role: 'teacher', realName: '全局叫号老师', classId: created.classId, subject: '语文', mustChangePassword: false, profileLocked: true, force: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.users.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '全局叫号班长', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+    created.users.push(r.data.user.id);
+    check('0) 夹具就绪（1 班 + 1 学生 + 老师 + 班长）', !!created.classId && !!stuId && created.users.length === 2);
+
+    // ============================================================
+    // ① 班长停在**非签到操作台**页面（随机点名页）→ 老师发布叫号 → 自动播报
+    // ============================================================
+    log('\n— ① 班长在「随机点名」页也能收到播报（不依赖签到台/叫号提醒弹窗） —');
+    // 先由管理员发布叫号（注意：**不要在驱动页里登录老师** —— 同源 cookie 会被覆盖，导致后续请求变成老师身份）
+    const nowD = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    const whenStr = `${nowD.getFullYear()}-${p2(nowD.getMonth() + 1)}-${p2(nowD.getDate())} ${p2(nowD.getHours())}:${p2(nowD.getMinutes())}`;
+    const pub = await japi('/api/announcements', {
+      method: 'POST',
+      body: { classId: created.classId, studentId: stuId, location: '教务处', note: '全局播报验证', priority: 'normal', scheduledTime: whenStr },
+    });
+    check('① 发布叫号成功（管理员）', pub.status === 200 || pub.status === 201, { status: pub.status, data: pub.data });
+    await asUser(MON);
+    await load('/random-call', '#rcClass');
+    check('① 当前页面确实不是签到操作台（模拟"班长在别的页面"）',
+      F().location.pathname === '/random-call', F().location.pathname);
+    check('① 页面上没有打开「叫号提醒」弹窗（播报不依赖手动点击）',
+      !Q('#annModal') || Q('#annModal').classList.contains('hidden'),
+      { hasModal: !!Q('#annModal'), hidden: Q('#annModal') ? Q('#annModal').classList.contains('hidden') : null });
+    check('① 全局轮询间隔 = 10 秒（navbar.js 定时器配置）',
+      (W().DSHNavbar && W().DSHNavbar.announcements && W().DSHNavbar.announcements.pollMs) === 10000,
+      W().DSHNavbar && W().DSHNavbar.announcements && W().DSHNavbar.announcements.pollMs);
+    // **不手动触发轮询**：等待定时器自己发现新叫号（≤10 秒；无头环境虚拟时间会快进）
+    const spoken = await until(() => W().__lastSpoken && /全局叫号同学/.test(W().__lastSpoken), 30000);
+    // 真实浏览器里每 10 秒一次；无头环境的虚拟时间会快进 setInterval，命中次数不做下限要求，
+    // 只要求"确实发生过自动轮询"（配合上一条 pollMs=10000 的断言，即证明定时轮询已配置）
+    check('① 已发生自动轮询（轮询计数 ≥ 1）',
+      (W().DSHNavbar.announcements.pollCount || 0) >= 1, W().DSHNavbar.announcements.pollCount);
+    check('① 班长在随机点名页**自动播报**（无需手动刷新、无需点「叫号提醒」）',
+      spoken && /^请全局叫号班\d*全局叫号同学到教务处$/.test(W().__lastSpoken), { spoken: W().__lastSpoken, count: W().__annSpokenCount });
+
+    // ============================================================
+    // ② 播报后被标记 is_played=true（收件箱 unplayed 为空）
+    // ============================================================
+    log('\n— ② 已播报标记（is_played）——刷新/换页不重复播 —');
+    const inbox = await japi('/api/announcements/inbox');
+    const list = (inbox.data && inbox.data.announcements) || [];
+    check('② 该叫号已标记 isPlayed=true（服务端 is_played 生效）',
+      inbox.status === 200 && list.length === 1 && list[0].isPlayed === true, list.map((a) => [a.id, a.isPlayed]));
+    check('② 收件箱 unplayed 为空（没有"待播报"堆积）',
+      ((inbox.data && inbox.data.unplayed) || []).length === 0, (inbox.data && inbox.data.unplayed || []).length);
+
+    // ============================================================
+    // ③ 同一叫号不重复播报（再次强制轮询，播报次数不增加）
+    // ============================================================
+    log('\n— ③ 同一叫号不重复播报 —');
+    const before = W().__annSpokenCount || 0;
+    for (let i = 0; i < 2; i += 1) {
+      await W().DSHNavbar.announcements.refresh();
+      await sleep(400);
+    }
+    check('③ 重复轮询不再播报（累计播报条数不变）',
+      (W().__annSpokenCount || 0) === before, { before, after: W().__annSpokenCount });
+
+    // ============================================================
+    // ④ 「叫号提醒」手动查看仍可用（签到操作台弹窗 + 记录显示）
+    // ============================================================
+    log('\n— ④ 手动查看（签到操作台 → 叫号提醒弹窗）仍正常 —');
+    await load('/dashboard?ann=1', '#annModal');
+    await until(() => !Q('#annModal').classList.contains('hidden'), 20000);
+    // 手动刷新一次列表（弹窗里的「刷新」等价操作）
+    try { await W().DSHNavbar.announcements.refresh(); await W().__ann.fetch(); } catch (_) {}
+    await until(() => Qa('#annList .ann-item').length >= 1, 15000);
+    await sleep(500);
+    check('④ 签到操作台打开「叫号提醒」弹窗，能手动看到叫号记录',
+      !Q('#annModal').classList.contains('hidden') && Qa('#annList .ann-item').length >= 1,
+      { modal: !Q('#annModal').classList.contains('hidden'), items: Qa('#annList .ann-item').length });
+    check('④ 记录内容与发布一致（学生 + 到何处）',
+      /全局叫号同学/.test(txt('#annList')) && /教务处/.test(txt('#annList')), txt('#annList').slice(0, 120));
+
+    log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  } catch (e) {
+    console.error(e);
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    await hardCleanup().catch(() => {});
+    log('清理完成');
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

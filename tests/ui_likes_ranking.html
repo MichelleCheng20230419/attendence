@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：班长端「点赞排行榜」
+  验证点：
+    ① 签到操作台出现「👍 点赞排行」入口（班长可见；学生不可见）
+    ② 点击入口 → 独立页面 /likes-ranking（统一页头：返回签到 / 标题居中）
+    ③ 排行榜按点赞数从高到低；只显示本班学生（不含其它班）
+    ④ 支持按学科筛选、按时间筛选（本周/本月/本学期/全部）
+    ⑤ 班长只读（提示"只读，不可修改"），范围=本班
+    ⑥ 学生访问 /likes-ranking → 回签到台；管理员打开时范围=全校
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_likes_ranking -AdminPw <管理员密码>
+    （脚本会把驱动里的 admin 密码替换为实际值；用后自动清理 public/_*.html）
+  夹具：1 年级 + 2 班 + 4 学生 + 2 班长 + 1 学生账号 + 若干点赞（走真实点赞接口）
+       夹具班级删除时，点赞/点名记录随外键级联清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>班长端点赞排行榜</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = 'body') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(900);
+}
+
+const stamp = String(Date.now()).slice(-6);
+const GRADE = '点赞UI年级' + stamp, CLASS_A = '点赞UI甲班' + stamp, CLASS_B = '点赞UI乙班' + stamp;
+const MON_A = 'lk_mon_' + stamp, MON_B = 'lk_monb_' + stamp, STU = 'lk_stu_' + stamp;
+const TEA = 'lk_tea_' + stamp, HEAD = 'lk_head_' + stamp;
+const created = { gradeId: null, classA: null, classB: null, studentIds: [], userIds: [] };
+let realBefore = null;
+
+async function asUser(name) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: name, password: '123456' } });
+  return r.status === 200;
+}
+async function snapshotReal() {
+  const u = (await japi('/api/users')).data, c = (await japi('/api/classes')).data, g = (await japi('/api/grades')).data;
+  return {
+    users: ((u && u.users) || []).length,
+    classes: ((c && c.classes) || []).length,
+    grades: ((g && g.grades) || []).length,
+  };
+}
+async function hardCleanup() {
+  const warn = (l) => (e) => log('  · 清理失败（' + l + '）：' + (e && e.message));
+  for (const cid of [created.classA, created.classB]) {
+    if (!cid) continue;
+    const st = (await japi('/api/students?classId=' + cid)).data;
+    for (const s of ((st && st.students) || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+  }
+  // 夹具账号（任课/班主任会被写进 classes.head_teacher_id / teacher_classes）→
+  // 先清带班关系，再删夹具班级，最后删账号，避免外键挡住删除
+  const lkUsers = ((await japi('/api/users')).data.users || []).filter((x) => /^lk_/.test(x.username));
+  for (const u of lkUsers) {
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } }).catch(warn('teacher-classes'));
+  }
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^点赞UI[甲乙]班/.test(x.className))) {
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const u of lkUsers) await japi('/api/users/' + u.id, { method: 'DELETE' }).catch(warn('users'));
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^点赞UI年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    realBefore = await snapshotReal();
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'LK', academicYear: year } })).data.id;
+    created.classA = (await japi('/api/classes', { method: 'POST', body: { className: CLASS_A, gradeName: GRADE, academicYear: year } })).data.id;
+    created.classB = (await japi('/api/classes', { method: 'POST', body: { className: CLASS_B, gradeName: GRADE, academicYear: year } })).data.id;
+    const mkStudent = async (no, name, classId) => {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: no, name, classId, status: '在读' } });
+      const id = (r.data && (r.data.id || (r.data.student && r.data.student.id))) || null;
+      created.studentIds.push(id);
+      return id;
+    };
+    const A1 = await mkStudent('LK' + stamp + '01', '排行榜甲一', created.classA);
+    const A2 = await mkStudent('LK' + stamp + '02', '排行榜甲二', created.classA);
+    await mkStudent('LK' + stamp + '03', '排行榜甲三', created.classA);   // 无点赞 → 不出现在榜单
+    const B1 = await mkStudent('LK' + stamp + '04', '排行榜乙一', created.classB);
+    const mkUser = async (u, role, classId) => {
+      // force: true —— 一个班已有班主任时，再建带该班的教师账号接口会返回 409 needConfirm
+      // （P0 起该冲突校验真正生效：前端页面会弹"班主任冲突"确认框，驱动直接确认覆盖）
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role, realName: u, classId, mustChangePassword: false, profileLocked: true, force: true } });
+      if (r.status !== 201) log('  · 创建账号失败 ' + u + ' ' + JSON.stringify(r.data));
+      if (!r.data || !r.data.user) throw new Error('创建账号失败 ' + u + '：' + JSON.stringify(r.data));
+      created.userIds.push(r.data.user.id);
+      return r.data.user.id;
+    };
+    await mkUser(MON_A, 'monitor', created.classA);
+    await mkUser(MON_B, 'monitor', created.classB);
+    await mkUser(STU, 'student', created.classA);
+    // 任课老师 + 班主任（用于验证"老师端没有点赞排行菜单"）
+    const teaId = await mkUser(TEA, 'teacher', created.classA);
+    const headId = await mkUser(HEAD, 'teacher', created.classA);
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: teaId, classes: [{ classId: created.classA, isHeadTeacher: false }] } });
+    await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: headId, classes: [{ classId: created.classA, isHeadTeacher: true }] } });
+
+    // 点赞：走真实接口（班长可点赞本班；乙班班长给乙班学生点赞）
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: MON_A, password: '123456' } });
+    const l1 = await japi('/api/rollcall/likes', { method: 'POST', body: { classId: created.classA, studentId: A1, subject: '数学', count: 3 } });
+    const l2 = await japi('/api/rollcall/likes', { method: 'POST', body: { classId: created.classA, studentId: A1, subject: '语文', count: 1 } });
+    const l3 = await japi('/api/rollcall/likes', { method: 'POST', body: { classId: created.classA, studentId: A2, subject: '数学', count: 2 } });
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: MON_B, password: '123456' } });
+    const l4 = await japi('/api/rollcall/likes', { method: 'POST', body: { classId: created.classB, studentId: B1, subject: '数学', count: 5 } });
+    check('0) 夹具就绪（2 班 + 4 学生 + 2 班长 + 1 学生 + 老师/班主任 + 4 次点赞）',
+      !!created.gradeId && [l1, l2, l3, l4].every((x) => x.status === 200 || x.status === 201),
+      { l1: l1.status, l2: l2.status, l3: l3.status, l4: l4.status });
+
+    fr.style.width = '1400px'; fr.style.height = '900px';
+
+    // ---------- 1) 班长端入口（导航栏一级菜单 + 签到台按钮） ----------
+    log('\n— A) 班长端入口 —');
+    await asUser(MON_A);
+    await loadPage('/dashboard', '#btnLikeRanking');
+    await sleep(700);
+    check('① 班长端导航栏出现一级菜单「👍 点赞排行」',
+      visible('#navLikesRanking') && /点赞排行/.test(txt('#navLikesRanking')),
+      { text: txt('#navLikesRanking'), visible: visible('#navLikesRanking') });
+    check('① 班长端一级菜单顺序 = 签到操作 → 叫号提醒 → 随机点名 → 点赞排行',
+      (() => {
+        const menus = W().document.getElementById('navbarMenus');
+        const ids = [...menus.children]
+          .filter((n) => n.classList && !n.classList.contains('hidden'))
+          .map((n) => n.id);
+        return JSON.stringify(ids) === JSON.stringify(['navAttendance', 'btnHomework', 'btnAnnouncements', 'btnRollCall', 'navLikesRanking']);
+      })(),
+      (() => {
+        const menus = W().document.getElementById('navbarMenus');
+        return [...menus.children].filter((n) => n.classList && !n.classList.contains('hidden')).map((n) => n.id);
+      })());
+    check('① 菜单项指向 /likes-ranking 且带 active 高亮逻辑（data-path）', (Q('#navLikesRanking').dataset.path || '') === '/likes-ranking', Q('#navLikesRanking').dataset.path);
+    check('① 签到操作台也保留「👍 点赞排行」快捷入口（仅班长）', visible('#btnLikeRanking') && /点赞排行/.test(txt('#btnLikeRanking')));
+    // 从导航栏一级菜单点击进入
+    Q('#navLikesRanking').click();
+    const onPage = await until(() => W().location.pathname === '/likes-ranking' && Q('.page-title'), 12000);
+    await until(() => Qa('#lrBody tr').length > 0, 12000);
+    check('② 点导航栏「点赞排行」→ 打开 /likes-ranking', onPage, W().location.pathname);
+    check('② 统一页头：返回签到 + 标题「👍 点赞排行榜」',
+      /返回签到/.test(txt('#btnBack')) && /点赞排行榜/.test(txt('.page-title')) && !!Q('.container > .page-card'),
+      { back: txt('#btnBack'), title: txt('.page-title') });
+    check('② 导航栏菜单项在当前页高亮（active）', Q('#navLikesRanking').classList.contains('active'), Q('#navLikesRanking').className);
+
+    // ---------- 2) 排行榜内容 ----------
+    log('\n— B) 排行榜内容（班长：本班只读） —');
+    check('③ 只有 2 名同学上榜（无点赞的甲三不上榜、乙班学生不出现）',
+      Qa('#lrBody tr').length === 2 && !/排行榜乙一/.test(txt('#lrBody')) && !/排行榜甲三/.test(txt('#lrBody')),
+      Qa('#lrBody tr').map((tr) => tr.textContent.replace(/\s+/g, ' ').trim()));
+    const rows = Qa('#lrBody tr').map((tr) => [...tr.children].map((td) => td.textContent.trim()));
+    check('③ 按点赞数从高到低（甲一 4 → 甲二 2）',
+      rows[0][1] === '排行榜甲一' && rows[0][3] === '4' && rows[1][1] === '排行榜甲二' && rows[1][3] === '2', rows);
+    check('③ 排名列为 1、2；表头 = 排名/学生姓名/学号/点赞次数',
+      rows[0][0].indexOf('1') >= 0 && rows[1][0].indexOf('2') >= 0 &&
+      JSON.stringify(Qa('.lr-table thead th').map((t) => t.textContent.trim())) === JSON.stringify(['排名', '学生姓名', '学号', '点赞次数']),
+      Qa('.lr-table thead th').map((t) => t.textContent.trim()));
+    check('③ 学号列显示学号', /^LK/.test(rows[0][2]), rows[0][2]);
+    check('④ 时间下拉 = 本周/本月/本学期/全部（默认本月）',
+      JSON.stringify(Qa('#lrPeriod option').map((o) => o.value)) === JSON.stringify(['week', 'month', 'term', 'all']) && Q('#lrPeriod').value === 'month',
+      { opts: Qa('#lrPeriod option').map((o) => o.textContent.trim()), val: Q('#lrPeriod').value });
+    check('⑤ 范围提示 = 本班（夹具甲班）+ 只读', txt('#lrScope').indexOf(CLASS_A) >= 0 && /只读/.test(txt('#lrReadonly')),
+      { scope: txt('#lrScope'), ro: txt('#lrReadonly') });
+
+    // ---------- 3) 学科筛选 ----------
+    log('\n— C) 学科筛选 —');
+    check('④ 学科下拉含「全部学科」+ 学科字典',
+      Qa('#lrSubject option').length > 1 && Qa('#lrSubject option')[0].value === '', Qa('#lrSubject option').map((o) => o.textContent.trim()).slice(0, 4));
+    // 以接口返回为准比对页面渲染（避免"读旧 DOM"）：先按同参数取接口，再切筛选，等 DOM 与接口一致
+    const domRows = () => Qa('#lrBody tr').map((tr) => [...tr.children].map((td) => td.textContent.trim().replace(/^🏅\s*/, '')));
+    async function applyFilter({ subject, period }, label) {
+      const q = new URLSearchParams();
+      q.set('period', period || 'all');
+      if (subject) q.set('subject', subject);
+      const api = await japi('/api/performance/likes?' + q.toString());
+      const exp = (api.data.ranking || []).map((x) => [String(x.rank), x.name, x.studentNo, String(x.likes)]);
+      if (Q('#lrPeriod') && Q('#lrPeriod').value !== (period || 'all')) {
+        Q('#lrPeriod').value = (period || 'all');
+        Q('#lrPeriod').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      }
+      if (Q('#lrSubject') && Q('#lrSubject').value !== (subject || '')) {
+        Q('#lrSubject').value = subject || '';
+        Q('#lrSubject').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      }
+      const ok = await until(() => JSON.stringify(domRows()) === JSON.stringify(exp), 12000);
+      check(label, ok, { exp, got: domRows() });
+      return api.data;
+    }
+    const allData = await applyFilter({ subject: '', period: 'all' }, '④ 全部学科：页面 = 接口（甲一 4 / 甲二 2）');
+    check('④ 全部学科确实包含语文（甲一 4 = 数学3 + 语文1）',
+      allData.ranking[0].name === '排行榜甲一' && allData.ranking[0].likes === 4, allData.ranking.map((x) => `${x.name}=${x.likes}`));
+    const mathData = await applyFilter({ subject: '数学', period: 'all' }, '④ 只看数学：页面 = 接口（甲一 3 / 甲二 2）');
+    check('④ 数学筛选真的过滤掉语文（甲一 3 = 仅数学）',
+      mathData.ranking[0].likes === 3 && mathData.ranking[1].likes === 2, mathData.ranking.map((x) => `${x.name}=${x.likes}`));
+    const chnData = await applyFilter({ subject: '语文', period: 'all' }, '④ 只看语文：页面 = 接口（只有甲一 1 次）');
+    check('④ 语文筛选只剩 1 名学生 1 次',
+      chnData.ranking.length === 1 && chnData.ranking[0].likes === 1, chnData.ranking.map((x) => `${x.name}=${x.likes}`));
+
+    // ---------- 4) 时间筛选 ----------
+    log('\n— D) 时间筛选 —');
+    const w = W();
+    w.__reqs = [];
+    if (!w.__origFetch) w.__origFetch = w.fetch;
+    w.fetch = function (u) { try { w.__reqs.push(String(u)); } catch (_) {} return w.__origFetch.apply(this, arguments); };
+    await applyFilter({ subject: '', period: 'week' }, '④ 本周：页面 = 接口（点赞都是今天发生的）');
+    check('④ 切「本周」→ 请求带 period=week', (w.__reqs || []).some((u) => u.indexOf('period=week') >= 0), (w.__reqs || []).slice(-3));
+    await applyFilter({ subject: '', period: 'term' }, '④ 本学期：页面 = 接口（按学期设置区间统计）');
+    await until(() => /本学期统计区间|请先设置当前学期/.test(txt('#lrTermHint')), 10000);
+    check('④ 切「本学期」→ 请求带 period=term 且显示学期区间提示',
+      (w.__reqs || []).some((u) => u.indexOf('period=term') >= 0) && visible('#lrTermHint') && /本学期/.test(txt('#lrTermHint')),
+      { reqs: (w.__reqs || []).slice(-2), hint: txt('#lrTermHint') });
+    await applyFilter({ subject: '', period: 'all' }, '④ 全部：页面 = 接口');
+    check('④ 四种时间筛选都可用（无错误提示）', !/加载失败/.test(txt('#lrCount')), txt('#lrCount'));
+
+    // ---------- 5) 返回 + 越权 ----------
+    log('\n— E) 返回与越权 —');
+    Q('#btnBack').click();
+    check('② 点「返回签到」→ 回 /dashboard', await until(() => W().location.pathname === '/dashboard', 12000), W().location.pathname);
+
+    await asUser(STU);
+    await loadPage('/dashboard', '#viewAttendance');
+    await sleep(600);
+    check('⑥ 学生端看不到「👍 点赞排行」入口（签到台按钮 + 导航菜单都没有）',
+      hidden('#btnLikeRanking') && hidden('#navLikesRanking'),
+      { btn: visible('#btnLikeRanking'), nav: visible('#navLikesRanking') });
+    const stuRes = await fetch('/likes-ranking', { credentials: 'same-origin', redirect: 'follow' });
+    check('⑥ 学生直接访问 /likes-ranking → 被挡回签到台', new URL(stuRes.url).pathname === '/dashboard', new URL(stuRes.url).pathname);
+
+    // 老师 / 班主任 / 管理员：都不该有「点赞排行」菜单或签到台入口（他们的点赞排名在「课堂表现」）
+    for (const [who, cookie] of [['任课老师', TEA], ['班主任', HEAD], ['管理员', 'admin']]) {
+      await asUser(cookie);
+      await loadPage('/dashboard', '#navbarMenus');
+      await sleep(700);
+      check(`⑥ ${who}端没有「👍 点赞排行」菜单（导航栏 + 签到台按钮都隐藏）`,
+        hidden('#navLikesRanking') && hidden('#btnLikeRanking'),
+        { nav: visible('#navLikesRanking'), btn: visible('#btnLikeRanking') });
+      const res = await fetch('/likes-ranking', { credentials: 'same-origin', redirect: 'follow' });
+      check(`⑥ ${who}直接访问 /likes-ranking → 被挡回签到台`, new URL(res.url).pathname === '/dashboard', new URL(res.url).pathname);
+    }
+    // 老师/管理员的点赞排名仍在「课堂表现」里（接口不受影响）
+    await asUser('admin');
+    const adminLikes = await japi('/api/performance/likes?period=all');
+    check('⑥ 管理员仍可读点赞排名接口（课堂表现用，未受影响）', adminLikes.status === 200 && Array.isArray(adminLikes.data.ranking), adminLikes.status);
+    const adminOpt = await japi('/api/likes/options');
+    check('⑥ 管理员读点赞排行榜筛选项 → 403（该页仅班长端）', adminOpt.status === 403, adminOpt.status);
+
+    // ---------- 清理 ----------
+    log('\n— 清理 —');
+    await hardCleanup();
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^点赞UI[甲乙]班/.test(c.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^lk_/.test(u.username));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^点赞UI年级/.test(g.grade_name || g.gradeName));
+    check('清理：夹具班级/账号/年级已删除（点赞随班级级联清理）',
+      leftClasses.length === 0 && leftUsers.length === 0 && leftGrades.length === 0,
+      { c: leftClasses.length, u: leftUsers.length, g: leftGrades.length });
+    const after = await snapshotReal();
+    check('清理：真实用户/班级/年级数量未变', JSON.stringify(realBefore) === JSON.stringify(after), { before: realBefore, after: after });
+    log('CLASSES=' + [created.classA, created.classB].filter(Boolean).join(','));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

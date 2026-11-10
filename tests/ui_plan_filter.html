@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：计划管理默认只显示「签到中 + 待签到」，已结束默认隐藏
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/ 目录：Copy-Item tests/ui_plan_filter.html public/_ui_plan_filter.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiPlan --virtual-time-budget=45000 --dump-dom `
+         "http://localhost:3000/_ui_plan_filter.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_plan_filter.html
+  说明：脚本创建"未来待签到"与"过去已结束"两个临时计划（过去计划由服务端调度自动置为已结束），
+        结束时通过接口删除；异常中断时用 db/fix_and_clean_test_fixtures.sql 之外的手工清理：
+        DELETE FROM attendance_plans WHERE plan_date < CURRENT_DATE AND class_id IS NULL AND session_id IS NULL;
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1100px; height: 680px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>计划管理：默认只显示「签到中 + 待签到」，已结束默认隐藏</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 12000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { if (await fn()) return true; } catch (_) {}
+    if (Date.now() - t0 > ms) return false;
+    await sleep(120);
+  }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  // cache: 'no-store' —— 驱动会反复轮询同一个 GET（计划状态刚变化就查询），
+  //   若命中浏览器启发式缓存会一直读到旧结果 → "夹具就绪"偶发失败
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (sel) => { const d = F(); return d ? d.querySelector(sel) : null; };
+const Qa = (sel) => { const d = F(); return d ? [...d.querySelectorAll(sel)] : []; };
+const text = (sel) => { const e = Q(sel); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+function setVal(sel, val) {
+  const d = F(); const e = d && d.querySelector(sel); if (!e) return false;
+  e.value = val;
+  e.dispatchEvent(new fr.contentWindow.Event('change', { bubbles: true }));
+  return true;
+}
+// 计划行：状态标签 + 操作按钮 data-id（待签到→删除按钮 / 已结束→补签按钮 / 签到中→无按钮）
+function rows() {
+  return Qa('#planList tr').map((tr) => {
+    const t = tr.textContent.replace(/\s+/g, ' ').trim();
+    const btn = tr.querySelector('[data-id]');
+    return {
+      text: t,
+      id: btn ? Number(btn.dataset.id) : null,
+      status: t.includes('签到中') ? 'active' : (t.includes('待签到') ? 'pending' : (t.includes('已结束') ? 'ended' : '?')),
+      ended: t.includes('已结束'),
+      empty: tr.querySelector('.plan-empty') !== null,
+    };
+  });
+}
+const realRows = () => rows().filter((r) => !r.empty);
+const countInRange = () => {
+  const m = text('#planRangeInfo').match(/共\s*(\d+)\s*条/);
+  return m ? Number(m[1]) : -1;
+};
+
+const pad = (n) => String(n).padStart(2, '0');
+const dayStr = (off) => {
+  const d = new Date(Date.now() + off * 86400000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const NOW = Date.now().toString().slice(-6);
+const pad2 = (n) => String(n).padStart(2, '0');
+// 用不常见的时间避免与真实计划 (plan_date, start_time, class_id) 冲突
+const future = { date: dayStr(3), time: '03:' + pad2(Math.floor(Math.random() * 60)) };
+const past = { date: dayStr(-1), time: '03:' + pad2(Math.floor(Math.random() * 60)) };
+const fids = { pending: null, ended: null };
+let plansBase = 0;
+let basePlanIds = new Set();     // 启动时已存在的计划 id 快照（清理时的白名单护栏）
+
+async function loadPlansView() {
+  fr.src = 'about:blank';
+  await sleep(120);
+  fr.src = '/dashboard?view=plans';
+  await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' && Q('#planStatusFilter'), 15000);
+  await until(() => Qa('#planList tr').length > 0, 10000);
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备：登录 + 造 2 个临时计划（未来=待签到 / 过去=已结束）…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    check('管理员登录成功', lg.status === 200, lg.data);
+    const plansBefore = (await japi('/api/plans')).data.plans || [];
+    plansBase = plansBefore.length;
+    // ⚠ 安全红线（2026-09-29 事故后加固）：清理时只允许删除"本次运行新建、且不在启动快照里"的计划，
+    //   绝不允许按「日期+时间+无班级」这类条件去匹配已有真实计划（曾经因为夹具日期/时间去匹配而误伤过真实数据）
+    basePlanIds = new Set(plansBefore.map((p) => p.id));
+
+    let r = await japi('/api/plans', { method: 'POST', body: { planDate: future.date, startTime: future.time, durationMinutes: 10 } });
+    check('创建未来计划（待签到夹具）', r.status === 201 && r.data.inserted === 1, r.data);
+    r = await japi('/api/plans', { method: 'POST', body: { planDate: past.date, startTime: past.time, durationMinutes: 10 } });
+    check('创建过去计划（已结束夹具）', r.status === 201 && r.data.inserted === 1, r.data);
+
+    // 触发服务端调度（超过 2 小时宽限期的过去计划 → 直接标记为已结束）
+    //   注：v35 起每天有自动签到场次（整天进行中），"没场次才顺手触发计划"的懒执行不再走；
+    //   服务端已改为"有场次时也每 30 秒顺手推进一次计划"，这里等待放宽到 45 秒以覆盖一个节流周期
+    await japi('/api/attendance/status');
+    const gotEnded = await until(async () => {
+      await japi('/api/attendance/status');
+      const d = await japi('/api/plans?status=ended');
+      const list = d.data.plans || [];
+      const p = list.find((x) => x.planDate === past.date && x.startTime === past.time && x.classId === null);
+      if (p) { fids.ended = p.id; return true; }
+      return false;
+    }, 45000);
+    check('过去计划已被服务端置为「已结束」（夹具就绪）', gotEnded, fids.ended);
+    const openList = (await japi('/api/plans?status=open')).data.plans || [];
+    const pend = openList.find((x) => x.planDate === future.date && x.startTime === future.time && x.classId === null);
+    fids.pending = pend ? pend.id : null;
+    check('未来计划处于「待签到」（夹具就绪）', !!fids.pending, fids);
+
+    await loadPlansView();
+
+    // A) 默认：只显示 签到中 + 待签到
+    check('A) 状态筛选默认值 = 签到中 + 待签到（value=open）',
+      (Q('#planStatusFilter') || {}).value === 'open', (Q('#planStatusFilter') || {}).value);
+    check('A) 默认视图没有任何「已结束」行', realRows().every((x) => !x.ended), realRows().map((x) => x.status));
+    check('A) 默认视图看不到已结束夹具（其补签按钮不出现）',
+      !rows().some((x) => x.id === fids.ended), rows().map((x) => x.id));
+    check('A) 默认视图能看到待签到夹具（其删除按钮出现）',
+      rows().some((x) => x.id === fids.pending), { rows: rows().map((x) => x.id), pend: fids.pending });
+    check('A) 列表条数与接口 ?status=open 一致（' + openList.length + ' 条）',
+      countInRange() === openList.length, { ui: countInRange(), api: openList.length });
+
+    // B) 切换「全部」→ 能看到已结束
+    setVal('#planStatusFilter', '');
+    const allShown = await until(() => realRows().some((x) => x.ended) && rows().some((x) => x.id === fids.ended), 10000);
+    check('B) 切换「全部」后能看到已结束计划（含已结束夹具）', allShown, realRows().map((x) => x.status));
+    const allCount = (await japi('/api/plans')).data.plans.length;
+    check('B) 「全部」条数与接口一致（' + allCount + ' 条）', countInRange() === allCount, { ui: countInRange(), api: allCount });
+
+    // C) 切换「已结束」→ 只显示已结束
+    setVal('#planStatusFilter', 'ended');
+    await until(() => realRows().length > 0 && realRows().every((x) => x.ended), 10000);
+    const endedRows = realRows();
+    check('C) 切换「已结束」后所有行都是已结束', endedRows.length > 0 && endedRows.every((x) => x.ended), endedRows.map((x) => x.status));
+    check('C) 「已结束」视图含已结束夹具、不含待签到夹具',
+      rows().some((x) => x.id === fids.ended) && !rows().some((x) => x.id === fids.pending), rows().map((x) => x.id));
+
+    // D) 切换「待签到」→ 只显示待签到
+    setVal('#planStatusFilter', 'pending');
+    await until(() => realRows().length > 0 && realRows().every((x) => x.status === 'pending'), 10000);
+    check('D) 切换「待签到」后所有行都是待签到', realRows().every((x) => x.status === 'pending'), realRows().map((x) => x.status));
+
+    // E) 切回默认 → 又隐藏已结束
+    setVal('#planStatusFilter', 'open');
+    const hiddenAgain = await until(() => realRows().every((x) => !x.ended) && !rows().some((x) => x.id === fids.ended), 10000);
+    check('E) 切回默认后已结束计划重新隐藏', hiddenAgain, realRows().map((x) => x.status));
+
+    // F) 排序：签到中 → 待签到 → 已结束
+    setVal('#planStatusFilter', '');
+    await until(() => realRows().length > 0, 10000);
+    const seq = realRows().map((x) => x.status);
+    const rank = { active: 0, pending: 1, ended: 2 };
+    check('F) 「全部」视图排序：签到中 → 待签到 → 已结束（不交叉）',
+      seq.every((v, i) => i === 0 || rank[seq[i - 1]] <= rank[v]), seq);
+
+    // ---------- 清理 ----------
+    //   兜底：即使中途没查到 id（历史上"夹具就绪"失败会漏 id → 残留计划），
+    //   也按「日期 + 时间 + 无班级」把本次造的两条夹具计划删掉；
+    //   但**必须**同时满足"不在启动快照里"（防止误删同日期/同时间的真实计划）。
+    const allNow = (await japi('/api/plans')).data.plans || [];
+    const mine = allNow.filter((p) => !basePlanIds.has(p.id) && p.classId === null
+      && ((p.planDate === future.date && p.startTime === future.time) || (p.planDate === past.date && p.startTime === past.time)));
+    for (const id of [...new Set([fids.pending, fids.ended, ...mine.map((p) => p.id)].filter((x) => !basePlanIds.has(x)).filter(Boolean))]) {
+      await japi('/api/plans/' + id, { method: 'DELETE' });
+    }
+    const afterAll = (await japi('/api/plans')).data.plans;
+    check('清理：临时计划已删除', !afterAll.some((p) => p.id === fids.pending || p.id === fids.ended || mine.some((m) => m.id === p.id)));
+    check('清理：真实计划数量未变（' + plansBase + ' 条）', afterAll.length === plansBase, { before: plansBase, after: afterAll.length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

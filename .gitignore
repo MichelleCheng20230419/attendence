@@ -1,0 +1,51 @@
+# 依赖与缓存
+server/node_modules/
+.npm-cache/
+
+# 敏感配置（含数据库密码，不入库；已单独备份到 db/backup/）
+server/.env
+
+# 临时产物 / 截图
+server/tmp-*
+server/shot_*.png
+server/dom_*.txt
+server/chrome_*.log
+
+# 数据库备份（独立快照文件）
+db/backup/
+
+# 巡堂记录上传的照片（运行期数据，不入库）
+public/uploads/
+
+# ===== 上传 GitHub / 部署 Zeabur 前的安全排除 =====
+# 以下文件仅保留在本地，绝不推送到远程仓库
+
+# 含真实学生名单、导出表、数据库全量备份（备份包内含真实 .env 与 testdb 导出）
+学生名单.csv
+_exp_class.xlsx
+系统备份_*.zip
+*.zip
+
+# 含明文数据库密码与 SESSION_SECRET 的本地编排文件
+docker-compose.yml
+
+# 本地环境变量（模板文件除外）
+.env
+.env.*
+!.env.example
+!server/.env.example
+
+# 本地运维 / 数据修复脚本：夹带运行期真实数据，且 Zeabur 部署不需要
+db/audit_*.sql
+db/backup_*.sql
+db/check_*.sql
+db/cleanup_*.sql
+db/diag_*.sql
+db/fix_*.sql
+db/repair_*.sql
+db/verify_*.sql
+
+# 本地助手工作记录 / 临时预览文件
+.workbuddy/
+*.genie
+.wbapp_*

@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>叫号管理 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="style.css?v=3.16.0">
+  <style>
+    /* ============================================================
+       叫号管理页样式（卡片式布局）
+       颜色规范：主色 #2563eb / 成功 #10b981 / 警告 #f59e0b / 紧急 #ef4444
+                背景 #f5f7fa / 卡片 #ffffff / 边框 #e8ecf1
+       ============================================================ */
+    :root {
+      --an-primary: #2563eb;
+      --an-primary-dark: #1d4ed8;
+      --an-primary-soft: #eff5ff;
+      --an-ok: #10b981;
+      --an-ok-soft: #e8f9f2;
+      --an-warn: #f59e0b;
+      --an-warn-soft: #fff7e6;
+      --an-danger: #ef4444;
+      --an-danger-soft: #fef2f2;
+      --an-bg: #f5f7fa;
+      --an-card: #ffffff;
+      --an-border: #e8ecf1;
+      --an-text: #1f2937;
+      --an-text-2: #666666;
+      --an-text-3: #9aa3b0;
+      --an-radius: 12px;
+      --an-radius-sm: 8px;
+      --an-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 4px 14px rgba(16, 24, 40, .06);
+      --an-shadow-hover: 0 2px 6px rgba(16, 24, 40, .06), 0 10px 26px rgba(16, 24, 40, .10);
+    }
+    * { box-sizing: border-box; }
+    body { background: var(--an-bg); margin: 0; color: var(--an-text); }
+
+    /* ---------- 顶部栏 ----------
+       页头（返回按钮 + 标题居中 + 右侧操作）现位于统一白色卡片内部（.page-card），
+       栅格（返回左 / 标题居中 / 按钮右）由 style.css 的 .page-head-bar 提供 */
+    .action-bar button {
+      border: 1px solid var(--an-border); background: #fff; color: var(--an-primary); font-size: 15px; font-weight: 700;
+      padding: 9px 16px; border-radius: var(--an-radius-sm); cursor: pointer; transition: all .15s ease; white-space: nowrap;
+    }
+    .action-bar button:hover { background: var(--an-primary-soft); border-color: var(--an-primary); transform: translateY(-1px); }
+    .action-bar button:active { transform: translateY(0); }
+
+    /* ---------- 卡内小节（发布叫号 / 我的叫号列表）----------
+       统一由 .page-card 提供白底/圆角/阴影；小节之间用分隔线区分 */
+    .an-card { padding: 0; }
+    .an-card-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 0 12px;
+      border-bottom: 1px solid var(--an-border);
+      flex-wrap: wrap;
+    }
+    .an-card-head h3 { font-size: 16px; font-weight: 800; margin: 0; color: var(--an-text); display: flex; align-items: center; gap: 8px; }
+    .an-card-head .an-hint { font-size: 13px; font-weight: 400; color: var(--an-text-3); }
+    .an-card-head .spacer { flex: 1; }
+    .an-card-body { padding: 16px 0 0; }
+
+    /* ---------- 发布表单：两列分组 ---------- */
+    .an-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 26px; align-items: start; }
+    .an-col { display: flex; flex-direction: column; gap: 14px; }
+    .an-field { display: flex; flex-direction: column; gap: 6px; position: relative; }
+    .an-field > label { font-size: 13px; color: var(--an-text-2); font-weight: 600; letter-spacing: .2px; }
+    .an-field .req { color: var(--an-danger); margin-left: 3px; }
+    .an-field input[type="text"],
+    .an-field input[type="date"],
+    .an-field input[type="time"],
+    .an-field select,
+    .an-field textarea {
+      font-size: 14px; color: var(--an-text); padding: 10px 12px; border: 1px solid var(--an-border);
+      border-radius: var(--an-radius-sm); background: #fff; font-family: inherit; width: 100%;
+      transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+    }
+    .an-field input::placeholder, .an-field textarea::placeholder { color: #b6bec9; }
+    .an-field input:hover, .an-field select:hover, .an-field textarea:hover { border-color: #cfd8e3; }
+    .an-field input:focus, .an-field select:focus, .an-field textarea:focus {
+      outline: none; border-color: var(--an-primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, .14); background: #fff;
+    }
+    .an-field textarea { resize: vertical; min-height: 44px; }
+    .an-datetime { display: grid; grid-template-columns: 1.25fr 1fr; gap: 10px; }
+    .an-field .an-msg { font-size: 12px; color: var(--an-text-3); min-height: 16px; }
+    .an-field .an-msg.ok { color: var(--an-ok); font-weight: 600; }
+
+    /* 学生搜索候选下拉 */
+    .an-suggest {
+      position: absolute; top: 100%; left: 0; right: 0; z-index: 30; background: #fff;
+      border: 1px solid var(--an-border); border-radius: var(--an-radius-sm);
+      box-shadow: 0 10px 26px rgba(16, 24, 40, .14); max-height: 232px; overflow: auto; margin-top: 4px; padding: 4px;
+    }
+    .an-suggest.hidden { display: none; }
+    .an-suggest div { padding: 9px 12px; font-size: 14px; cursor: pointer; border-radius: 6px; color: var(--an-text); }
+    .an-suggest div:hover, .an-suggest div.active { background: var(--an-primary-soft); color: var(--an-primary-dark); }
+    .an-suggest .an-sug-no { color: var(--an-text-3); font-size: 13px; margin-left: 8px; }
+
+    /* 表单底部操作区 */
+    .an-form-actions {
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+      margin-top: 20px; padding: 16px 22px 0; border-top: 1px dashed var(--an-border);
+    }
+    .an-check { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; color: var(--an-danger); cursor: pointer; }
+    .an-check input { width: 17px; height: 17px; accent-color: var(--an-danger); cursor: pointer; }
+    .an-check:has(input:checked) {
+      border: 1px solid var(--an-danger); background: var(--an-danger-soft);
+      border-radius: 999px; padding: 5px 12px 5px 10px;
+    }
+    .an-btn {
+      border: 1px solid transparent; border-radius: var(--an-radius-sm); font-size: 14px; font-weight: 700;
+      padding: 10px 22px; cursor: pointer; transition: all .15s ease; font-family: inherit;
+    }
+    .an-btn:disabled { cursor: not-allowed; opacity: .55; }
+    /* 主按钮：蓝色实心，悬停加深 */
+    .an-btn-primary { background: var(--an-primary); color: #fff; box-shadow: 0 2px 8px rgba(37, 99, 235, .28); }
+    .an-btn-primary:not(:disabled):hover { background: var(--an-primary-dark); box-shadow: 0 4px 14px rgba(37, 99, 235, .34); transform: translateY(-1px); }
+    .an-btn-primary:not(:disabled):active { transform: translateY(0); }
+    /* 次按钮：白底描边 */
+    .an-btn-ghost { background: #fff; border-color: var(--an-border); color: var(--an-text-2); }
+    .an-btn-ghost:hover { border-color: var(--an-primary); color: var(--an-primary); background: var(--an-primary-soft); }
+
+    /* ---------- 列表卡片 ---------- */
+    .an-count { font-size: 13px; color: var(--an-text-3); }
+    .an-count b { color: var(--an-text); font-weight: 800; }
+    .an-count .pend { color: var(--an-warn); font-weight: 800; }
+    .an-filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .an-filters .an-field { flex-direction: row; align-items: center; gap: 6px; }
+    .an-filters .an-field > label { font-size: 13px; color: var(--an-text-2); white-space: nowrap; }
+    .an-filters select, .an-filters input[type="date"] {
+      font-size: 13px; padding: 8px 10px; border: 1px solid var(--an-border); border-radius: var(--an-radius-sm);
+      background: #fff; color: var(--an-text); font-family: inherit; transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .an-filters select:focus, .an-filters input[type="date"]:focus {
+      outline: none; border-color: var(--an-primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, .14);
+    }
+
+    .an-table-wrap { overflow-x: auto; }
+    table.an-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; min-width: 760px; }
+    table.an-table thead th {
+      position: sticky; top: 0; z-index: 1; background: #f0f7ff; color: #1e40af; font-weight: 800;
+      text-align: left; padding: 12px 16px; white-space: nowrap; border-bottom: 1px solid var(--an-border);
+    }
+    table.an-table thead th:first-child { border-top-left-radius: 0; }
+    table.an-table tbody td { padding: 12px 16px; border-bottom: 1px solid #f1f4f9; vertical-align: middle; color: var(--an-text); }
+    table.an-table tbody tr { transition: background .15s ease; }
+    table.an-table tbody tr:hover { background: #f5f9ff; }
+    table.an-table tbody tr:last-child td { border-bottom: none; }
+    table.an-table tbody tr.urgent { background: #fff7f7; box-shadow: inset 3px 0 0 var(--an-danger); }
+    table.an-table tbody tr.urgent:hover { background: var(--an-danger-soft); }
+    .an-stu { font-weight: 700; }
+    .an-stu-no { color: var(--an-text-3); font-size: 12px; margin-left: 6px; font-weight: 400; }
+    .an-loc-cell { color: #0f766e; font-weight: 600; }
+    .an-when { color: var(--an-text-2); }
+
+    /* 状态标签 */
+    .an-tag {
+      display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 999px;
+      font-size: 12px; font-weight: 700; line-height: 1.6; white-space: nowrap;
+    }
+    .an-tag.pending { background: var(--an-warn-soft); color: #b45309; border: 1px solid #fde3b3; }
+    .an-tag.processed { background: var(--an-ok-soft); color: #047857; border: 1px solid #b9ebd5; }
+    .an-tag.urgent { background: var(--an-danger-soft); color: var(--an-danger); border: 1px solid #fdc9c9; }
+    .an-tag.played { background: transparent; color: var(--an-primary); border: 1px solid transparent; font-weight: 600; padding: 3px 4px; }
+
+    /* 操作列：文字按钮 */
+    .an-ops { display: flex; align-items: center; gap: 14px; }
+    .an-op {
+      border: none; background: transparent; color: var(--an-primary); font-size: 14px; font-weight: 700;
+      padding: 4px 2px; cursor: pointer; font-family: inherit; border-radius: 6px; transition: all .15s ease;
+    }
+    .an-op:hover { color: var(--an-primary-dark); text-decoration: underline; }
+    .an-op.danger { color: var(--an-danger); }
+    .an-op.danger:hover { color: #b91c1c; }
+
+    /* 空状态 */
+    .an-empty { padding: 46px 20px 52px; text-align: center; color: var(--an-text-3); }
+    .an-empty svg { width: 92px; height: 92px; display: block; margin: 0 auto 14px; opacity: .95; }
+    .an-empty .an-empty-title { font-size: 15px; font-weight: 700; color: #8b95a5; }
+    .an-empty .an-empty-sub { font-size: 13px; margin-top: 6px; color: #aeb6c2; }
+
+    /* 提示条 */
+    .an-toast {
+      position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%) translateY(8px);
+      background: rgba(31, 41, 55, .95); color: #fff; font-size: 14px; padding: 12px 22px; border-radius: 10px;
+      z-index: 60; transition: opacity .2s ease, transform .2s ease; box-shadow: 0 8px 24px rgba(16, 24, 40, .22);
+    }
+    .an-toast.hidden { opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(16px); }
+
+    /* 详情弹窗 */
+    .an-modal-mask {
+      position: fixed; inset: 0; background: rgba(15, 23, 42, .48); display: flex; align-items: center;
+      justify-content: center; z-index: 80; padding: 16px; backdrop-filter: blur(2px);
+    }
+    .an-modal-mask.hidden { display: none; }
+    .an-modal {
+      background: #fff; border-radius: 14px; width: min(540px, 94vw); box-shadow: 0 24px 60px rgba(16, 24, 40, .28);
+      animation: anModalIn .18s ease; overflow: hidden;
+    }
+    @keyframes anModalIn { from { opacity: 0; transform: translateY(10px) scale(.99); } to { opacity: 1; transform: none; } }
+    .an-modal h3 { margin: 0; font-size: 16px; font-weight: 800; padding: 18px 24px 14px; border-bottom: 1px solid var(--an-border); }
+    .an-modal dl { margin: 0; padding: 18px 24px; display: grid; grid-template-columns: 96px 1fr; gap: 12px 14px; font-size: 14px; }
+    .an-modal dt { color: var(--an-text-2); font-weight: 600; }
+    .an-modal dd { margin: 0; word-break: break-all; color: var(--an-text); }
+    .an-modal .an-modal-actions { display: flex; justify-content: flex-end; gap: 12px; padding: 0 24px 20px; }
+
+    /* ---------- 响应式 ---------- */
+    @media (max-width: 1024px) {
+      .an-form-grid { grid-template-columns: 1fr; }   /* 平板：表单自动换行（单列堆叠） */
+      .an-card-head { align-items: flex-start; }
+      .an-filters { width: 100%; }
+    }
+    @media (max-width: 720px) {
+      .action-bar button { font-size: 13px; padding: 8px 12px; }
+      .an-card-body { padding: 14px 0 0; }
+      .an-form-actions { padding: 14px 0 0; }
+      .an-datetime { grid-template-columns: 1fr; }
+      .an-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }  /* 手机：表格左右滑动 */
+      table.an-table { min-width: 720px; }
+      .an-modal dl { grid-template-columns: 80px 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头（卡片内部）：返回(左) · 标题居中 · 功能按钮(右) -->
+      <div class="page-head-bar">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+        <h2 class="page-title">📢 叫号管理</h2>
+        <div class="action-bar">
+          <button id="btnRefresh" class="btn btn-secondary">↻ 刷新</button>
+        </div>
+      </div>
+
+    <!-- 小节一：发布叫号 -->
+    <section class="an-card" id="anPublishCard">
+      <div class="an-card-head">
+        <h3>📝 发布叫号</h3>
+        <span class="an-hint">发布后班长端会实时收到并语音播报</span>
+      </div>
+      <div class="an-card-body">
+        <div class="an-form-grid">
+          <!-- 左列：班级 / 学生 -->
+          <div class="an-col">
+            <div class="an-field">
+              <label for="anClass">班级<span class="req">*</span></label>
+              <select id="anClass"></select>
+            </div>
+            <div class="an-field">
+              <label for="anStudent">学生<span class="req">*</span>（可搜索姓名 / 学号）</label>
+              <input type="text" id="anStudent" placeholder="输入姓名或学号搜索" autocomplete="off">
+              <input type="hidden" id="anStudentId">
+              <div class="an-suggest hidden" id="anSuggest"></div>
+              <span class="an-msg" id="anStudentMsg">未选择学生</span>
+            </div>
+          </div>
+          <!-- 右列：到何处 / 何时 / 备注 -->
+          <div class="an-col">
+            <div class="an-field">
+              <label for="anLocation">到何处<span class="req">*</span></label>
+              <input type="text" id="anLocation" maxlength="100" placeholder="如：教务处 / 班主任办公室">
+            </div>
+            <div class="an-field">
+              <label for="anDate">何时<span class="req">*</span></label>
+              <div class="an-datetime">
+                <input type="date" id="anDate" title="日期">
+                <input type="time" id="anTime" title="时间">
+              </div>
+            </div>
+            <div class="an-field">
+              <label for="anNote">备注</label>
+              <textarea id="anNote" maxlength="500" rows="1" placeholder="可填写事由（选填）"></textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="an-form-actions">
+        <label class="an-check"><input type="checkbox" id="anUrgent"> ⚡ 紧急</label>
+        <button class="an-btn an-btn-primary" id="anSubmit">发布叫号</button>
+        <span class="an-msg" id="anPublishMsg"></span>
+      </div>
+    </section>
+
+    <!-- 卡片二：我发布的叫号 -->
+    <section class="an-card" id="anListCard">
+      <div class="an-card-head">
+        <h3>📋 我发布的叫号</h3>
+        <span class="an-count" id="anCount">—</span>
+        <span class="spacer"></span>
+        <div class="an-filters">
+          <div class="an-field">
+            <label for="anFilterStatus">状态</label>
+            <select id="anFilterStatus">
+              <option value="">全部</option>
+              <option value="pending">待处理</option>
+              <option value="processed">已处理</option>
+            </select>
+          </div>
+          <div class="an-field">
+            <label for="anFilterDate">日期</label>
+            <input type="date" id="anFilterDate">
+          </div>
+          <button class="an-btn an-btn-ghost" id="anFilterReset">重置</button>
+        </div>
+      </div>
+      <div class="an-table-wrap">
+        <table class="an-table">
+          <thead>
+            <tr>
+              <th style="width:150px">时间</th>
+              <th style="width:130px">班级</th>
+              <th>学生姓名</th>
+              <th style="width:170px">到何处</th>
+              <th style="width:150px">何时</th>
+              <th style="width:130px">状态</th>
+              <th style="width:130px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="anBody"></tbody>
+        </table>
+      </div>
+    </section>
+    </section><!-- /.page-card -->
+  </div>
+
+  <div id="anToast" class="an-toast hidden"></div>
+
+  <!-- 详情弹窗 -->
+  <div class="an-modal-mask hidden" id="anDetailMask">
+    <div class="an-modal">
+      <h3 id="anDetailTitle">叫号详情</h3>
+      <dl id="anDetailBody"></dl>
+      <div class="an-modal-actions">
+        <button class="an-btn an-btn-ghost" id="anDetailClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="announcements.js?v=3.5.2"></script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>记录问题 - 巡堂记录 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 巡堂记录：创建问题页（统一页面卡片模板） */
+    .form-row { margin-bottom: 16px; }
+    .form-row > label { display: block; font-size: 13px; font-weight: 600; color: var(--text-light); margin-bottom: 6px; }
+    .form-row input[type="date"], .form-row select, .form-row textarea {
+      width: 100%; font-size: 14px; padding: 10px 12px; border: 1px solid var(--border);
+      border-radius: 8px; background: #fff; font-family: inherit; color: var(--text); outline: none;
+    }
+    .form-row textarea { min-height: 110px; resize: vertical; line-height: 1.6; }
+    .form-row input:focus, .form-row select:focus, .form-row textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(74,144,217,.14); }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; }
+    .req { color: var(--danger); margin-left: 3px; }
+
+    .photo-hint { font-size: 12px; color: var(--text-light); margin-top: 6px; }
+    .photo-box { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+    .photo-item { position: relative; width: 96px; height: 96px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: #f5f7fa; }
+    .photo-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .photo-item .rm {
+      position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%;
+      border: none; background: rgba(17,24,39,.6); color: #fff; cursor: pointer; font-size: 12px; line-height: 1;
+    }
+    .photo-add {
+      width: 96px; height: 96px; border: 1px dashed var(--border); border-radius: 10px; background: #fff;
+      color: var(--text-light); font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    }
+    .photo-add:hover { border-color: var(--primary); color: var(--primary); }
+    #photoInput { display: none; }
+
+    .form-actions { display: flex; gap: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+    .err-box { border-radius: 10px; padding: 10px 14px; font-size: 13px; margin-bottom: 14px; border: 1px solid #FFCCC7; background: #FFF1F0; color: #CF1322; }
+    .deny-tip { border-radius: 10px; padding: 12px 16px; font-size: 14px; border: 1px solid #FFE58F; background: #FFFBE6; color: #AD6800; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头：返回巡堂记录(左) · 标题居中 -->
+      <div class="page-head">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回巡堂记录</button>
+        <h2 class="page-title">➕ 记录问题</h2>
+      </div>
+
+      <div id="denyTip" class="deny-tip hidden">🔒 你的账号没有「记录问题」权限，请联系管理员在「小组管理」中授权。</div>
+      <div id="errBox" class="err-box hidden"></div>
+
+      <form id="issueForm" autocomplete="off">
+        <div class="form-grid">
+          <div class="form-row">
+            <label>日期<span class="req">*</span></label>
+            <input type="date" id="fIssueDate" required>
+          </div>
+          <div class="form-row">
+            <label>年级<span class="req">*</span></label>
+            <select id="fGrade"><option value="">请选择年级</option></select>
+          </div>
+          <div class="form-row">
+            <label>班级<span class="req">*</span></label>
+            <select id="fClass" disabled><option value="">请先选择年级</option></select>
+          </div>
+          <div class="form-row">
+            <label>问题类型</label>
+            <select id="fCategory"></select>
+          </div>
+          <div class="form-row">
+            <label>紧急程度</label>
+            <select id="fPriority"></select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>问题描述<span class="req">*</span></label>
+          <textarea id="fDescription" maxlength="2000" placeholder="请填写巡堂发现的问题..."></textarea>
+        </div>
+
+        <div class="form-row">
+          <label>照片上传（支持多张，JPG/PNG，每张 ≤ 5MB，最多 9 张）</label>
+          <input type="file" id="photoInput" accept="image/jpeg,image/png" multiple>
+          <div class="photo-box" id="photoBox">
+            <button type="button" class="photo-add" id="btnAddPhoto" title="选择照片">＋</button>
+          </div>
+          <div class="photo-hint" id="photoHint">尚未选择照片</div>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="btnSubmit">提交</button>
+          <button type="button" class="btn btn-secondary" id="btnCancel">取消</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/inspection-common.js?v=3.12.0"></script>
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/inspection-new.js?v=3.13.0"></script>
+</body>
+</html>

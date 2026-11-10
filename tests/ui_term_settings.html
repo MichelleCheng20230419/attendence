@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：学期设置（系统管理 → 学年管理 → 学期设置）
+  验证点：
+    ① 学年管理页新增「学期设置」卡片：上下学期起止日期 + 当前学期 + 保存/默认值/清空
+    ② 未配置时卡片给出「请先设置学期起止日期」提示；可一键「填入默认值」
+    ③ 保存后卡片显示已设置 + 实际统计区间（走 PUT /api/settings/term）
+    ④ 保存校验：开始晚于结束时报错且不落库
+    ⑤ 考勤分析选「本学期」→ 提示条显示配置区间，且请求真的带上配置的 startDate/endDate
+    ⑥ 巡查面板选「本学期」→ 统计范围带配置区间（未配置时提示去设置）
+    ⑦ 课堂表现选「本学期」→ 提示条显示配置区间（未配置时提示去设置）
+    ⑧ 清理：恢复原学期设置
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_term_settings.html public/_ui_term_settings.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir="$env:TEMP\uiTerm" --virtual-time-budget=400000 --dump-dom `
+         "http://localhost:3000/_ui_term_settings.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_term_settings.html
+  注意：本驱动会临时改写真实学期设置，结束时按快照还原。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>学期设置（学年管理 → 学期设置 → 各页面「本学期」口径）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const rect = (s) => { const e = Q(s); return e ? e.getBoundingClientRect() : null; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#btnBack') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(1000);
+}
+// 在 iframe 里劫持 fetch，记录页面发出的请求 URL（用于验证「本学期」真的带了配置日期）
+function hookFetch() {
+  const w = W();
+  w.__reqs = [];
+  if (!w.__origFetch) w.__origFetch = w.fetch;
+  w.fetch = function (u) { try { w.__reqs.push(String(u)); } catch (_) {} return w.__origFetch.apply(this, arguments); };
+}
+function setInputs(cfg) {
+  const d = F();
+  d.getElementById('termFirstStart').value = cfg.firstStart;
+  d.getElementById('termFirstEnd').value = cfg.firstEnd;
+  d.getElementById('termSecondStart').value = cfg.secondStart;
+  d.getElementById('termSecondEnd').value = cfg.secondEnd;
+  d.getElementById('termCurrent').value = cfg.currentTerm;
+}
+const CFG1 = { firstStart: '2020-01-01', firstEnd: '2020-06-30', secondStart: '2020-07-01', secondEnd: '2020-12-31', currentTerm: 'first' };
+
+let snapshot = null;   // 原始学期设置（结束时还原）
+
+async function restore() {
+  if (!snapshot) return;
+  const t = snapshot;
+  await japi('/api/settings/term', {
+    method: 'PUT',
+    body: { firstStart: t.firstStart || '', firstEnd: t.firstEnd || '', secondStart: t.secondStart || '', secondEnd: t.secondEnd || '', currentTerm: t.currentTerm || 'first' },
+  });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备（登录 + 快照学期设置）…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const s0 = (await japi('/api/settings')).data;
+    snapshot = s0.term;
+    check('0) 已取到学期设置快照（term + termDefaults）', !!s0.term && !!s0.termDefaults, { term: s0.term });
+    // 先清空 → 制造「未配置」状态用于验证提示
+    await japi('/api/settings/term', { method: 'PUT', body: { firstStart: '', firstEnd: '', secondStart: '', secondEnd: '', currentTerm: 'first' } });
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+
+    // ---------- 1) 学年管理页：学期设置卡片 ----------
+    log('\n— /admin/academic-year-management 学期设置卡片 —');
+    await loadPage('/admin/academic-year-management');
+    check('① 页内有「学期设置」卡片（.year-card 含 h3 学期设置）',
+      Qa('.year-card h3').some((h) => h.textContent.includes('学期设置')), Qa('.year-card h3').map((h) => h.textContent.trim()));
+    check('① 上学期/下学期各两个日期输入 + 当前学期下拉',
+      !!Q('#termFirstStart') && !!Q('#termFirstEnd') && !!Q('#termSecondStart') && !!Q('#termSecondEnd') && !!Q('#termCurrent'),
+      { a: !!Q('#termFirstStart'), b: !!Q('#termFirstEnd'), c: !!Q('#termSecondStart'), d: !!Q('#termSecondEnd'), e: !!Q('#termCurrent') });
+    check('① 当前学期下拉 = 上学期/下学期 两项',
+      Qa('#termCurrent option').map((o) => o.value).join(',') === 'first,second', Qa('#termCurrent option').map((o) => o.value));
+    check('① 有「保存学期设置 / 填入默认值 / 清空」三个按钮',
+      !!Q('#btnSaveTerm') && !!Q('#btnTermDefault') && !!Q('#btnTermClear'),
+      { save: !!Q('#btnSaveTerm'), def: !!Q('#btnTermDefault'), clr: !!Q('#btnTermClear') });
+    check('① 同一行的两个日期输入对齐（上学期 开始/结束 同一水平线）',
+      (() => { const a = rect('#termFirstStart'), b = rect('#termFirstEnd');
+        return !!a && !!b && Math.abs(a.top - b.top) <= 2 && a.right <= b.left; })(),
+      { a: rect('#termFirstStart') && Math.round(rect('#termFirstStart').top), b: rect('#termFirstEnd') && Math.round(rect('#termFirstEnd').top) });
+    check('① 学期设置卡片可见（在统一白卡内）', visible('#termStatus') && !!Q('.page-card #termStatus'), { status: txt('#termStatus') });
+    check('② 未配置时提示「请先设置当前学期…起止日期」且为警告样式',
+      /请先设置当前学期/.test(txt('#termStatus')) && Q('#termStatus').classList.contains('warn'),
+      { text: txt('#termStatus'), cls: Q('#termStatus').className });
+    check('② 未配置时四个日期输入为空', ['#termFirstStart', '#termFirstEnd', '#termSecondStart', '#termSecondEnd'].every((id) => !Q(id).value),
+      ['#termFirstStart', '#termFirstEnd', '#termSecondStart', '#termSecondEnd'].map((id) => Q(id).value));
+
+    // 「填入默认值」按钮
+    Q('#btnTermDefault').click();
+    await sleep(250);
+    const defs = (await japi('/api/settings')).data.termDefaults;
+    check('② 点「填入默认值」→ 四个日期按默认口径填入（上学期 9/1~次年 1/31、下学期 2/1~7/15）',
+      Q('#termFirstStart').value === defs.firstStart && Q('#termFirstEnd').value === defs.firstEnd
+      && Q('#termSecondStart').value === defs.secondStart && Q('#termSecondEnd').value === defs.secondEnd,
+      { ui: [Q('#termFirstStart').value, Q('#termFirstEnd').value, Q('#termSecondStart').value, Q('#termSecondEnd').value], defs });
+    check('② 「填入默认值」提示需先保存才生效', /保存/.test(txt('#termMsg')), txt('#termMsg'));
+
+    // 保存校验：开始晚于结束
+    setInputs({ firstStart: '2020-06-30', firstEnd: '2020-01-01', secondStart: '', secondEnd: '', currentTerm: 'first' });
+    Q('#btnSaveTerm').click();
+    await until(() => /失败/.test(txt('#termMsg')), 8000);
+    const afterBad = await japi('/api/term');
+    check('④ 开始晚于结束 → 页面报错「开始日期不能晚于结束日期」',
+      /开始日期不能晚于结束日期/.test(txt('#termMsg')), txt('#termMsg'));
+    check('④ 校验失败时未落库（仍为未配置）', afterBad.data.configured === false, afterBad.data);
+
+    // 正常保存（走 UI）
+    setInputs(CFG1);
+    Q('#btnSaveTerm').click();
+    const savedOk = await until(() => /已设置/.test(txt('#termStatus')), 10000);
+    const t1 = (await japi('/api/term')).data;
+    check('③ 点「保存学期设置」→ 卡片变为已设置（ok 样式）', savedOk && Q('#termStatus').classList.contains('ok'), { text: txt('#termStatus'), cls: Q('#termStatus').className });
+    check('③ 接口确认：configured=true，区间 = 2020-01-01 ~ 2020-06-30',
+      t1.configured === true && t1.startDate === '2020-01-01' && t1.endDate === '2020-06-30', t1);
+    check('③ 卡片文案含实际统计区间（2020-01-01 ~ 2020-06-30）', /2020-01-01 ~ 2020-06-30/.test(txt('#termStatus')), txt('#termStatus'));
+    check('③ 保存成功提示', /已保存/.test(txt('#termMsg')), txt('#termMsg'));
+
+    // ---------- 2) 考勤分析：本学期按配置统计 ----------
+    log('\n— /attendance-analysis 本学期（已配置） —');
+    await loadPage('/attendance-analysis');
+    hookFetch();
+    Q('[data-t="semester"]').click();
+    await until(() => /2020-01-01/.test(txt('#termHint')), 10000);
+    check('⑤ 选「本学期」→ 提示条显示配置区间（来自学期设置）',
+      visible('#termHint') && /2020-01-01 ~ 2020-06-30/.test(txt('#termHint')), txt('#termHint'));
+    check('⑤ 已配置时不显示「未设置」警告', !Q('#termHint').classList.contains('warn'), Q('#termHint').className);
+    check('⑤ 页面请求真的带上了配置的 startDate/endDate',
+      (W().__reqs || []).some((u) => u.includes('startDate=2020-01-01') && u.includes('endDate=2020-06-30')),
+      (W().__reqs || []).slice(-4));
+    check('⑤ 页面内 getRange() 与本学期配置一致',
+      (() => { const r = W().getRange(); return r.startDate === '2020-01-01' && r.endDate === '2020-06-30'; })(), W().getRange && W().getRange());
+    Q('#btnExport').click();
+    await sleep(300);
+    Qa('#exportModal [data-quick]').find((b) => b.dataset.quick === 'semester').click();
+    await sleep(250);
+    check('⑤ 导出弹窗点「本学期」→ 起止日期 = 配置区间',
+      Q('#exStart').value === '2020-01-01' && Q('#exEnd').value === '2020-06-30', { s: Q('#exStart').value, e: Q('#exEnd').value });
+
+    // 未配置时：提示去设置
+    log('\n— /attendance-analysis 本学期（未配置） —');
+    await japi('/api/settings/term', { method: 'PUT', body: { firstStart: '', firstEnd: '', secondStart: '', secondEnd: '', currentTerm: 'first' } });
+    await loadPage('/attendance-analysis');
+    Q('[data-t="semester"]').click();
+    await until(() => /请先设置当前学期/.test(txt('#termHint')), 10000);
+    check('⑥ 未配置时选「本学期」→ 提示「请先设置当前学期…起止日期」',
+      /请先设置当前学期/.test(txt('#termHint')) && Q('#termHint').classList.contains('warn')
+      && /系统管理 → 学年管理 → 学期设置/.test(txt('#termHint')), { text: txt('#termHint'), cls: Q('#termHint').className });
+    check('⑥ 未配置时仍可统计（默认口径区间非空）',
+      (() => { const r = W().getRange(); return !!r.startDate && !!r.endDate && /^\d{4}-\d{2}-\d{2}$/.test(r.startDate); })(), W().getRange && W().getRange());
+
+    // ---------- 3) 巡查面板 ----------
+    log('\n— /inspection/panel 本学期 —');
+    await loadPage('/inspection/panel', '#pRange');
+    const optTerm = Qa('#pRange option').some((o) => o.value === 'term');
+    if (optTerm) {
+      Q('#pRange').value = 'term';
+      Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      await until(() => /请先设置当前学期/.test(txt('#filterNote')), 10000);
+      check('⑦ 未配置时巡查面板选「本学期」→ 统计范围提示去设置（警告样式）',
+        /请先设置当前学期/.test(txt('#filterNote')) && Q('#filterNote').classList.contains('warn'),
+        { text: txt('#filterNote'), cls: Q('#filterNote').className });
+    } else { skip('⑦ 巡查面板本学期入口', '当前账号无巡堂页面权限'); }
+
+    await japi('/api/settings/term', { method: 'PUT', body: CFG1 });
+    await loadPage('/inspection/panel', '#pRange');
+    if (Qa('#pRange option').some((o) => o.value === 'term')) {
+      Q('#pRange').value = 'term';
+      Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      await until(() => /2020-01-01/.test(txt('#filterNote')), 10000);
+      check('⑦ 已配置时巡查面板选「本学期」→ 统计范围 = 配置区间',
+        /2020-01-01/.test(txt('#filterNote')) && /2020-06-30/.test(txt('#filterNote')) && !Q('#filterNote').classList.contains('warn'),
+        { text: txt('#filterNote'), cls: Q('#filterNote').className });
+    } else { skip('⑦ 巡查面板本学期区间', '当前账号无巡堂页面权限'); }
+
+    // ---------- 4) 课堂表现 ----------
+    log('\n— /performance 本学期 —');
+    await loadPage('/performance', '#pfTermHint');
+    hookFetch();
+    Q('[data-period="term"]').click();
+    await until(() => /2020-01-01/.test(txt('#pfTermHint')), 12000);
+    check('⑧ 已配置时课堂表现选「本学期」→ 提示条显示配置区间',
+      visible('#pfTermHint') && /2020-01-01 ~ 2020-06-30/.test(txt('#pfTermHint')) && !Q('#pfTermHint').classList.contains('warn'),
+      { text: txt('#pfTermHint'), cls: Q('#pfTermHint').className });
+    check('⑧ 课堂表现请求带上了配置的 term 窗口（period=term）',
+      (W().__reqs || []).some((u) => u.includes('period=term')), (W().__reqs || []).slice(-4));
+
+    await japi('/api/settings/term', { method: 'PUT', body: { firstStart: '', firstEnd: '', secondStart: '', secondEnd: '', currentTerm: 'first' } });
+    await loadPage('/performance', '#pfTermHint');
+    Q('[data-period="term"]').click();
+    await until(() => /请先设置当前学期/.test(txt('#pfTermHint')), 12000);
+    check('⑧ 未配置时课堂表现提示去设置（警告样式）',
+      /请先设置当前学期/.test(txt('#pfTermHint')) && Q('#pfTermHint').classList.contains('warn'),
+      { text: txt('#pfTermHint'), cls: Q('#pfTermHint').className });
+
+    // ---------- 5) 只填「当前学期」（管理员最常见的填法）也要同步 ----------
+    log('\n— 只填上学期（当前学期）→ 各页面同步 —');
+    const CFG_ONE = { firstStart: '2026-09-01', firstEnd: '2027-01-30', secondStart: '', secondEnd: '', currentTerm: 'first' };
+    await japi('/api/settings/term', { method: 'PUT', body: CFG_ONE });
+    await loadPage('/admin/academic-year-management');
+    const okOne = await until(() => /已设置/.test(txt('#termStatus')), 10000);
+    check('⑨ 只填上学期也判为「已设置」（不再一直提示未设置）',
+      okOne && Q('#termStatus').classList.contains('ok') && /2026-09-01/.test(txt('#termStatus')), { text: txt('#termStatus'), cls: Q('#termStatus').className });
+    check('⑨ 提示各页面实际统计区间（截到今天）+ 未填学期提醒',
+      /2026-09-01 ~ \d{4}-\d{2}-\d{2}/.test(txt('#termStatus')) && /2027-01-30/.test(txt('#termStatus')) && /下学期/.test(txt('#termStatus')),
+      txt('#termStatus'));
+
+    await loadPage('/attendance-analysis');
+    Q('[data-t="semester"]').click();
+    await until(() => /2026-09-01/.test(txt('#termHint')), 10000);
+    check('⑨ 考勤分析「本学期」同步为 2026-09-01 起（无警告）',
+      /2026-09-01/.test(txt('#termHint')) && !Q('#termHint').classList.contains('warn'), { text: txt('#termHint'), cls: Q('#termHint').className });
+
+    await loadPage('/inspection/panel', '#pRange');
+    if (Qa('#pRange option').some((o) => o.value === 'term')) {
+      Q('#pRange').value = 'term';
+      Q('#pRange').dispatchEvent(new (W().Event)('change', { bubbles: true }));
+      await until(() => /2026-09-01/.test(txt('#filterNote')), 10000);
+      check('⑨ 巡查面板「本学期」同步为 2026-09-01（无警告）',
+        /2026-09-01/.test(txt('#filterNote')) && !Q('#filterNote').classList.contains('warn'), { text: txt('#filterNote'), cls: Q('#filterNote').className });
+    } else { skip('⑨ 巡查面板同步', '当前账号无巡堂页面权限'); }
+
+    await loadPage('/performance', '#pfTermHint');
+    Q('[data-period="term"]').click();
+    await until(() => /2026-09-01/.test(txt('#pfTermHint')), 12000);
+    check('⑨ 课堂表现「本学期」同步为 2026-09-01（无警告）',
+      /2026-09-01/.test(txt('#pfTermHint')) && !Q('#pfTermHint').classList.contains('warn'), { text: txt('#pfTermHint'), cls: Q('#pfTermHint').className });
+
+    // 当前学期换成下学期但没填下学期日期 → 提示去设置
+    await japi('/api/settings/term', { method: 'PUT', body: { ...CFG_ONE, currentTerm: 'second' } });
+    await loadPage('/attendance-analysis');
+    Q('[data-t="semester"]').click();
+    await until(() => /请先设置当前学期/.test(txt('#termHint')), 10000);
+    check('⑨ 当前学期=下学期但未填其日期 → 明确提示设置当前学期',
+      /请先设置当前学期/.test(txt('#termHint')) && Q('#termHint').classList.contains('warn'), txt('#termHint'));
+
+    // ---------- 清理 ----------
+    log('\n— 清理 —');
+    await restore();
+    const back = (await japi('/api/term')).data;
+    check('⑨ 学期设置已还原为驱动运行前状态',
+      back.configured === !!snapshot.configured && back.currentTerm === (snapshot.currentTerm || 'first'),
+      { now: back, snapshot });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await restore(); log('  · 已还原学期设置'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

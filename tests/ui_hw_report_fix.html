@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：作业统计页两个显示问题修复
+    ① 状态列「已截止」标签一行显示（white-space:nowrap / min-width:60px / 不折行）
+    ② 按学科提交率进度条有颜色，宽度 = 提交率，颜色随提交率变化（≥90% 绿 / 70-89% 橙 / <70% 红）
+  用法：.\tests\run-ui.ps1 -Name ui_hw_report_fix -AdminPw <管理员密码>
+  说明：只读驱动（不写夹具）；数据取自真实库，颜色规则按接口 rate 逐条校验
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>作业统计：状态标签换行 + 学科进度条配色</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path) {
+  const res = await fetch(path, { credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (el, prop) => { const e = typeof el === 'string' ? Q(el) : el; return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : ''; };
+const rect = (el) => { const e = typeof el === 'string' ? Q(el) : el; return e ? e.getBoundingClientRect() : null; };
+const LX = { ok: 'rgb(16, 185, 129)', warn: 'rgb(245, 158, 11)', bad: 'rgb(239, 68, 68)' };
+function levelOf(rate) { return rate >= 90 ? 'ok' : (rate >= 70 ? 'warn' : 'bad'); }
+
+(async () => {
+  try {
+    out.textContent = '0) 准备（登录 + 打开作业统计）…';
+    const lg0 = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: '123456' }), credentials: 'same-origin' });
+    if (lg0.status !== 200) throw new Error('管理员登录失败：' + lg0.status);
+    fr.style.width = '1500px'; fr.style.height = '1100px';
+    fr.src = '/homework';
+    await until(() => F() && F().readyState === 'complete' && Q('#subjectBars'), 20000);
+    await until(() => Qa('.hw-bar-fill').length > 0, 15000);
+    await sleep(900);
+
+    // 用页面自身的筛选条件取同一份接口数据（页面对管理员默认只加载"当前班级范围"）
+    const pageParams = new URLSearchParams();
+    if (Q('#fDate') && Q('#fDate').value) pageParams.set('date', Q('#fDate').value);
+    if (Q('#fSubject') && Q('#fSubject').value) pageParams.set('subject', Q('#fSubject').value);
+    if (Q('#fTeacher') && Q('#fTeacher').value) pageParams.set('teacherId', Q('#fTeacher').value);
+    const scid = W().scopeClassId ? W().scopeClassId() : '';
+    if (scid) pageParams.set('classId', scid);
+    const api = await japi('/api/homework/tasks?' + pageParams.toString());
+    const apiBy = (api.data && api.data.bySubject) || [];
+    check('0) 页面进度条与接口 bySubject 都有数据（同一筛选条件）', Qa('.hw-bar-row').length > 0 && apiBy.length > 0,
+      { ui: Qa('.hw-bar-row').length, api: apiBy.length, params: pageParams.toString() });
+
+    // ---------- 1) 状态标签换行 ----------
+    log('\n— A) 状态列「已截止」标签 —');
+    const tags = Qa('.hw-status-tag');
+    check('① 列表里存在状态标签', tags.length > 0, tags.length);
+    check('① 标签禁止换行（white-space: nowrap、min-width: 60px、text-align: center）',
+      cs('.hw-status-tag', 'white-space') === 'nowrap' && cs('.hw-status-tag', 'min-width') === '60px' && cs('.hw-status-tag', 'text-align') === 'center',
+      { ws: cs('.hw-status-tag', 'white-space'), min: cs('.hw-status-tag', 'min-width'), align: cs('.hw-status-tag', 'text-align') });
+    const wrapped = tags.filter((t) => t.getClientRects().length > 1);
+    check('① 所有状态标签只占一行（getClientRects().length === 1）', wrapped.length === 0,
+      wrapped.slice(0, 3).map((t) => t.textContent + ' rects=' + t.getClientRects().length));
+    const done = tags.find((t) => t.textContent.trim() === '已截止');
+    if (done) {
+      const r = done.getBoundingClientRect();
+      const lh = parseFloat(cs(done, 'line-height'));
+      check('①「已截止」完整显示且高度=单行（≥60px 宽、高 < 2 行）',
+        done.textContent.trim() === '已截止' && r.width >= 60 && (!lh || r.height < lh * 2),
+        { text: done.textContent.trim(), w: Math.round(r.width), h: Math.round(r.height), lineHeight: lh });
+      check('①「已截止」文字完整（未被截断）', done.scrollWidth <= done.clientWidth + 1 && done.scrollHeight <= done.clientHeight + 1,
+        { scrollW: done.scrollWidth, clientW: done.clientWidth, scrollH: done.scrollHeight, clientH: done.clientHeight });
+    } else {
+      skip('①「已截止」具体尺寸', '当前没有已截止的作业行');
+    }
+    check('① 进行中/已截止 标签仍有底色（未因 nowrap 丢样式）',
+      tags.every((t) => cs(t, 'background-color') !== 'rgba(0, 0, 0, 0)'),
+      tags.slice(0, 3).map((t) => t.textContent.trim() + ':' + cs(t, 'background-color')));
+
+    // ---------- 2) 学科提交率进度条 ----------
+    log('\n— B) 按学科提交率进度条 —');
+    const rows = Qa('.hw-bar-row');
+    check('② 轨道浅灰 #e8ecf1、高度 8px、圆角 4px',
+      cs('.hw-bar-track', 'background-color') === 'rgb(232, 236, 241)' && cs('.hw-bar-track', 'height') === '8px' && cs('.hw-bar-track', 'border-radius') === '4px',
+      { bg: cs('.hw-bar-track', 'background-color'), h: cs('.hw-bar-track', 'height') });
+    const fills = Qa('.hw-bar-fill');
+    // 说明：提交率 0% 的学科（例如当天"每日作业"已生成但班长尚未录入）填充宽度本来是 0，
+    //       属于正常数据 —— 这里断言的是"填充是块级元素且高度可见"（修复前是 inline span → 0×0）
+    check('② 填充为块级元素且有可见尺寸（修复前是 inline span，宽高失效呈 0×0）',
+      fills.length === rows.length && fills.every((f, i) => {
+        const r = f.getBoundingClientRect();
+        const rate = parseFloat(Qa('.hw-bar-row')[i].dataset.rate);
+        return cs(f, 'display') === 'block' && r.height > 0 && (rate === 0 || r.width > 0);
+      }),
+      fills.map((f) => { const r = f.getBoundingClientRect(); return cs(f, 'display') + ':' + Math.round(r.width) + 'x' + Math.round(r.height); }));
+
+    const detail = rows.map((row, i) => {
+      const rate = parseFloat(row.dataset.rate);
+      const lv = levelOf(rate);
+      const track = row.querySelector('.hw-bar-track');
+      const fill = row.querySelector('.hw-bar-fill');
+      const trackW = track.getBoundingClientRect().width;
+      const fillW = fill.getBoundingClientRect().width;
+      return {
+        subject: row.querySelector('.hw-bar-label').textContent.trim(),
+        rate, lv,
+        fillLv: (fill.className.match(/\b(ok|warn|bad)\b/) || [''])[0],
+        color: cs(fill, 'background-color'),
+        wantColor: LX[lv],
+        expectW: trackW * Math.min(100, Math.max(0, rate)) / 100,
+        fillW, trackW,
+      };
+    });
+    check('② 颜色随提交率变化（≥90% 绿 / 70-89% 橙 / <70% 红）',
+      detail.every((d) => d.fillLv === d.lv && d.color === d.wantColor),
+      detail.map((d) => `${d.subject} ${d.rate}% → ${d.fillLv} ${d.color}`));
+    check('② 进度条宽度 = 提交率 × 轨道宽度（±2px）',
+      detail.every((d) => Math.abs(d.fillW - d.expectW) <= 2),
+      detail.map((d) => `${d.subject} rate=${d.rate}% fill=${Math.round(d.fillW)} expect=${Math.round(d.expectW)}`));
+    check('② 三种颜色都有对应类（.hw-bar-fill.ok/.warn/.bad 已定义）',
+      !!Q('.hw-bar-fill.ok') || !!Q('.hw-bar-fill.warn') || !!Q('.hw-bar-fill.bad'),
+      detail.map((d) => d.fillLv));
+    const green = detail.filter((d) => d.lv === 'ok'), orange = detail.filter((d) => d.lv === 'warn'), red = detail.filter((d) => d.lv === 'bad');
+    log(`  · 样本：绿 ${green.length} 个 / 橙 ${orange.length} 个 / 红 ${red.length} 个`);
+    if (green.length) check('② ≥90% 的学科为绿色 #10b981', green.every((d) => d.color === 'rgb(16, 185, 129)'), green.map((d) => d.subject + ':' + d.color));
+    else skip('② 绿色样本', '当前没有 ≥90% 的学科');
+    if (orange.length) check('② 70%-89% 的学科为橙色 #f59e0b', orange.every((d) => d.color === 'rgb(245, 158, 11)'), orange.map((d) => d.subject + ':' + d.color));
+    else skip('② 橙色样本', '当前没有 70%-89% 的学科');
+    if (red.length) check('② <70% 的学科为红色 #ef4444', red.every((d) => d.color === 'rgb(239, 68, 68)'), red.map((d) => d.subject + ':' + d.color));
+    else skip('② 红色样本', '当前没有 <70% 的学科');
+
+    // 与接口数据一致性（科目 + 提交率）
+    const apiMap = {};
+    apiBy.forEach((b) => { apiMap[b.subject] = b.rate; });
+    const mismatch = detail.filter((d) => apiMap[d.subject] === undefined || Math.abs(apiMap[d.subject] - d.rate) > 0.05);
+    check('② 每条进度条的学科与提交率 = 接口 bySubject（' + apiBy.length + ' 个学科）',
+      detail.length === apiBy.length && mismatch.length === 0,
+      { ui: detail.map((d) => d.subject + ':' + d.rate), api: apiBy.map((b) => b.subject + ':' + b.rate) });
+    check('② 进度条数值文案 = 实交/应交（率）',
+      rows.every((row, i) => {
+        const txt = row.querySelector('.hw-bar-value').textContent.replace(/\s+/g, '');
+        const b = apiBy.find((x) => x.subject === detail[i].subject);
+        return !!b && txt === `${b.submitted}/${b.total}（${b.rate}%）`;
+      }),
+      rows.map((row) => row.querySelector('.hw-bar-value').textContent.trim()));
+
+    // ---------- 3) 回归：汇总卡片仍在 ----------
+    log('\n— C) 回归 —');
+    check('③ 汇总三卡（总作业数/平均提交率/未交人次）仍正常', Qa('.stat-cards .stat-card').length === 3 &&
+      /%|—/.test(Q('#scRate').textContent), { n: Qa('.stat-cards .stat-card').length, rate: Q('#scRate') && Q('#scRate').textContent });
+    check('③ 作业列表仍渲染（表头含 状态 列）', Qa('#taskHead th').some((th) => th.textContent.trim() === '状态'),
+      Qa('#taskHead th').map((th) => th.textContent.trim()));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

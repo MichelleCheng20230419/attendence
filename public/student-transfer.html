@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>学生异动 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* ============ 面包屑导航 ============ */
+    .breadcrumb {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; color: var(--text-light); margin-bottom: 12px;
+    }
+    .breadcrumb a { color: var(--primary); text-decoration: none; }
+    .breadcrumb a:hover { text-decoration: underline; }
+    .breadcrumb .sep { color: #C0C8D4; }
+
+    /* ============ 页面头部 ============ */
+    /* 页头与返回按钮样式统一由 style.css 提供（.page-head / .back-link） */
+    .operator { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-light); }
+    .operator .avatar {
+      width: 32px; height: 32px; border-radius: 50%;
+      background: var(--primary); color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 14px; flex-shrink: 0;
+    }
+    .operator b { color: var(--text); }
+    .class-info {
+      font-size: 13px;
+      color: var(--primary-dark);
+      background: var(--primary-light);
+      padding: 5px 12px;
+      border-radius: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    /* ============ 统计卡片 ============ */
+    .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
+    .stat-card {
+      background: #fff; border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: var(--shadow); padding: 16px 18px;
+      display: flex; align-items: center; gap: 14px;
+    }
+    .stat-card .ico {
+      width: 42px; height: 42px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px; flex-shrink: 0;
+    }
+    .stat-card.blue .ico { background: #EAF2FB; }
+    .stat-card.green .ico { background: #E8F7E6; }
+    .stat-card.orange .ico { background: #FFF7E6; }
+    .stat-card.purple .ico { background: #F3EFFF; }
+    .stat-card .num { font-size: 24px; font-weight: 700; line-height: 1; }
+    .stat-card .label { font-size: 12.5px; color: var(--text-light); margin-top: 5px; }
+
+    /* ============ 左右两栏 ============ */
+    .transfer-layout { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 16px; }
+    .transfer-col { flex: 1 1 45%; min-width: 0; }
+
+    /* ============ 通用卡片 ============ */
+    .card { background: #fff; border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 20px; }
+    .card h3 { font-size: 15px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+
+    /* ============ 选班 / 选学生（一行三控件） ============ */
+    .tf-row { display: flex; gap: 10px; margin-bottom: 14px; }
+    .tf-row > div { flex: 1; min-width: 0; }
+    .tf-row label { display: block; font-size: 13px; color: var(--text-light); margin-bottom: 6px; }
+    .tf-row select, .tf-row input {
+      width: 100%; padding: 9px 12px; border: 1px solid var(--border);
+      border-radius: 8px; font-size: 14px; background: #fff; outline: none;
+    }
+    .tf-row select:focus, .tf-row input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(74, 144, 217, 0.15); }
+
+    /* ============ 学生搜索组合框 ============ */
+    .combobox { position: relative; }
+    .combobox-list {
+      position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+      background: #fff; border: 1px solid var(--border); border-radius: 8px;
+      box-shadow: var(--shadow-md); max-height: 232px; overflow-y: auto; z-index: 60;
+    }
+    .combobox-item {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      padding: 9px 12px; cursor: pointer; font-size: 13.5px;
+      border-bottom: 1px solid #F0F2F5;
+    }
+    .combobox-item:last-child { border-bottom: none; }
+    .combobox-item:hover { background: var(--primary-light); }
+    .combobox-item .no { font-family: Consolas, monospace; color: var(--text-light); font-size: 12px; }
+    .combobox-item .st { font-size: 12px; flex-shrink: 0; }
+    .combobox-empty { padding: 12px; text-align: center; color: var(--text-light); font-size: 13px; }
+
+    /* ============ 异动类型按钮组 ============ */
+    .type-btns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 14px; }
+    .type-btn {
+      padding: 10px 6px; border: 1px solid var(--border); border-radius: 8px;
+      background: #fff; font-size: 14px; cursor: pointer; color: var(--text);
+      transition: all 0.15s ease;
+    }
+    .type-btn:hover { border-color: var(--primary); color: var(--primary); }
+    .type-btn.active {
+      background: var(--primary); border-color: var(--primary); color: #fff;
+      font-weight: 600; box-shadow: 0 2px 8px rgba(74, 144, 217, 0.35);
+    }
+
+    /* ============ 动态异动信息表单 ============ */
+    .type-form { background: #F8FAFD; border: 1px dashed #D8E1EC; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .form-row { margin-bottom: 12px; }
+    .form-row:last-child { margin-bottom: 0; }
+    .form-row label { display: block; font-size: 13px; color: var(--text-light); margin-bottom: 6px; }
+    .form-row input, .form-row select {
+      width: 100%; padding: 9px 12px; border: 1px solid var(--border);
+      border-radius: 8px; font-size: 14px; background: #fff; outline: none;
+    }
+    .form-row input:focus, .form-row select:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(74, 144, 217, 0.15); }
+
+    /* ============ 确认执行按钮 ============ */
+    .btn-exec {
+      width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
+      border: none; border-radius: 8px; background: var(--primary); color: #fff;
+      cursor: pointer; transition: background 0.15s ease;
+    }
+    .btn-exec:hover { background: var(--primary-dark); }
+    .btn-exec:disabled { background: #A9C7E8; cursor: not-allowed; }
+
+    /* ============ 右侧学生信息预览 ============ */
+    .preview-empty { text-align: center; color: var(--text-light); padding: 46px 10px; font-size: 13px; }
+    .preview-empty .big { font-size: 44px; margin-bottom: 12px; }
+    .stu-card { display: flex; gap: 16px; align-items: center; }
+    .stu-card .avatar {
+      width: 64px; height: 64px; border-radius: 50%;
+      background: var(--primary-light); color: var(--primary-dark);
+      font-size: 26px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    .stu-card .meta { flex: 1; min-width: 0; }
+    .stu-card .name { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .stu-card .sub { font-size: 13px; color: var(--text-light); margin-top: 6px; }
+    .stu-card .sub .val { color: var(--text); font-weight: 600; }
+    .info-list {
+      margin-top: 16px; border-top: 1px solid #F0F2F5; padding-top: 14px;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; font-size: 13px;
+    }
+    .info-list .item label { display: block; color: var(--text-light); font-size: 12px; margin-bottom: 3px; }
+    .info-list .item b { font-size: 14px; font-weight: 600; }
+
+    /* ============ 历史记录筛选 ============ */
+    .filter-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .filter-row select, .filter-row input[type="date"] {
+      padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+      font-size: 13px; background: #fff; outline: none;
+    }
+    .filter-row .range-sep { color: var(--text-light); font-size: 13px; }
+
+    /* ============ 表格（统一风格：浅蓝表头） ============ */
+    .admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .admin-table thead th {
+      background: #EAF2FB; color: #3B5A7A; font-weight: 700; font-size: 13px;
+      text-align: left; padding: 11px 14px; border-bottom: 1px solid #D6E4F3; white-space: nowrap;
+    }
+    .admin-table td { padding: 11px 14px; border-bottom: 1px solid #F0F2F5; vertical-align: middle; }
+    .admin-table tbody tr:hover { background: #F4F9FF; }
+    .admin-table tbody tr:last-child td { border-bottom: none; }
+    .plan-empty { text-align: center; color: var(--text-light); padding: 26px; }
+
+    /* ============ 彩色标签 ============ */
+    .tag { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+    .tag-zb { background: #EAF2FB; color: #3B7CC4; }  /* 转班 */
+    .tag-xx { background: #FFF7E6; color: #D48806; }  /* 休学 */
+    .tag-fx { background: #E8F7E6; color: #389E0D; }  /* 复学 */
+    .tag-zx { background: #F3EFFF; color: #7B61FF; }  /* 转学 */
+    .tag-tx { background: #FFF1F0; color: #E5484D; }  /* 退学 */
+    .tag-enroll { background: #E8F7E6; color: #389E0D; }
+    .tag-other { background: #F2F3F5; color: #8A94A6; }
+
+    /* ============ 分页 ============ */
+    .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 14px; font-size: 13px; color: var(--text-light); }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏 -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+
+    <!-- 面包屑导航 -->
+    <nav class="breadcrumb">
+      <a href="/admin/account-management">🛠 后台管理</a>
+      <span class="sep">/</span>
+      <span>🔄 学生异动</span>
+    </nav>
+
+    <!-- 统一页头：返回按钮在左上角、与页面标题同一行 -->
+    <div class="page-head">
+      <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+      <h2 class="page-title">🔄 学生异动管理</h2>
+      <div class="operator">
+        <span id="currentClassInfo" class="class-info hidden">📌 当前管理班级：<b id="currentClassName">--</b></span>
+        <span class="avatar" id="opAvatar">—</span>
+        <span>当前操作人：<b id="userInfo">--</b></span>
+      </div>
+    </div>
+
+    <!-- 本月统计卡片 -->
+    <div class="stat-grid">
+      <div class="stat-card blue">
+        <div class="ico">📅</div>
+        <div><div class="num" id="statTotal">0</div><div class="label">本月异动总数（人）</div></div>
+      </div>
+      <div class="stat-card green">
+        <div class="ico">🔀</div>
+        <div><div class="num" id="statZhuanban">0</div><div class="label">转班</div></div>
+      </div>
+      <div class="stat-card orange">
+        <div class="ico">⏸</div>
+        <div><div class="num" id="statXiuxue">0</div><div class="label">休学</div></div>
+      </div>
+      <div class="stat-card purple">
+        <div class="ico">▶️</div>
+        <div><div class="num" id="statFuxue">0</div><div class="label">复学</div></div>
+      </div>
+    </div>
+
+    <!-- 左右两栏：执行异动 | 学生信息预览 -->
+    <div class="transfer-layout">
+
+      <!-- 左栏：执行异动表单 -->
+      <div class="card transfer-col">
+        <h3>🖊 执行异动</h3>
+
+        <!-- 第一步+第二步：年级 / 班级 / 学生搜索 -->
+        <div class="tf-row">
+          <div>
+            <label>年级</label>
+            <select id="tfGrade"><option value="">请选择年级</option></select>
+          </div>
+          <div>
+            <label>班级</label>
+            <select id="tfClass"><option value="">请选择班级</option></select>
+          </div>
+          <div>
+            <label>学生搜索（姓名/学号）</label>
+            <div class="combobox">
+              <input type="text" id="tfSearch" placeholder="先选班级，再搜索学生" autocomplete="off">
+              <div class="combobox-list hidden" id="tfSearchList"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 第三步：异动类型（按钮组） -->
+        <div class="form-row">
+          <label>异动类型 *</label>
+          <div class="type-btns" id="tfTypeBtns">
+            <button type="button" class="type-btn active" data-type="转班">转班</button>
+            <button type="button" class="type-btn" data-type="休学">休学</button>
+            <button type="button" class="type-btn" data-type="复学">复学</button>
+            <button type="button" class="type-btn" data-type="转学">转学</button>
+            <button type="button" class="type-btn" data-type="退学">退学</button>
+          </div>
+        </div>
+
+        <!-- 第四步：异动信息（按类型动态显示） -->
+        <div class="type-form" id="tfTypeForm"></div>
+
+        <div id="tfError" class="import-preview err hidden" style="margin-bottom:10px"></div>
+
+        <!-- 第五步：确认执行 -->
+        <button id="tfSubmit" class="btn-exec">✔ 确认执行异动</button>
+      </div>
+
+      <!-- 右栏：学生信息预览 -->
+      <div class="card transfer-col">
+        <h3>👀 学生信息预览</h3>
+        <div id="previewArea">
+          <div class="preview-empty">
+            <div class="big">👤</div>
+            请先在左侧选择学生<br>选中后这里将显示学生信息卡片
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 异动历史记录（独立卡片，上下排列） -->
+    <div class="card">
+      <h3>📋 异动历史记录</h3>
+      <div class="filter-row">
+        <select id="tfHistoryClass"><option value="">全部班级</option></select>
+        <input type="date" id="tfFrom" title="开始日期">
+        <span class="range-sep">~</span>
+        <input type="date" id="tfTo" title="结束日期">
+        <button id="tfQuery" class="btn btn-secondary">🔍 查询</button>
+        <button id="btnExportHistory" class="btn btn-secondary">📤 导出Excel</button>
+      </div>
+      <div class="plan-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th style="width:52px">序号</th>
+              <th>日期</th>
+              <th>学生姓名</th>
+              <th>学号</th>
+              <th>异动类型</th>
+              <th>原班级 → 新班级</th>
+              <th>事由</th>
+              <th>操作人</th>
+              <th style="width:72px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody"></tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <button id="pagePrev" class="btn btn-secondary">上一页</button>
+        <span id="pageInfo">第 1 / 1 页</span>
+        <button id="pageNext" class="btn btn-secondary">下一页</button>
+      </div>
+    </div>
+    </section><!-- /.page-card -->
+  </div>
+
+  <!-- 通用确认弹窗 -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3 id="confirmTitle">提示</h3>
+      <p id="confirmMessage" class="confirm-message"></p>
+      <div class="modal-actions">
+        <button id="confirmCancel" class="btn btn-secondary">取消</button>
+        <button id="confirmOk" class="btn btn-danger">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提示浮层 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/student-transfer.js?v=3.11.0"></script>
+</body>
+</html>

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>补签 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 页头与返回按钮样式统一由 style.css 提供（.page-head / .back-link） */
+
+    /* 场次信息卡 */
+    .plan-info {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      padding: 14px 18px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      flex-wrap: wrap;
+      font-size: 14px;
+    }
+    .plan-info .pi-item { display: flex; align-items: baseline; gap: 6px; }
+    .plan-info .pi-label { color: var(--text-light); font-size: 12px; }
+    .plan-info .pi-value { font-weight: 700; }
+    .plan-info .pi-session { margin-left: auto; color: var(--text-light); font-size: 12px; }
+
+    /* 统计条 */
+    .mk-stats {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .mk-stat {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      padding: 12px 18px;
+      min-width: 120px;
+      text-align: center;
+    }
+    .mk-stat .ms-label { font-size: 12px; color: var(--text-light); margin-bottom: 4px; }
+    .mk-stat .ms-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .mk-stat.total .ms-value { color: var(--text); }
+    .mk-stat.can .ms-value { color: var(--primary); }
+    .mk-stat.pick .ms-value { color: var(--success); }
+
+    /* 工具栏 */
+    .mk-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .mk-toolbar .sel-all {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+    }
+    .mk-toolbar .sel-all input { width: 16px; height: 16px; cursor: pointer; }
+    .mk-toolbar .mk-search {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-light);
+    }
+    .mk-toolbar .mk-search input {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 13px;
+      width: 220px;
+      outline: none;
+    }
+    .mk-toolbar .mk-search input:focus { border-color: var(--primary); }
+
+    /* 学生清单表格 */
+    .mk-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .mk-scroll {
+      max-height: calc(100vh - 380px);
+      min-height: 180px;
+      overflow: auto;
+    }
+    .mk-scroll table { width: 100%; border-collapse: collapse; }
+    .mk-scroll th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f0f7ff;
+      color: #333;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 10px 14px;
+      border-bottom: 2px solid #dbeafe;
+      text-align: left;
+      white-space: nowrap;
+    }
+    .mk-scroll td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 14px;
+      vertical-align: middle;
+    }
+    .mk-scroll tbody tr:last-child td { border-bottom: none; }
+    .mk-scroll tbody tr:hover { background: #f5f9ff; }
+    .mk-scroll tbody tr.selected { background: #eef7ee; }
+    .mk-scroll tbody tr.disabled-row { opacity: 0.62; }
+    .mk-scroll tbody tr.disabled-row:hover { background: transparent; }
+    .mk-scroll th.col-check, .mk-scroll td.col-check { width: 42px; text-align: center; }
+    .mk-scroll td.col-check input { width: 16px; height: 16px; cursor: pointer; }
+    .mk-scroll td.col-check input:disabled { cursor: not-allowed; }
+    .mk-scroll td.col-no { font-variant-numeric: tabular-nums; color: var(--text-light); font-size: 13px; }
+
+    /* 状态标签 */
+    .mk-tag {
+      display: inline-block;
+      min-width: 52px;
+      padding: 2px 10px;
+      border-radius: 11px;
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+    }
+    .mk-tag.none   { background: #eef0f3; color: #7a8394; }
+    .mk-tag.signed { background: #e6f7e6; color: #1f9d55; }
+    .mk-tag.leave  { background: #fff4e0; color: #c47c16; }
+    .mk-tag.absent { background: #ffeceb; color: #d93025; }
+    .mk-tag.hint { background: #eaf3ff; color: #2f6fb0; }
+
+    .mk-empty {
+      text-align: center;
+      color: var(--text-light);
+      padding: 44px 0;
+      font-size: 13px;
+    }
+
+    /* 底部操作条 */
+    .mk-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 18px;
+      border-top: 1px solid var(--border);
+      background: #fbfdff;
+      flex-wrap: wrap;
+    }
+    .mk-actions .mk-note { font-size: 12px; color: var(--text-light); }
+    .mk-actions .mk-btns { display: flex; gap: 10px; align-items: center; }
+    .mk-actions .btn { min-width: 120px; }
+
+    .mk-loading { text-align: center; color: var(--text-light); padding: 50px 0; font-size: 14px; }
+    .mk-error {
+      text-align: center;
+      padding: 40px 0;
+      color: var(--danger);
+      font-size: 14px;
+    }
+
+    @media (max-width: 600px) {
+      .mk-toolbar .mk-search { margin-left: 0; width: 100%; }
+      .mk-toolbar .mk-search input { flex: 1; width: auto; }
+      .plan-info .pi-session { margin-left: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏 -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+    <!-- 统一页头：返回按钮在左上角、与页面标题同一行（返回目标随来源：计划管理 / 签到台） -->
+    <div class="page-head">
+      <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回计划管理</button>
+      <h2 class="page-title">✏️ 补签</h2>
+    </div>
+
+    <!-- 场次信息卡 -->
+    <div class="plan-info" id="planInfo">
+      <div class="pi-item"><span class="pi-label">日期</span><span class="pi-value" id="piDate">--</span></div>
+      <div class="pi-item"><span class="pi-label">时间</span><span class="pi-value" id="piTime">--</span></div>
+      <div class="pi-item"><span class="pi-label">班级</span><span class="pi-value" id="piClass">--</span></div>
+      <div class="pi-item pi-session" id="piSession"></div>
+    </div>
+
+    <!-- 统计条 -->
+    <div class="mk-stats" id="mkStats">
+      <div class="mk-stat total"><div class="ms-label">总人数（在读）</div><div class="ms-value" id="stTotal">0</div></div>
+      <div class="mk-stat can"><div class="ms-label">可补签（未签/缺勤）</div><div class="ms-value" id="stCan">0</div></div>
+      <div class="mk-stat pick"><div class="ms-label">已选择</div><div class="ms-value" id="stPick">0</div></div>
+    </div>
+
+    <!-- 工具栏 -->
+    <div class="mk-toolbar">
+      <label class="sel-all" title="只勾选当前列表中的未签/缺勤学生">
+        <input type="checkbox" id="selectAll"> 全选
+      </label>
+      <label class="mk-search">
+        搜索：<input type="text" id="searchBox" placeholder="输入学号或姓名筛选" autocomplete="off">
+      </label>
+    </div>
+
+    <!-- 学生清单 -->
+    <div class="mk-panel">
+      <div class="mk-scroll" id="mkScroll">
+        <div class="mk-loading" id="mkLoading">加载中…</div>
+      </div>
+      <div class="mk-actions">
+        <span class="mk-note" id="mkNote">仅未签 / 缺勤的学生可选择；补签后标记为已签到（含补签标记）</span>
+        <div class="mk-btns">
+          <button id="btnSubmit" class="btn btn-primary" disabled>确认补签（0 人）</button>
+        </div>
+      </div>
+    </div>
+    </section><!-- /.page-card -->
+  </div>
+
+  <!-- 提示浮层 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/makeup-attendance.js?v=3.11.0"></script>
+</body>
+</html>

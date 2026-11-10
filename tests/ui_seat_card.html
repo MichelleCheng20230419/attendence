@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：座位表卡片宽度自适应列数（不溢出）+ 字号按列数分档 + 长姓名两行省略
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_seat_card.html public/_ui_seat_card.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiSeat --virtual-time-budget=120000 --dump-dom `
+         "http://localhost:3000/_ui_seat_card.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_seat_card.html
+  阶段：A) 8 列（用户场景 10行×8列） B) 10 列（验证自动缩小不溢出） C) 真实班级 高二6班（8 列 56 人，含真实长姓名）
+  夹具：临时年级 + 2 个临时班级（8 列 / 10 列）+ 2 个临时教师账号，结束自动清理。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1220px; height: 780px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>座位表卡片：宽度随列数自适应（不溢出）+ 字号分档 + 长姓名 2 行省略</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+// 真实数据依赖项：前置数据不满足时跳过（而不是误报失败）
+function skip(name, why) { skipped++; log('  – 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const W = () => fr.contentWindow;
+const px = (v) => Math.round(parseFloat(String(v || '0').replace('px', '')) * 100) / 100;
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '座位宽度年级' + stamp;
+const CLASS8 = '座位宽度8列班' + stamp;
+const CLASS10 = '座位宽度10列班' + stamp;
+const T8 = 'seat8_' + stamp, T10 = 'seat10_' + stamp, TREAL = 'seatreal_' + stamp, TMON = 'seatmon_' + stamp;
+const REAL_CLASS_ID = 73;   // 高二6班（真实数据，8 列 56 人，含 11 字长姓名）
+const NAMES = ['张三', '刘亦菲', '热孜耶·亚生江', '阿卜杜力艾则孜·克热木', '阿卜杜力艾则孜·克热木阿卜杜拉·买买提江阿依古丽·阿不都热合曼'];
+const created = { gradeId: null, classIds: [], userIds: [], studentIds: [] };
+
+async function loginAs(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  return japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+}
+async function loadSeatView() {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = '/dashboard?view=seat';
+  // 需求 2026-09-30：签到操作台只有座位表模式（列表/座位表切换按钮已移除）→ 直接等座位卡片渲染
+  const ok = await until(() => F() && F().readyState === 'complete' && Q('#seatView'), 20000);
+  if (!ok) throw new Error('看板未加载完成（找不到 #seatView）');
+  await until(() => Qa('#seatGrid .student-card').length > 0, 20000);
+  await sleep(800);
+}
+// 卡片快照 + 溢出信息
+function snapshot() {
+  const win = W();
+  const grid = Q('#seatGrid');
+  const gridRect = grid.getBoundingClientRect();
+  const cards = Qa('#seatGrid .seat-card').map((c) => {
+    const nameEl = c.querySelector('.name');
+    const cs = win.getComputedStyle(c);
+    const ns = nameEl ? win.getComputedStyle(nameEl) : null;
+    const rect = c.getBoundingClientRect();
+    return {
+      id: Number(c.dataset.studentId),
+      text: (nameEl ? nameEl.textContent : '').trim(),
+      len: [...((nameEl ? nameEl.textContent : '') || '')].length,
+      w: px(cs.width), h: px(cs.height),
+      rectW: Math.round(rect.width * 100) / 100, rectH: Math.round(rect.height),
+      left: rect.left, right: rect.right,
+      nameSize: ns ? px(ns.fontSize) : null,
+      lineClamp: ns ? ns.webkitLineClamp : null,
+      nameOverflow: nameEl ? ns.overflow : null,
+      clipped: nameEl ? nameEl.scrollHeight > nameEl.clientHeight + 1 : null,
+      noSize: px(win.getComputedStyle(c.querySelector('.no')).fontSize),
+      posSize: px(win.getComputedStyle(c.querySelector('.seat-pos')).fontSize),
+      empty: false,
+    };
+  });
+  const empties = Qa('#seatGrid .seat-empty').map((e) => {
+    const r = e.getBoundingClientRect();
+    return { w: px(win.getComputedStyle(e).width), h: px(win.getComputedStyle(e).height), left: r.left, right: r.right };
+  });
+  const cols = (win.getComputedStyle(grid).gridTemplateColumns || '').split(' ').map((v) => px(v));
+  return {
+    grid: {
+      left: gridRect.left, right: gridRect.right,
+      clientW: grid.clientWidth, scrollW: grid.scrollWidth,
+      cols, colCount: cols.length,
+      nameSizeVar: win.getComputedStyle(grid).getPropertyValue('--seat-name-size').trim(),
+      metaSizeVar: win.getComputedStyle(grid).getPropertyValue('--seat-meta-size').trim(),
+    },
+    cards, empties,
+  };
+}
+const within = (snap) => snap.cards.every((c) => c.left >= snap.grid.left - 1 && c.right <= snap.grid.right + 1);
+
+// 状态标签（已签到）几何：是否显示、是否完整在卡片内（含间距）、文字是否被裁切
+function badgeInfo() {
+  const win = W();
+  return Qa('#seatGrid .seat-card').map((card) => {
+    const b = card.querySelector('.badge');
+    if (!b) return null;
+    const bs = win.getComputedStyle(b);
+    const shown = bs.display !== 'none' && bs.visibility !== 'hidden';
+    const cr = card.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return {
+      student: (card.querySelector('.name') || {}).textContent,
+      shown,
+      text: b.textContent.trim(),
+      gapTop: Math.round(br.top - cr.top),
+      gapRight: Math.round(cr.right - br.right),
+      gapBottom: Math.round(cr.bottom - br.bottom),
+      gapLeft: Math.round(br.left - cr.left),
+      inside: br.top >= cr.top - 0.5 && br.right <= cr.right + 0.5 && br.left >= cr.left - 0.5 && br.bottom <= cr.bottom + 0.5,
+      fontPx: px(bs.fontSize),
+      boxH: Math.round(br.height), boxW: Math.round(br.width),
+      clippedW: b.scrollWidth > b.clientWidth + 1,
+      clippedH: b.scrollHeight > b.clientHeight + 1,
+      cardH: Math.round(cr.height),
+    };
+  }).filter(Boolean);
+}
+// 临时把前两张卡片标记为"已签到"（绿色）以测量标签布局，测完还原
+function markSigned(n = 2) {
+  const cards = Qa('#seatGrid .seat-card').slice(0, n);
+  cards.forEach((c) => {
+    c.classList.remove('gray', 'orange', 'blue', 'red');
+    c.classList.add('green');
+    const b = c.querySelector('.badge');
+    if (b) b.textContent = '已签到';
+  });
+  return cards.length;
+}
+function unmarkSigned(cards) {
+  cards.classList.remove('green');
+  cards.classList.add('gray');
+  const b = cards.querySelector('.badge');
+  if (b) b.textContent = '';
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具（临时年级 + 8列班 + 10列班，各 5 名学生）…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'SW', academicYear: year } })).data.id;
+    const mkClass = async (name) => (await japi('/api/classes', { method: 'POST', body: { className: name, gradeName: GRADE, academicYear: year } })).data.id;
+    const c8 = await mkClass(CLASS8);
+    const c10 = await mkClass(CLASS10);
+    created.classIds = [c8, c10];
+    const mkTeacher = async (uname, classId) => (await japi('/api/users', {
+      method: 'POST',
+      body: { username: uname, password: '123456', role: 'teacher', realName: '座位宽度老师', subject: '物理', classId, profileLocked: true, teachingClasses: [{ classId, roleInClass: 'head_teacher' }] },
+    })).data.user.id;
+    created.userIds.push(await mkTeacher(T8, c8));
+    created.userIds.push(await mkTeacher(T10, c10));
+    const mkStudents = async (classId, prefix) => {
+      for (let i = 0; i < NAMES.length; i += 1) {
+        await japi('/api/students', { method: 'POST', body: { studentNo: prefix + stamp + '0' + (i + 1), name: NAMES[i], classId, status: '在读' } });
+      }
+      const list = (await japi('/api/students?classId=' + classId + '&status=' + encodeURIComponent('在读'))).data.students || [];
+      list.forEach((s) => created.studentIds.push(s.id));
+      return list;
+    };
+    const l8 = await mkStudents(c8, 'S8');
+    const l10 = await mkStudents(c10, 'S10');
+    check('0) 夹具就绪（8列班/10列班各 5 名学生，姓名 2/3/7/11/31 字）',
+      l8.length === 5 && l10.length === 5 && l8.some((s) => s.name === '阿卜杜力艾则孜·克热木'),
+      { c8: l8.length, c10: l10.length });
+    // 8 列班：10 行 × 8 列（用户场景）；10 列班：10 行 × 10 列
+    await japi('/api/students/seats', { method: 'POST', body: { classId: c8, seats: l8.map((s, i) => ({ studentId: s.id, row: Math.floor(i / 8) + 1, col: (i % 8) + 1 })), seatConfig: { rows: 10, cols: 8, mode: '标准' } } });
+    await japi('/api/students/seats', { method: 'POST', body: { classId: c10, seats: l10.map((s, i) => ({ studentId: s.id, row: Math.floor(i / 10) + 1, col: (i % 10) + 1 })), seatConfig: { rows: 10, cols: 10, mode: '标准' } } });
+
+    // ---------- A) 8 列（10 行 × 8 列）：不溢出 + 字号 12/9 ----------
+    await loginAs(T8);
+    await loadSeatView();
+    let snap = snapshot();
+    check('A) 渲染出 5 张卡片（10行×8列）', snap.cards.length === 5, snap.cards.length);
+    check('A) 网格为 8 列', snap.grid.colCount === 8, snap.grid.colCount);
+    check('A) 卡片全部在容器内、左右不被截断',
+      within(snap) && snap.grid.scrollW <= snap.grid.clientW + 1,
+      { scrollW: snap.grid.scrollW, clientW: snap.grid.clientW, left: Math.round(snap.cards[0].left - snap.grid.left), right: Math.round(snap.grid.right - snap.cards[0].right) });
+    check('A) 8 列时卡片宽度 = 列宽（均分，全部一致）',
+      new Set(snap.cards.map((c) => c.rectW)).size === 1 && snap.cards.every((c) => c.rectW === snap.grid.cols[0]),
+      { cardW: snap.cards[0].rectW, colW: snap.grid.cols[0] });
+    check('A) 卡片高度固定 80px（不因姓名长短变化）',
+      snap.cards.every((c) => c.h === 80 && c.rectH === 80), [...new Set(snap.cards.map((c) => c.h))]);
+    check('A) 8 列字号档位：姓名 12px / 学号·座位 9px（CSS 变量生效）',
+      snap.grid.nameSizeVar === '12px' && snap.grid.metaSizeVar === '9px',
+      { name: snap.grid.nameSizeVar, meta: snap.grid.metaSizeVar });
+    const byLen8 = (n) => snap.cards.find((c) => c.len === n) || {};
+    check('A) 短姓名（张三 2 字）字号 = 12px', byLen8(2).nameSize === 12, byLen8(2).nameSize);
+    check('A) 7 字姓名（热孜耶·亚生江）字号 = 12px（未超 8 字）', byLen8(7).nameSize === 12, byLen8(7).nameSize);
+    check('A) 11 字长姓名（阿卜杜力艾则孜·克热木）字号自动缩小到 11px', byLen8(11).nameSize === 11, byLen8(11).nameSize);
+    check('A) 学号/座位字号全表一致（不随姓名缩放）',
+      new Set(snap.cards.map((c) => c.noSize)).size === 1 && new Set(snap.cards.map((c) => c.posSize)).size === 1,
+      snap.cards.map((c) => c.noSize + '/' + c.posSize));
+    check('A) 姓名最多 2 行 + 溢出省略',
+      snap.cards.every((c) => String(c.lineClamp) === '2' && (c.nameOverflow === 'hidden' || c.nameOverflow === 'clip')),
+      snap.cards.map((c) => c.lineClamp + '/' + c.nameOverflow));
+    check('A) 超长姓名（31 字）超出 2 行被裁切（省略号）且卡片尺寸不变',
+      (() => { const L = snap.cards.reduce((a, b) => (b.len > a.len ? b : a), snap.cards[0]); return L.len >= 25 && L.clipped === true && L.rectH === 80 && L.rectW === snap.grid.cols[0]; })(),
+      snap.cards.reduce((a, b) => (b.len > a.len ? b : a), snap.cards[0]));
+    check('A) 空位块宽度同样等于列宽、高度 80px 且在容器内',
+      snap.empties.length > 0 && snap.empties.every((e) => e.w === snap.grid.cols[0] && e.h === 80 && e.left >= snap.grid.left - 1 && e.right <= snap.grid.right + 1),
+      { n: snap.empties.length, w: snap.empties[0] && snap.empties[0].w, colW: snap.grid.cols[0] });
+
+    const snap8 = snapshot();   // 班主任端 8 列基准（供 D 阶段与班长端对比）
+    // A2) 状态标签（已签到）：完整显示在卡片内右上角，不被截断、不超出边界
+    const markedEls = Qa('#seatGrid .seat-card').slice(0, 2);
+    markSigned(2);
+    await sleep(250);
+    const badges = badgeInfo().filter((b) => b.shown);
+    const signed = badges.filter((b) => b.text === '已签到');
+    check('A2) 已签到的卡片显示状态标签（注入 2 张，全部标签均显示）', signed.length === 2 && badges.length >= 2, badgeInfo().map((b) => ({ t: b.text, shown: b.shown })));
+    check('A2) 标签完整位于卡片内（不超出上下左右边界）',
+      badges.every((b) => b.inside), badges.map((b) => ({ in: b.inside, top: b.gapTop, right: b.gapRight, bottom: b.gapBottom, left: b.gapLeft })));
+    check('A2) 标签与卡片边缘有间距（上/右 ≥2px，且不在卡片外）',
+      badges.every((b) => b.gapTop >= 2 && b.gapRight >= 2 && b.gapBottom >= 2 && b.gapLeft >= 0),
+      badges.map((b) => b.gapTop + '/' + b.gapRight + '/' + b.gapBottom + '/' + b.gapLeft));
+    check('A2) 标签文字完整显示（无横向/纵向裁切，含真实状态的标签）',
+      badges.every((b) => b.clippedW === false && b.clippedH === false && b.boxH >= 12) && signed.every((b) => b.text === '已签到'),
+      badges.map((b) => ({ t: b.text, cw: b.clippedW, ch: b.clippedH, h: b.boxH, w: b.boxW })));
+    check('A2) 标签与姓名不重叠（姓名在标签下方）',
+      (() => {
+        const cards = Qa('#seatGrid .seat-card').slice(0, 2);
+        return cards.every((card) => {
+          const b = card.querySelector('.badge');
+          const n = card.querySelector('.name');
+          if (!b || !n) return false;
+          return Math.round(n.getBoundingClientRect().top) >= Math.round(b.getBoundingClientRect().bottom) - 1;
+        });
+      })(), Qa('#seatGrid .seat-card').slice(0, 2).map((c) => {
+        const b = c.querySelector('.badge').getBoundingClientRect();
+        const n = c.querySelector('.name').getBoundingClientRect();
+        return { badgeBottom: Math.round(b.bottom), nameTop: Math.round(n.top) };
+      }));
+    markedEls.forEach((c) => unmarkSigned(c));
+    await sleep(150);
+
+    // ---------- B) 10 列：自动缩小、不溢出 ----------
+    await loginAs(T10);
+    await loadSeatView();
+    snap = snapshot();
+    check('B) 网格为 10 列', snap.grid.colCount === 10, snap.grid.colCount);
+    check('B) 10 列时卡片全部在容器内（左右不截断）',
+      within(snap) && snap.grid.scrollW <= snap.grid.clientW + 1,
+      { scrollW: snap.grid.scrollW, clientW: snap.grid.clientW });
+    check('B) 10 列字号档位：姓名 11px / 学号·座位 8px',
+      snap.grid.nameSizeVar === '11px' && snap.grid.metaSizeVar === '8px',
+      { name: snap.grid.nameSizeVar, meta: snap.grid.metaSizeVar });
+    const byLen10 = (n) => snap.cards.find((c) => c.len === n) || {};
+    check('B) 10 列时短姓名字号 = 11px', byLen10(2).nameSize === 11, byLen10(2).nameSize);
+    check('B) 10 列时长姓名（11 字）字号 = 10px', byLen10(11).nameSize === 10, byLen10(11).nameSize);
+    check('B) 10 列卡片宽度 = 列宽（均分且 < 8 列时的宽度）',
+      snap.cards.every((c) => c.rectW === snap.grid.cols[0]), { cardW: snap.cards[0].rectW, colW: snap.grid.cols[0] });
+    check('B) 10 列卡片高度仍为 80px', snap.cards.every((c) => c.h === 80), [...new Set(snap.cards.map((c) => c.h))]);
+    // B2) 10 列下状态标签同样完整显示（卡片更窄）
+    markSigned(2);
+    await sleep(250);
+    const badges10 = badgeInfo().filter((b) => b.shown);
+    check('B2) 10 列下「已签到」标签仍完整在卡片内、无裁切',
+      badges10.filter((b) => b.text === '已签到').length === 2 && badges10.every((b) => b.inside && b.clippedW === false && b.clippedH === false && b.gapTop >= 2 && b.gapRight >= 2),
+      badges10.map((b) => ({ in: b.inside, top: b.gapTop, right: b.gapRight, cw: b.clippedW, ch: b.clippedH, w: b.boxW })));
+    Qa('#seatGrid .seat-card').slice(0, 2).forEach((c) => unmarkSigned(c));
+    await sleep(150);
+
+    // ---------- D) 班长账号 vs 班主任账号：同一班级座位表必须一致 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const rMon = await japi('/api/users', { method: 'POST', body: { username: TMON, password: '123456', role: 'monitor', realName: '座位班长', classId: c8 } });
+    if (rMon.status !== 201) {
+      log('    · 无法创建班长账号：' + JSON.stringify(rMon.data));
+    } else {
+      created.userIds.push(rMon.data.user.id);
+      await loginAs(TMON);
+      await loadSeatView();
+      const mon = snapshot();
+      check('D) 班长账号看到同一班级的 5 张卡片', mon.cards.length === 5, mon.cards.length);
+      check('D) 班长账号网格列数与班主任一致（8 列）', mon.grid.colCount === snap8.grid.colCount, { mon: mon.grid.colCount, teacher: snap8.grid.colCount });
+      check('D) 班长账号卡片尺寸规范一致（宽=列宽、高 80px、全表统一、不溢出）',
+        mon.cards.every((c) => c.rectW === mon.grid.cols[0] && c.rectH === 80) &&
+        new Set(mon.cards.map((c) => c.rectW)).size === 1 && within(mon) && mon.grid.scrollW <= mon.grid.clientW + 1,
+        { monW: mon.cards[0].rectW, colW: mon.grid.cols[0], teacherW: snap8.cards[0].rectW, scrollW: mon.grid.scrollW, clientW: mon.grid.clientW });
+      check('D) 班长账号字号档位与班主任一致（12px / 9px）',
+        mon.grid.nameSizeVar === snap8.grid.nameSizeVar && mon.grid.metaSizeVar === snap8.grid.metaSizeVar,
+        { mon: mon.grid.nameSizeVar + '/' + mon.grid.metaSizeVar, teacher: snap8.grid.nameSizeVar + '/' + snap8.grid.metaSizeVar });
+      check('D) 班长端启用班长模式（monitor-mode）', W().document.body.classList.contains('monitor-mode'));
+      // 统一卡片布局：班长模式下操作条仍在卡片内部、且与卡片内容区左右对齐
+      check('D) 班长端：签到操作条在统一卡片内部',
+        !!Q('#viewAttendance .page-card') && Q('#viewAttendance .page-card').contains(Q('.dash-toolbar')));
+      check('D) 班长端：操作条与卡片内容区左右对齐（左右内边距 0）',
+        (() => {
+          const c = Q('#viewAttendance .page-card'); const t = Q('.dash-toolbar');
+          if (!c || !t) return false;
+          const cr = c.getBoundingClientRect(); const tr = t.getBoundingClientRect();
+          const pad = parseFloat(W().getComputedStyle(c).paddingLeft);
+          return Math.abs(tr.left - (cr.left + pad)) <= 2 && Math.abs((cr.right - pad) - tr.right) <= 2;
+        })(),
+        (() => {
+          const c = Q('#viewAttendance .page-card'); const t = Q('.dash-toolbar');
+          if (!c || !t) return null;
+          const cr = c.getBoundingClientRect(); const tr = t.getBoundingClientRect();
+          return { cardInner: Math.round(cr.left + 24), toolbar: Math.round(tr.left), cardInnerRight: Math.round(cr.right - 24), toolbarRight: Math.round(tr.right) };
+        })());
+      check('D) 班长端：座位表在卡片内部', !!Q('#viewAttendance .page-card') && Q('#viewAttendance .page-card').contains(Q('#seatGrid')));
+      // 班长端状态标签：完整显示、不与姓名重叠（与班主任端同样的判定）
+      markSigned(2);
+      await sleep(250);
+      const monBadges = badgeInfo().filter((b) => b.shown);
+      check('D) 班长端「已签到」标签同样完整显示在卡片内、无裁切',
+        monBadges.length >= 2 && monBadges.every((b) => b.inside && b.clippedW === false && b.clippedH === false && b.gapTop >= 2 && b.gapRight >= 2),
+        monBadges.map((b) => ({ t: b.text, in: b.inside, top: b.gapTop, cw: b.clippedW, ch: b.clippedH })));
+      check('D) 班长端标签不与姓名重叠（姓名在标签下方）',
+        (() => {
+          const cards = Qa('#seatGrid .seat-card').slice(0, 2);
+          return cards.every((card) => {
+            const b = card.querySelector('.badge');
+            const n = card.querySelector('.name');
+            if (!b || !n) return false;
+            return Math.round(n.getBoundingClientRect().top) >= Math.round(b.getBoundingClientRect().bottom) - 1;
+          });
+        })(), Qa('#seatGrid .seat-card').slice(0, 2).map((c) => ({
+          badgeBottom: Math.round(c.querySelector('.badge').getBoundingClientRect().bottom),
+          nameTop: Math.round(c.querySelector('.name').getBoundingClientRect().top),
+          padTop: W().getComputedStyle(c).paddingTop,
+        })));
+      check('D) 班长端卡片顶部内边距与班主任端一致（16px，给标签留空间）',
+        W().getComputedStyle(Qa('#seatGrid .seat-card')[0]).paddingTop === '16px',
+        W().getComputedStyle(Qa('#seatGrid .seat-card')[0]).paddingTop);
+      Qa('#seatGrid .seat-card').slice(0, 2).forEach((c) => unmarkSigned(c));
+    }
+    // ---------- C) 真实班级 高二6班（8 列 56 人）----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const rReal = await japi('/api/users', { method: 'POST', body: { username: TREAL, password: '123456', role: 'teacher', realName: '真实班级查看', subject: '物理', classId: REAL_CLASS_ID, profileLocked: true, teachingClasses: [{ classId: REAL_CLASS_ID, roleInClass: 'subject_teacher' }] } });
+    if (rReal.status !== 201) {
+      log('    · 无法创建真实班级查看账号：' + JSON.stringify(rReal.data));
+    } else {
+      created.userIds.push(rReal.data.user.id);
+      await loginAs(TREAL);
+      await loadSeatView();
+      const real = snapshot();
+      check('C) 真实班级渲染 56 张卡片', real.cards.length === 56, real.cards.length);
+      check('C) 真实班级卡片全部在容器内（不溢出、不截断）',
+        within(real) && real.grid.scrollW <= real.grid.clientW + 1,
+        { scrollW: real.grid.scrollW, clientW: real.grid.clientW });
+      // 真实数据会随使用变化（列数档位、最长姓名长度），因此这两条按"允许档位 + 一致性"断言，
+      // 而不是写死 12px/11px（真实班级数据一变就会误报）
+      const colW0 = real.grid.cols[0];
+      check('C) 真实班级卡片高度统一 80px、宽度统一 = 列宽（允许亚像素四舍五入误差）',
+        new Set(real.cards.map((c) => c.rectH)).size === 1 && real.cards[0].rectH === 80 &&
+        real.cards.every((c) => Math.abs(c.rectW - colW0) <= 0.6),
+        { h: [...new Set(real.cards.map((c) => c.rectH))], w: [...new Set(real.cards.map((c) => c.rectW))], colW: colW0 });
+      const longReal = real.cards.find((c) => c.len === 11);
+      const NAME_TIERS = ['12px', '11px', '10px', '9px'];
+      const META_TIERS = ['9px', '8px', '7px'];
+      check('C) 真实班级字号档位在允许档位内（姓名 > 学号），长姓名再缩小且不小于 9px',
+        NAME_TIERS.includes(real.grid.nameSizeVar) && META_TIERS.includes(real.grid.metaSizeVar) &&
+        parseFloat(real.grid.nameSizeVar) > parseFloat(real.grid.metaSizeVar) &&
+        (!longReal || (longReal.nameSize <= parseFloat(real.grid.nameSizeVar) && longReal.nameSize >= 9)),
+        { name: real.grid.nameSizeVar, meta: real.grid.metaSizeVar, long: longReal && longReal.nameSize });
+      // 真实签到状态标签（高二6班当日场次已有记录）
+      // 依赖真实数据：若当日没有该班/全校场次与签到记录，跳过而不是误报失败
+      const realBadges = badgeInfo().filter((b) => b.shown);
+      if (realBadges.length === 0) {
+        skip('C) 真实班级已签到状态标签', '高二6班当日无场次签到记录（真实数据前置不满足）');
+      } else {
+        check('C) 真实班级出现已签到状态标签（数量 = ' + realBadges.length + '）', realBadges.length > 0, realBadges.slice(0, 3));
+        check('C) 真实班级标签全部完整显示在卡片内且无裁切',
+          realBadges.every((b) => b.inside && b.clippedW === false && b.clippedH === false && b.gapTop >= 2 && b.gapRight >= 2 && b.boxH >= 12),
+          realBadges.filter((b) => !b.inside || b.clippedW || b.clippedH).slice(0, 3));
+      }
+    }
+
+    // ---------- 清理 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    for (const id of created.studentIds) await japi('/api/students/' + id, { method: 'DELETE' });
+    for (const id of created.userIds) await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: id, classes: [] } });
+    for (const id of created.userIds) await japi('/api/users/' + id, { method: 'DELETE' });
+    for (const id of created.classIds) await japi('/api/classes/' + id, { method: 'DELETE' });
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    const leftUsers = await japi('/api/users');
+    check('清理：临时教师与班级已删除',
+      !(leftUsers.data.users || []).some((u) => [T8, T10, TREAL, TMON].includes(u.username)));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

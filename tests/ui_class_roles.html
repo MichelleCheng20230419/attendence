@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：账号管理「教师带班角色按班级分别设置」
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/ 目录：Copy-Item tests/ui_class_roles.html public/_ui_class_roles.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiCR --virtual-time-budget=30000 --dump-dom `
+         "http://localhost:3000/_ui_class_roles.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_class_roles.html
+  说明：脚本会创建临时年级/班级/教师账号，正常结束时自动清理（异常中断时用
+        db/fix_and_clean_test_fixtures.sql 兜底清理）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1000px; height: 620px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>账号管理 · 教师带班角色（按班级分别设置）UI 验证</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+// 无头 Chrome 验证脚本：跑完把结果写入 #out 并把 PASS/FAIL 写入 title
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 8000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { if (await fn()) return true; } catch (_) {}
+    if (Date.now() - t0 > ms) return false;
+    await sleep(120);
+  }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (sel) => { const d = F(); return d ? d.querySelector(sel) : null; };
+const Qa = (sel) => { const d = F(); return d ? [...d.querySelectorAll(sel)] : []; };
+const click = (sel) => { const e = Q(sel); if (e) e.click(); return !!e; };
+function setVal(sel, val) {
+  const d = F(); const e = d && d.querySelector(sel); if (!e) return false;
+  e.value = val;
+  const W = fr.contentWindow;
+  e.dispatchEvent(new W.Event('change', { bubbles: true }));
+  return true;
+}
+const visible = (sel) => {
+  const d = F(); const e = d && d.querySelector(sel);
+  if (!e) return false;
+  let n = e; // 逐级检查祖先 display（父级 .hidden 会让子元素同样不可见）
+  while (n && n.nodeType === 1 && n !== d.body) {
+    if (fr.contentWindow.getComputedStyle(n).display === 'none') return false;
+    n = n.parentElement;
+  }
+  return true;
+};
+const text = (sel) => { const e = Q(sel); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = 'UI带班年级' + stamp;          // 当前学年，有班级
+const GRADE_EMPTY = 'UI空年级' + stamp;       // 当前学年，无班级（BUG 场景：年级管理已加、添加账号看不到）
+const GRADE_OTHER = 'UI往届年级' + stamp;     // 非当前学年
+const C1 = 'UI带班一班' + stamp;
+const C2 = 'UI带班二班' + stamp;
+const C_OTHER = 'UI往届班' + stamp;
+const OTHER_YEAR = '2019-2020';
+const USERNAME = 'ui_tcr_' + stamp;
+const created = { gradeId: null, gradeEmptyId: null, gradeOtherId: null, classIds: [], otherClassId: null, userId: null };
+
+(async () => {
+  try {
+    out.textContent = '1) 管理员登录…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    check('管理员登录成功', lg.status === 200, lg.data);
+    const YEAR = (await japi('/api/settings')).data.currentAcademicYear;
+
+    // 夹具：当前学年 年级（含 2 个班级）+ 空年级（无班级）；另建一个非当前学年的年级+班级
+    const g = await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'UI' + stamp, academicYear: YEAR } });
+    created.gradeId = g.data && g.data.id;
+    const gEmpty = await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE_EMPTY, gradeCode: 'UIE' + stamp, academicYear: YEAR } });
+    created.gradeEmptyId = gEmpty.data && gEmpty.data.id;
+    const gOther = await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE_OTHER, gradeCode: 'UIO' + stamp, academicYear: OTHER_YEAR } });
+    created.gradeOtherId = gOther.data && gOther.data.id;
+    const c1 = await japi('/api/classes', { method: 'POST', body: { className: C1, gradeName: GRADE, academicYear: YEAR } });
+    const c2 = await japi('/api/classes', { method: 'POST', body: { className: C2, gradeName: GRADE, academicYear: YEAR } });
+    const cOther = await japi('/api/classes', { method: 'POST', body: { className: C_OTHER, gradeName: GRADE_OTHER, academicYear: OTHER_YEAR } });
+    check('创建临时年级/班级（当前学年有班级年级 + 空年级 + 非当前学年年级）',
+      !!(created.gradeId && created.gradeEmptyId && created.gradeOtherId && c1.status < 300 && c2.status < 300 && cOther.status < 300),
+      { g: g.status, ge: gEmpty.status, go: gOther.status, c1: c1.status, c2: c2.status, co: cOther.status });
+    const cid1 = c1.data.id, cid2 = c2.data.id;
+    created.classIds = [cid1, cid2];
+    created.otherClassId = cOther.data.id;
+    const cidByName = { [C1]: cid1, [C2]: cid2 };
+
+    // 3-0) 数据源一致性（年级管理接口 = 添加账号年级下拉接口）
+    const apiGrades = await japi('/api/grades?academicYear=' + encodeURIComponent(YEAR));
+    const apiNames = (apiGrades.data.grades || []).map((x) => x.grade_name);
+    check('API：/api/grades?academicYear=当前学年 含空年级、不含非当前学年年级',
+      apiNames.includes(GRADE_EMPTY) && apiNames.includes(GRADE) && !apiNames.includes(GRADE_OTHER), apiNames.slice(-4));
+
+    // 等 iframe 后台页面就绪（登录成功后再导航，否则会被重定向到登录页）
+    fr.src = '/admin';
+    const diag = () => {
+      const d = F();
+      let href = '?';
+      try { href = fr.contentWindow.location.href; } catch (_) {}
+      return { title: d ? d.title : null, href, len: d && d.body ? d.body.innerHTML.length : -1, hasBtn: !!Q('#btnAddUser') };
+    };
+    await sleep(400);
+    log('    诊断(初始)：' + JSON.stringify(diag()));
+    await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' && Q('#btnAddUser'), 20000);
+    log('    诊断(等待后)：' + JSON.stringify(diag()));
+    check('后台页面加载完成（#btnAddUser 存在）', !!Q('#btnAddUser'));
+
+    // 2) 打开「添加账号」→ 角色默认教师：显示带班记录区、隐藏所属班级
+    click('#btnAddUser');
+    await until(() => visible('#userModal'));
+    check('点「添加账号」弹窗打开', visible('#userModal'));
+    check('角色=教师 → 显示带班记录区 #uTeachBlock', visible('#uTeachBlock'));
+    check('角色=教师 → 隐藏「所属班级」下拉 #uClassRow', !visible('#uClassRow'));
+    check('带班表初始为空提示', ((Q('#uTeachList') || {}).textContent || '').indexOf('未设置带班班级') >= 0);
+    // 表头只保留 年级 / 班级 / 在该班角色 / 操作（学科列已移除）
+    const heads = Qa('#uTeachBlock table thead th').map((th) => th.textContent.trim());
+    check('带班表格表头 = 年级/班级/在该班角色/操作（无「学科」列）',
+      heads.join(',') === '年级,班级,在该班角色,操作', heads);
+    check('带班表格内不存在任何学科下拉（.tc-subj = 0）', Qa('#uTeachList .tc-subj').length === 0);
+
+    // 3) 填账号信息
+    const u = F();
+    u.getElementById('uUsername').value = USERNAME;
+    u.getElementById('uPassword').value = '123456';
+    u.getElementById('uRealName').value = 'UI张老师';
+    setVal('#uSubject', '数学');
+    check('账号级「所教学科」保留且可设置（=数学）', (Q('#uSubject') || {}).value === '数学', (Q('#uSubject') || {}).value);
+    // 教学设置锁定状态：新教师默认"待首次登录确认"，编辑时才会出现"重置为待确认"
+    check('新教师显示"待教师首次登录确认"（未锁定）',
+      text('#uLockState').indexOf('待教师首次登录确认') >= 0, text('#uLockState'));
+    check('新教师不显示「重置为待确认」勾选项', !visible('#uResetLockRow'));
+    check('「所教学科」下拉是表单中唯一的学科输入项',
+      Qa('#userModal select').filter((s) => s.id === 'uSubject').length === 1 &&
+      Qa('#userModal .tc-subj').length === 0);
+
+    // 4) 添加第 1 条带班记录：一班 → 班主任
+    click('#btnAddTeach');
+    await until(() => visible('#teachModal'));
+    check('点「＋添加带班」→ 弹窗打开', visible('#teachModal'));
+    // 年级下拉数据源 = 年级管理同一接口（/api/grades?academicYear=当前学年），含"还没有班级"的年级
+    const gradeTexts = Qa('#tmGrade option').map((o) => o.textContent.trim());
+    const gradeValues = Qa('#tmGrade option').map((o) => o.value);
+    check('年级下拉显示"年级管理里新增、暂无班级"的年级（原 BUG）',
+      gradeTexts.includes(GRADE_EMPTY), gradeTexts.slice(-4));
+    check('年级下拉显示当前学年有班级的年级', gradeTexts.includes(GRADE), gradeTexts.slice(-4));
+    check('年级下拉不显示非当前学年的年级', !gradeTexts.includes(GRADE_OTHER), gradeTexts.slice(-4));
+    check('年级下拉用年级 id 作为 value（与年级管理同源）',
+      gradeValues.includes(String(created.gradeEmptyId)) && gradeValues.includes(String(created.gradeId)),
+      gradeValues.slice(-4));
+    setVal('#tmGrade', String(created.gradeId));
+    await until(() => Qa('#tmClass option').some((o) => o.textContent.includes(C1)));
+    const clsTexts = Qa('#tmClass option').map((o) => o.textContent.trim());
+    check('选择年级 → 班级下拉只显示该年级的班级（不含其它学年班级）',
+      clsTexts.some((x) => x.includes(C1)) && clsTexts.some((x) => x.includes(C2)) && !clsTexts.some((x) => x.includes(C_OTHER)),
+      clsTexts);
+    // 切到"空年级" → 班级下拉为空并给出提示
+    setVal('#tmGrade', String(created.gradeEmptyId));
+    await until(() => text('#tmClassNote').indexOf('可选 0 个班级') >= 0, 6000);
+    check('选择无班级的新年级 → 提示"还没有班级，请先在班级标签页添加"',
+      text('#tmClassNote').indexOf('该年级下还没有班级') >= 0, text('#tmClassNote'));
+    check('选择无班级的新年级 → 班级下拉为占位提示', (Q('#tmClass') || {}).value === '', (Q('#tmClass') || {}).value);
+    // 回到有班级的年级继续流程
+    setVal('#tmGrade', String(created.gradeId));
+    await until(() => Qa('#tmClass option').some((o) => o.textContent.includes(C1)));
+    setVal('#tmClass', String(cid1));
+    setVal('#tmRole', 'head_teacher');
+    click('#tmSubmit');
+    await until(() => Qa('#uTeachList tr').length === 1);
+    check('添加第 1 条带班记录（一班·班主任）', Qa('#uTeachList tr').length === 1);
+    check('第 1 条记录只显示 年级/班级/角色/操作 四列',
+      Qa('#uTeachList tr')[0].children.length === 4, Qa('#uTeachList tr')[0].children.length);
+    check('第 1 条记录班级/角色正确',
+      (Q('#uTeachList tr') || {}).textContent.includes(C1) &&
+      (Qa('#uTeachList .tc-role')[0] || {}).value === 'head_teacher',
+      (Q('#uTeachList tr') || {}).textContent);
+    check('第 1 条记录显示年级名（年级列来自年级管理）',
+      (Q('#uTeachList tr') || {}).textContent.includes(GRADE), (Q('#uTeachList tr') || {}).textContent);
+
+    // 5) 添加第 2 条带班记录：二班 → 任课老师
+    click('#btnAddTeach');
+    await until(() => visible('#teachModal'));
+    setVal('#tmGrade', String(created.gradeId));
+    await until(() => Qa('#tmClass option').some((o) => o.textContent.includes(C2)));
+    check('已添加的班级不再出现在下拉（一班已过滤）', !Qa('#tmClass option').some((o) => o.textContent.includes(C1)));
+    setVal('#tmClass', String(cid2));
+    setVal('#tmRole', 'subject_teacher');
+    click('#tmSubmit');
+    await until(() => Qa('#uTeachList tr').length === 2);
+    check('添加第 2 条带班记录（二班·任课老师）→ 共 2 行', Qa('#uTeachList tr').length === 2);
+    check('两条记录角色各自独立（班主任 / 任课老师）',
+      Qa('#uTeachList .tc-role').map((s) => s.value).join(',') === 'head_teacher,subject_teacher',
+      Qa('#uTeachList .tc-role').map((s) => s.value));
+    check('两行均无学科输入项（学科只在账号级设置）', Qa('#uTeachList .tc-subj').length === 0);
+
+    // 6) 保存 → 账号列表出现该教师，角色列显示班主任，班级列显示两种角色
+    click('#uSubmit');
+    await until(() => !visible('#userModal') && Q('#userList').textContent.includes(USERNAME));
+    const listed = await until(() => {
+      const d = F();
+      const row = [...d.querySelectorAll('#userList tr')].find((tr) => tr.textContent.includes(USERNAME));
+      return row && row.textContent.includes('班主任') && row.textContent.includes('任课老师');
+    });
+    check('保存成功 → 账号列表出现新教师且含「班主任」「任课老师」标签', listed);
+    const rowHtml = (() => {
+      const d = F();
+      const row = [...d.querySelectorAll('#userList tr')].find((tr) => tr.textContent.includes(USERNAME));
+      return row ? row.textContent.replace(/\s+/g, ' ').trim() : '';
+    })();
+    log('    列表行文本：' + rowHtml);
+    check('列表班级列显示两个班级各自的角色',
+      rowHtml.includes(C1 + '·班主任') && rowHtml.includes(C2 + '·任课老师'), rowHtml);
+    check('列表角色列/学科显示「班主任」「所教：数学」', rowHtml.includes('班主任') && rowHtml.includes('所教：数学'), rowHtml);
+
+    // 7) 服务端数据核对
+    const users = await japi('/api/users');
+    const target = (users.data.users || []).find((x) => x.username === USERNAME);
+    created.userId = target && target.id;
+    check('服务端 roleLabel=班主任', target && target.roleLabel === '班主任', target && target.roleLabel);
+    check('服务端「所教学科」=数学（账号级保留）', target && target.subject === '数学', target && target.subject);
+    check('服务端 2 条带班记录，角色各自独立且不带逐班学科',
+      target && (target.teachingClasses || []).length === 2 &&
+      target.teachingClasses.some((t) => t.classId === cid1 && t.roleInClass === 'head_teacher') &&
+      target.teachingClasses.some((t) => t.classId === cid2 && t.roleInClass === 'subject_teacher') &&
+      target.teachingClasses.every((t) => t.subject === null),
+      target && target.teachingClasses);
+
+    // 8) 编辑账号 → 带班记录回显；删一条并把另一条改为任课老师 → 保存生效
+    const rowsInfo = () => Qa('#uTeachList tr').map((tr) => ({
+      text: tr.textContent.replace(/\s+/g, ' ').trim(),
+      role: (tr.querySelector('.tc-role') || {}).value,
+      cols: tr.children.length,
+    }));
+    const d = F();
+    const row = [...d.querySelectorAll('#userList tr')].find((tr) => tr.textContent.includes(USERNAME));
+    const editBtn = row.querySelector('[data-act="edit"]');
+    check('列表存在「编辑」按钮', !!editBtn);
+    editBtn.click();
+    await until(() => visible('#userModal') && Qa('#uTeachList tr').length === 2);
+    check('编辑弹窗回显 2 条带班记录（各自的班级 + 在该班角色，四列且无学科）',
+      (() => {
+        const info = rowsInfo();
+        return info.length === 2 &&
+          info.every((x) => x.cols === 4) &&
+          info.some((x) => x.text.includes(C1) && x.role === 'head_teacher') &&
+          info.some((x) => x.text.includes(C2) && x.role === 'subject_teacher');
+      })(),
+      rowsInfo());
+    check('编辑时账号级「所教学科」回显为数学', (Q('#uSubject') || {}).value === '数学', (Q('#uSubject') || {}).value);
+    check('编辑时角色下拉为「教师」', (Q('#uRole') || {}).value === 'teacher', (Q('#uRole') || {}).value);
+    check('编辑时「所属班级」仍隐藏', !visible('#uClassRow'));
+
+    // 删除「二班」那条（🗑️），再把剩下的一条（一班）角色改为任课老师 → 保存
+    const idx2 = rowsInfo().findIndex((x) => x.text.includes(C2));
+    log('    编辑弹窗行：' + JSON.stringify(rowsInfo()));
+    Qa('#uTeachList [data-act="delTeach"]')[idx2].click();
+    await until(() => Qa('#uTeachList tr').length === 1);
+    check('删除「二班」带班记录 → 剩 1 行', Qa('#uTeachList tr').length === 1);
+    check('剩下的一行是一班', rowsInfo()[0].text.includes(C1), rowsInfo()[0].text);
+    setVal('#uTeachList .tc-role[data-idx="0"]', 'subject_teacher');
+    // 同时把账号级「所教学科」改为物理：保存后该学科对所有带班班级生效（班级行不再带自己的学科）
+    setVal('#uSubject', '物理');
+    click('#uSubmit');
+    await until(() => !visible('#userModal'));
+    await sleep(600);
+    const users2 = await japi('/api/users');
+    const t2 = (users2.data.users || []).find((x) => x.username === USERNAME);
+    check('改角色后保存：只剩 1 条记录（一班·任课老师）',
+      t2 && (t2.teachingClasses || []).length === 1 && t2.teachingClasses[0].roleInClass === 'subject_teacher' &&
+      t2.teachingClasses[0].classId === cid1,
+      t2 && t2.teachingClasses);
+    check('改「所教学科」后保存生效（账号级=物理，班级行无独立学科）',
+      t2 && t2.subject === '物理' && t2.teachingClasses[0].subject === null,
+      t2 && { subject: t2.subject, row: t2.teachingClasses[0] });
+    check('无班主任班级 → 账号角色标签变为「任课老师」', t2 && t2.roleLabel === '任课老师', t2 && t2.roleLabel);
+    const d2 = F();
+    const row2 = [...d2.querySelectorAll('#userList tr')].find((tr) => tr.textContent.includes(USERNAME));
+    const row2Text = row2.textContent.replace(/\s+/g, ' ').trim();
+    check('列表随之更新（只剩一班·任课老师，不再显示班主任班级标签）',
+      row2Text.includes(C1 + '·任课老师') && !row2Text.includes(C2), row2Text);
+
+    // 9) 清理：清空带班 → 删除账号 → 删除临时班级/年级（含空年级与非当前学年年级）
+    const cleared = await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: created.userId, classes: [] } });
+    check('清理：清空带班记录', cleared.status === 200, cleared.data);
+    const del = await japi('/api/users/' + created.userId, { method: 'DELETE' });
+    check('清理：删除临时教师账号', del.status === 200, del.data);
+    for (const id of created.classIds.concat(created.otherClassId ? [created.otherClassId] : [])) {
+      const rc = await japi('/api/classes/' + id, { method: 'DELETE' });
+      if (rc.status >= 300) log('    · 删除班级 ' + id + ' 失败：' + JSON.stringify(rc.data));
+    }
+    for (const gid of [created.gradeId, created.gradeEmptyId, created.gradeOtherId]) {
+      if (!gid) continue;
+      const rg = await japi('/api/grades/' + gid, { method: 'DELETE' });
+      if (rg.status >= 300) log('    · 删除年级 ' + gid + ' 失败：' + JSON.stringify(rg.data));
+    }
+    const left = await japi('/api/users');
+    check('清理：临时账号已不存在', !(left.data.users || []).some((x) => x.username === USERNAME));
+    const leftGrades = await japi('/api/grades');
+    check('清理：临时年级已不存在',
+      !(leftGrades.data.grades || []).some((x) => [GRADE, GRADE_EMPTY, GRADE_OTHER].includes(x.grade_name)),
+      (leftGrades.data.grades || []).map((x) => x.grade_name).slice(-3));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

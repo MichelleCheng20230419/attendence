@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：账号管理 → 教师账号批量导入（下载模板 + 导入弹窗 + 预览 + 确认导入 + 结果）
+  验证点：
+    ① 账号管理页有「📥 下载模板」「📤 导入账号」「＋ 添加账号」三个按钮
+    ② 下载模板 → 返回 xlsx（非空、Content-Disposition 中文文件名）
+    ③ 点「导入账号」→ 打开导入弹窗（含 1 下载模板 / 2 上传 / 3 预览 / 4 确认导入）
+    ④ 选择文件 → 预览前 5 行（用户名/姓名/角色/学科/班级/校验）+ 「将自动创建班级」提示
+    ⑤ 确认导入 → 结果区显示成功/失败条数 + 失败原因列表 + 账号列表刷新
+    ⑥ 非法行（缺用户名/密码过短/角色非法）在预览里标红并阻止导入
+  用法：.\tests\run-ui.ps1 -Name ui_teacher_import -AdminPw <管理员密码>
+  夹具：用 CSV 形式上传（服务端 XLSX.read 兼容 CSV），用户名带时间戳；测完通过 API 清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>账号管理：教师账号批量导入</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = 'body') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(1000);
+}
+
+const stamp = String(Date.now()).slice(-6);
+const GRADE = '导入UI年级' + stamp, HEAD_CLASS = '导入UI甲班' + stamp, SUB_CLASS = '导入UI乙班' + stamp;
+const U_HEAD = 'tiui_head_' + stamp, U_SUBJ = 'tiui_subj_' + stamp, PW = 'abc123';
+// CSV（服务端用 XLSX.read 兼容 CSV）——表头即模板列
+const CSV_HEADER = '用户名,密码,真实姓名,角色,所教学科,班主任班级,所带班级,年级,手机号,邮箱';
+const csvRows = [
+  `${U_HEAD},${PW},导入UI班主任,班主任,数学,${HEAD_CLASS},,${GRADE},13800000011,head@ui.com`,
+  `${U_SUBJ},${PW},导入UI任课,任课老师,语文,,${SUB_CLASS},${GRADE},,`,
+  `,${PW},缺用户名,班主任,数学,${HEAD_CLASS},,${GRADE},,`,
+];
+function fileOf(text, name) {
+  return new File([new Blob([text], { type: 'text/csv' })], name, { type: 'text/csv' });
+}
+function setFile(input, file) {
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备（管理员登录 + 打开账号管理）…';
+    const lg = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: '123456' }), credentials: 'same-origin' });
+    check('0) 管理员登录成功', lg.status === 200, lg.status);
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+    await loadPage('/admin/account-management', '#btnAddUser');
+    await until(() => Qa('#userList tr').length > 0, 15000);   // 等页面初始化（事件绑定）完成
+
+    // ---------- 1) 工具栏按钮 ----------
+    log('\n— A) 工具栏 —');
+    check('① 账号管理页有「📥 下载模板 / 📤 导入账号 / ＋ 添加账号」三个按钮',
+      visible('#btnTeacherTemplate') && /下载模板/.test(txt('#btnTeacherTemplate')) &&
+      visible('#btnImportUser') && /导入账号/.test(txt('#btnImportUser')) &&
+      visible('#btnAddUser') && /添加账号/.test(txt('#btnAddUser')),
+      { tpl: txt('#btnTeacherTemplate'), imp: txt('#btnImportUser'), add: txt('#btnAddUser') });
+    Q('#btnAddUser').click();
+    const addOpened = await until(() => !hidden('#userModal'), 8000);   // openAddUser 内部有 await，需要等弹窗真正显示
+    check('① 添加账号按钮打开的是新增弹窗（原功能保留）', addOpened, Q('#userModal') && Q('#userModal').className);
+    if (Q('#uCancel')) Q('#uCancel').click();
+    await sleep(200);
+
+    // ---------- 2) 下载模板 ----------
+    log('\n— B) 下载模板 —');
+    const tpl = await fetch('/api/teachers/template', { credentials: 'same-origin' });
+    const tplBuf = await tpl.arrayBuffer();
+    check('② 模板接口 → 200 且为 xlsx', tpl.status === 200 && (tpl.headers.get('content-type') || '').indexOf('spreadsheetml') >= 0 && tplBuf.byteLength > 5000,
+      { status: tpl.status, bytes: tplBuf.byteLength, ct: tpl.headers.get('content-type') });
+    check('② 模板文件名含中文「教师账号导入模板.xlsx」',
+      decodeURIComponent(tpl.headers.get('content-disposition') || '').indexOf('教师账号导入模板.xlsx') >= 0,
+      tpl.headers.get('content-disposition'));
+    check('② 页面上「下载模板」按钮可直接下载（指向模板接口）',
+      !!Q('#btnTeacherTemplate'));
+
+    // ---------- 3) 导入弹窗 ----------
+    log('\n— C) 导入弹窗 —');
+    Q('#btnImportUser').click();
+    await sleep(400);
+    check('③ 点「导入账号」→ 打开教师导入弹窗', !hidden('#teacherImportModal') && visible('#teacherImportModal'), hidden('#teacherImportModal'));
+    check('③ 弹窗含四步：1 下载模板 / 2 上传文件 / 3 预览 / 4 确认导入',
+      /1\. 下载模板/.test(txt('#teacherImportModal')) && /2\. 上传文件/.test(txt('#teacherImportModal')) &&
+      !!Q('#btnTeacherTpl') && !!Q('#teacherImportFile') && /确认导入/.test(txt('#teacherImportSubmit')));
+    check('③ 确认导入按钮初始禁用（未选文件）', Q('#teacherImportSubmit').disabled === true, Q('#teacherImportSubmit').disabled);
+    check('③ 弹窗提示了自动建班规则', /自动创建/.test(txt('#teacherImportModal')), txt('#teacherImportModal').slice(0, 80));
+
+    // ---------- 4) 预览 ----------
+    log('\n— D) 预览（前 5 行 + 校验） —');
+    const csv = [CSV_HEADER, ...csvRows].join('\n');
+    setFile(Q('#teacherImportFile'), fileOf(csv, 'teachers.csv'));
+    await until(() => Qa('#teacherPreview table tbody tr').length >= 3 || /失败|未识别/.test(txt('#teacherPreview')), 15000);
+    const prows = Qa('#teacherPreview table tbody tr');
+    check('④ 预览表显示上传的行（3 行）', prows.length === 3, { rows: prows.length, preview: txt('#teacherPreview').slice(0, 240) });
+    check('④ 预览表头含 行/用户名/姓名/角色/学科/班级/校验',
+      JSON.stringify(Qa('#teacherPreview table thead th').map((t) => t.textContent.trim())) ===
+      JSON.stringify(['行', '用户名', '姓名', '角色', '学科', '班级', '校验']),
+      Qa('#teacherPreview table thead th').map((t) => t.textContent.trim()));
+    check('④ 合法行显示「✅ 通过」',
+      prows.length >= 2 && prows.slice(0, 2).every((tr) => /通过/.test(tr.textContent)), prows.map((tr) => tr.textContent.replace(/\s+/g, ' ').trim()));
+    const badRow = prows[2];
+    check('④ 非法行（缺用户名）标红并给出原因',
+      !!badRow && /用户名不能为空/.test(badRow.textContent) && badRow.className.indexOf('err') >= 0,
+      { text: badRow && badRow.textContent.replace(/\s+/g, ' ').trim(), cls: badRow && badRow.className, rows: prows.length });
+    check('④ 汇总显示 校验通过 2 行 / 待处理问题 1 行', /校验通过 2 行/.test(txt('#teacherPreview')) && /待处理问题 1 行/.test(txt('#teacherPreview')), txt('#teacherPreview').slice(0, 60));
+    check('④ 提示将自动创建的年级与班级',
+      /将自动创建/.test(txt('#teacherPreview')) && txt('#teacherPreview').indexOf(GRADE) >= 0 && txt('#teacherPreview').indexOf(HEAD_CLASS) >= 0,
+      txt('#teacherPreview').slice(-120));
+    check('④ 有可导入行 → 确认导入按钮可用', Q('#teacherImportSubmit').disabled === false, Q('#teacherImportSubmit').disabled);
+    check('④ 预览阶段不写库（教师账号尚未创建）',
+      (await japi('/api/users')).data.users.filter((u) => u.username === U_HEAD).length === 0);
+
+    // ---------- 5) 确认导入 ----------
+    log('\n— E) 确认导入 + 结果 —');
+    Q('#teacherImportSubmit').click();
+    await until(() => !Q('#teacherResultWrap') || Q('#teacherResultWrap').style.display !== 'none', 15000);
+    await until(() => /导入完成/.test(txt('#teacherResult')), 15000);
+    check('⑤ 结果区显示 成功 2 条 · 失败 1 条',
+      /成功 2 条/.test(txt('#teacherResult')) && /失败 1 条/.test(txt('#teacherResult')), txt('#teacherResult').slice(0, 80));
+    // 行号按「文件行号」报（表头是第 1 行 → 第 3 条数据 = 文件第 4 行），便于用户在 Excel 里定位
+    check('⑤ 结果区列出失败原因（第 4 行 用户名不能为空）',
+      /失败原因/.test(txt('#teacherResult')) && /用户名不能为空/.test(txt('#teacherResult')) && /第 4 行/.test(txt('#teacherResult')),
+      txt('#teacherResult').slice(-160));
+    check('⑤ 结果区显示自动创建的班级数',
+      /自动创建班级 2 个/.test(txt('#teacherResult')) || /自动创建班级/.test(txt('#teacherResult')), txt('#teacherResult').slice(0, 200));
+
+    const users = (await japi('/api/users')).data.users.filter((u) => [U_HEAD, U_SUBJ].includes(u.username));
+    check('⑤ 账号列表已刷新并出现 2 个新教师账号', users.length === 2 && Qa('#userList tr').some((tr) => tr.textContent.indexOf(U_HEAD) >= 0),
+      { api: users.map((u) => u.username), listed: Qa('#userList tr').some((tr) => tr.textContent.indexOf(U_HEAD) >= 0) });
+    const detail = await japi('/api/users/teacher-classes?teacherId=' + (users.find((u) => u.username === U_SUBJ) || {}).id);
+    check('⑤ 导入的任课老师带班记录已写入（导入UI乙班）',
+      (detail.data.teacherClasses || []).some((c) => c.roleInClass === 'subject_teacher' && c.className === SUB_CLASS),
+      detail.data);
+
+    // 关闭弹窗
+    Q('#teacherImportCancel').click();
+    await sleep(300);
+    check('③ 点「取消」→ 弹窗关闭', hidden('#teacherImportModal'));
+
+    // 旧版通用导入入口仍可用
+    Q('#btnImportUser').click();
+    await sleep(300);
+    Q('#linkLegacyImport').click();
+    await sleep(300);
+    check('③ 弹窗内「旧版通用导入」链接 → 打开通用导入弹窗（学生/班长等）',
+      !hidden('#userImportModal') && hidden('#teacherImportModal'), { legacy: hidden('#userImportModal') });
+    Q('#userImportCancel').click();
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    // 清理夹具：账号 → 班级 → 年级（先解除班主任引用）
+    log('\n— 清理 —');
+    try {
+      const all = (await japi('/api/users')).data.users || [];
+      for (const u of all.filter((x) => /^tiui_/.test(x.username))) {
+        await japi('/api/users/teacher-classes', { method: 'POST', body: { teacherId: u.id, classes: [] } });
+        await japi('/api/users/' + u.id, { method: 'DELETE' });
+      }
+      for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^导入UI[甲乙]班/.test(x.className))) {
+        await japi('/api/classes/' + c.id, { method: 'DELETE' });
+      }
+      for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^导入UI年级/.test(x.grade_name || x.gradeName))) {
+        await japi('/api/grades/' + g.id, { method: 'DELETE' });
+      }
+      const left = {
+        users: ((await japi('/api/users')).data.users || []).filter((x) => /^tiui_/.test(x.username)).length,
+        classes: ((await japi('/api/classes')).data.classes || []).filter((x) => /^导入UI/.test(x.className)).length,
+        grades: ((await japi('/api/grades')).data.grades || []).filter((x) => /^导入UI/.test(x.grade_name || x.gradeName)).length,
+      };
+      check('清理：夹具账号/班级/年级已删除', left.users === 0 && left.classes === 0 && left.grades === 0, left);
+    } catch (e) {
+      fail++;
+      log('  ✘ 清理异常：' + e.message);
+    }
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

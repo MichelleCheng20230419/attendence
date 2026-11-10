@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：每天自动签到（v35 · 路线 B）签到操作台
+    ① 早自习/晚自修 两块出现（系统自动生成），默认「全员已签到」（绿色）
+    ② 点卡片 = 取消未到（红）；再点 = 恢复已签到（绿）；右键 = 请假（橙）
+    ③ 点「保存本场」→ 整场落库（present/absent/leave 显式行），刷新后保持
+    ④ auto 场次不显示倒计时/截止时间（不限时）
+    ⑤ 切到另一场（晚自修）互不影响；未保存修改时切场会二次确认
+  用法：.\tests\run-ui.ps1 -Name ui_auto_session -AdminPw <管理员密码>
+  夹具：1 年级 + 1 班（3 生）+ 班主任 + 班长；测完自愈清理（含自动场次）
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>每天自动签到：默认全签 + 点取消未到 + 保存整场（签到操作台）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(1200);
+}
+async function loadList(url, waitSel) {
+  // 需求 2026-09-30：签到台只有座位表模式（切换按钮已移除）
+  //   · 页面直接渲染座位表；列表视图的 DOM 仍在（隐藏），一~四段的卡片断言继续用它
+  await load(url, waitSel);
+  await until(() => Qa('#studentGrid .student-card').length > 0, 15000);
+  await sleep(400);
+}
+// 显式选中「早自习」（默认选中的场次按当前时间决定：中午前早自习 / 中午后晚自修 → 这里固定成早自习，让断言确定）
+async function pickMorning() {
+  await until(() => Qa('#autoSlots .auto-slot-btn').length === 2, 15000);
+  const b0 = Qa('#autoSlots .auto-slot-btn')[0];
+  if (b0 && !b0.classList.contains('active')) b0.click();
+  await until(() => /早自习/.test(txt('#startTime')), 15000);
+  await sleep(600);
+}
+async function asUser(u) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: '123456' } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + ': ' + r.status);
+  return r.data.user;
+}
+const cardStatus = (name) => {
+  const card = Qa('#studentGrid .student-card').find((c) => c.textContent.includes(name));
+  if (!card) return null;
+  return { cls: card.className.replace('student-card', '').trim(), status: card.dataset.status, badge: (card.querySelector('.badge') || {}).textContent };
+};
+const clickCard = (name) => {
+  const card = Qa('#studentGrid .student-card').find((c) => c.textContent.includes(name));
+  card.dispatchEvent(new (W().MouseEvent)('click', { bubbles: true }));
+};
+const rightClickCard = (name) => {
+  const card = Qa('#studentGrid .student-card').find((c) => c.textContent.includes(name));
+  card.dispatchEvent(new (W().MouseEvent)('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 200 }));
+};
+const viewModeIs = (m) => (m === 'seat' ? !hidden('#seatView') : !hidden('#studentGrid'));
+const today = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '自签UI年级' + stamp;
+const CA = '自签UI甲班' + stamp;
+const HEAD = 'asu_head_' + stamp, MON = 'asu_mon_' + stamp;
+const created = { gradeId: null, classId: null, users: [], students: [], beforeAutoIds: [], switchBefore: null, switchExisted: false };
+
+async function hardCleanup() {
+  await asUser('admin');
+  // 本套件会临时打开"每天自动签到"开关 → 它会给**所有班级**（含真实班级）生成当天两场；
+  //   收尾必须把"不是测试前就有的"那些场次删掉，否则会污染真实基线（真实班级凭空多 2 场）
+  const cfg = await japi('/api/attendance/daily-sessions/config');
+  for (const s of ((cfg.data && cfg.data.todaySessions) || [])) {
+    if (created.beforeAutoIds.includes(s.id)) continue;
+    await japi('/api/attendance/sessions/' + s.id + '/close', { method: 'POST' }).catch(() => {});   // 只允许删已结束场次
+    await japi('/api/attendance/sessions/' + s.id, { method: 'DELETE' }).catch(() => {});
+  }
+  const cids = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^自签UI/.test(c.className)).map((c) => c.id);
+  for (const c of cids) {
+    for (const s of ((await japi('/api/students?classId=' + c)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^asu_/.test(x.username))) await japi('/api/users/' + u.id, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^自签UI/.test(x.grade_name || x.gradeName || ''))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  // **还原开关到测试前的值**（不要硬写成 false：灰度开启后这是生产设置，写成 false 会把线上关掉）
+  await japi('/api/attendance/daily-sessions/config', {
+    method: 'PUT',
+    body: { enabled: created.switchExisted ? created.switchBefore === true : false },
+  }).catch(() => {});
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具（并打开"每天自动签到"开关生成今天两场）…';
+    await asUser('admin');
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'ASU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CA, gradeName: GRADE, academicYear: year } })).data.id;
+    for (let i = 1; i <= 3; i += 1) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: 'ASU' + stamp + i, name: '自签同学' + i, classId: created.classId, status: '在读' } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    let r = await japi('/api/users', { method: 'POST', body: { username: HEAD, password: '123456', role: 'teacher', realName: '自签班主任', classId: created.classId, subject: '语文', mustChangePassword: false, profileLocked: true, force: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.users.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: MON, password: '123456', role: 'monitor', realName: '自签班长', classId: created.classId, mustChangePassword: false, profileLocked: true, force: true } });
+    created.users.push(r.data.user.id);
+    // 打开开关**之前**先记下"今天已存在的自动场次"（正常情况下应为 0 条）→ 收尾只删本次新造的
+    const cfgBefore = await japi('/api/attendance/daily-sessions/config');
+    created.beforeAutoIds = (((cfgBefore.data || {}).todaySessions) || []).map((x) => x.id);
+    created.switchExisted = typeof (cfgBefore.data || {}).enabled === 'boolean';
+    created.switchBefore = (cfgBefore.data || {}).enabled === true;
+    // 打开开关（幂等生成今天两场；含真实班级，收尾会删掉本次新造的场次）
+    const on = await japi('/api/attendance/daily-sessions/config', { method: 'PUT', body: { enabled: true } });
+    check('0) 夹具就绪 + 开关已打开（今天两场自动生成）', !!created.classId && created.students.length === 3 && on.status === 200, { classId: created.classId, on: on.status });
+
+    // ============================================================
+    // 一、班主任端：早自习/晚自修两块 + 默认全员已签到
+    // ============================================================
+    log('\n— 一) 默认全签 + 两场切换 —');
+    fr.style.width = '1500px'; fr.style.height = '1100px';
+    await asUser(HEAD);
+    await loadList('/dashboard', '#autoBar');
+    // 需求 2026-09-30：**默认显示早自习**（晚自修需手动切换）→ 这里先断言默认值，再开始后续操作
+    check('一) 默认选中「早自习」（不需要点切换按钮）',
+      /早自习/.test(txt('#startTime')) && Qa('#autoSlots .auto-slot-btn')[0].classList.contains('active'),
+      { startTime: txt('#startTime'), active: Qa('#autoSlots .auto-slot-btn').map((b) => b.classList.contains('active')) });
+    await pickMorning();
+    check('一) 出现「早自习/晚自修」两块（系统自动生成的自动场次）',
+      !hidden('#autoBar') && Qa('#autoSlots .auto-slot-btn').length === 2, { bar: !hidden('#autoBar'), n: Qa('#autoSlots .auto-slot-btn').length });
+    const slotTexts = Qa('#autoSlots .auto-slot-btn').map((b) => b.textContent.replace(/\s+/g, ' ').trim());
+    check('一) 两块分别是「早自习」「晚自修」', /早自习/.test(slotTexts[0]) && /晚自修/.test(slotTexts[1]), slotTexts);
+    check('一) 不限时：不显示倒计时/截止时间，改用「不限时」+「系统每天 0 点自动生成」',
+      txt('#deadlineTime') === '不限时' && txt('#countdown') === '—' && /系统每天 0 点自动生成/.test(txt('#sessionStarter')),
+      { deadline: txt('#deadlineTime'), countdown: txt('#countdown'), starter: txt('#sessionStarter') });
+    check('一) **默认全员已签到**：3 名学生都是绿色 present',
+      Qa('#studentGrid .student-card').length === 3 &&
+      Qa('#studentGrid .student-card').every((c) => c.dataset.status === 'present' && /green/.test(c.className)),
+      Qa('#studentGrid .student-card').map((c) => c.dataset.status));
+    check('一) 统计条：总人数 3 / 已签到 3 / 缺勤 0 / 请假 0',
+      txt('#statTotal') === '3' && txt('#statPresent') === '3' && txt('#statAbsent') === '0' && txt('#statLeave') === '0',
+      { total: txt('#statTotal'), present: txt('#statPresent'), absent: txt('#statAbsent'), leave: txt('#statLeave') });
+    check('一) 尚未保存时提示"默认全员已签到，点掉没来的人后点保存"', /默认全员已签到/.test(txt('#autoHint')), txt('#autoHint'));
+    check('一) 未保存修改标记：初始不显示', hidden('#autoDirty'));
+
+    // ============================================================
+    // 二、点卡片取消未到 / 再点恢复（本地草稿，不落库）+ 右键请假
+    // ============================================================
+    log('\n— 二) 点取消未到 / 请假 —');
+    clickCard('自签同学1');
+    await sleep(300);
+    let st1 = cardStatus('自签同学1');
+    check('二) 点一下 → 取消未到：该生变红（absent）+「待保存」角标',
+      st1 && st1.status === 'absent' && /red/.test(st1.cls) && /待保存/.test(st1.badge || ''), st1);
+    check('二) 统计实时更新：已签到 2 / 缺勤 1', txt('#statPresent') === '2' && txt('#statAbsent') === '1', { p: txt('#statPresent'), a: txt('#statAbsent') });
+    check('二) 出现"有未保存的修改"标记 + 保存按钮可用',
+      !hidden('#autoDirty') && !hidden('#autoSave'), { dirty: !hidden('#autoDirty'), save: !hidden('#autoSave') });
+    // 未点保存 → 服务端不应有任何记录（路线 B：默认全签只在本地）
+    const beforeSave = await japi('/api/attendance/status?slot=morning&date=' + today() + '&classId=' + created.classId);
+    check('二) 未保存时服务端仍是 0 条记录（默认全签只存在前端草稿里）',
+      beforeSave.data && beforeSave.data.autoSessions && Number(beforeSave.data.autoSessions[0].marked) === 0,
+      beforeSave.data && beforeSave.data.autoSessions);
+    clickCard('自签同学1');
+    await sleep(250);
+    st1 = cardStatus('自签同学1');
+    check('二) 再点一下 → 恢复已签到（绿色）', st1 && st1.status === 'present' && /green/.test(st1.cls), st1);
+    // 右键 → 标记为请假：自动签到模式下事由直接可见（一步到位）
+    rightClickCard('自签同学2');
+    await sleep(300);
+    check('二) 右键菜单出现（含「标记为请假」「恢复为已签到」）',
+      !hidden('#contextMenu') && /标记为请假/.test(txt('#contextAbsentLeave')) && /恢复为已签到/.test(txt('#contextAbsentPresent')),
+      { menu: !hidden('#contextMenu'), leave: txt('#contextAbsentLeave'), present: txt('#contextAbsentPresent') });
+    const reasonBtns = Qa('#contextMenu [data-reason]').filter((b) => !b.classList.contains('hidden'));
+    check('二) 自动签到模式下右键直接给出病假/事假/公假事由',
+      reasonBtns.length >= 2, reasonBtns.map((b) => b.textContent.trim()));
+    const sickBtn = reasonBtns.find((b) => /病假/.test(b.textContent));
+    sickBtn.click();
+    await sleep(400);
+    const toastTxt = txt('#toast');
+    const dbgAuto = (() => { try { const a = W().__DSH_AUTO; return a ? { slot: a.slot, on: a.on, dirty: a.dirty, draft: a.draft } : 'no-hook'; } catch (e) { return 'err:' + e.message; } })();
+    const st2 = cardStatus('自签同学2');
+    check('二) 标记病假 → 该生变橙（leave）且角标写事由',
+      st2 && st2.status === 'leave' && /orange/.test(st2.cls) && /请假/.test(st2.badge || ''), { st2, toastTxt, dbgAuto });
+    check('二) 统计：已签到 2 / 请假 1', txt('#statPresent') === '2' && txt('#statLeave') === '1', { p: txt('#statPresent'), l: txt('#statLeave') });
+
+    // ============================================================
+    // 三、保存本场 → 整场落库（显式 present/absent/leave）→ 刷新保持
+    // ============================================================
+    log('\n— 三) 保存本场 —');
+    clickCard('自签同学3');   // 同学3 → 缺勤
+    await sleep(250);
+    Q('#autoSave').click();
+    await until(() => /已保存/.test(txt('#toast')), 15000);
+    await sleep(800);
+    check('三) 保存成功提示（含 已签到/缺勤/请假 计数）', /已保存/.test(txt('#toast')) && /已签到/.test(txt('#toast')), txt('#toast'));
+    check('三) 保存后"未保存"标记消失', hidden('#autoDirty'));
+    const afterSave = await japi('/api/attendance/status?slot=morning&date=' + today() + '&classId=' + created.classId);
+    check('三) 服务端落库：早自习已登记 3 条（present/absent/leave 显式行）',
+      afterSave.data.autoSessions[0].marked === 3 && afterSave.data.autoSessions[0].present === 1 &&
+      afterSave.data.autoSessions[0].absent === 1 && afterSave.data.autoSessions[0].leave === 1,
+      afterSave.data.autoSessions[0]);
+    const rw = await japi('/api/attendance/status?slot=morning&date=' + today() + '&classId=' + created.classId);
+    const recs = Object.values(rw.data.records || {});
+    check('三) 记录类型正确：1 个缺勤 + 1 个请假(病假) + 1 个已签到',
+      recs.filter((x) => x.status === 'absent').length === 1 && recs.filter((x) => x.status === 'leave').length === 1 && recs.filter((x) => x.status === 'present').length === 1,
+      recs.map((x) => x.status + (x.leaveReason ? '/' + x.leaveReason : '')));
+    // 刷新页面 → 先切回「早自习」（默认按当前时间选场次：中午前=早自习、中午后=晚自修）→ 状态保持
+    await loadList('/dashboard', '#autoBar');
+    await pickMorning();
+    Qa('#autoSlots .auto-slot-btn')[0].click();
+    await until(() => /早自习/.test(txt('#startTime')) && Qa('#studentGrid .student-card').length === 3, 15000);
+    await sleep(900);
+    const kept = { s1: cardStatus('自签同学1'), s2: cardStatus('自签同学2'), s3: cardStatus('自签同学3') };
+    check('三) 刷新后保持：同学1 已签到 / 同学2 请假 / 同学3 缺勤',
+      kept.s1.status === 'present' && kept.s2.status === 'leave' && kept.s3.status === 'absent',
+      { s1: kept.s1.status, s2: kept.s2.status, s3: kept.s3.status });
+    check('三) 刷新后（该场已保存）提示变为"随时可录入"', /随时可录入/.test(txt('#autoHint')), txt('#autoHint'));
+
+    // ============================================================
+    // 四、切到「晚自修」：独立一场，互不影响
+    // ============================================================
+    log('\n— 四) 切换晚自修 —');
+    Qa('#autoSlots .auto-slot-btn')[1].click();
+    await until(() => /晚自修/.test(txt('#startTime')), 15000);
+    await sleep(600);
+    check('四) 切到晚自修：场次标签变为「晚自修」', /晚自修/.test(txt('#startTime')), txt('#startTime'));
+    check('四) 晚自修默认另起一场：全员已签到（3 绿），不受早自习影响',
+      Qa('#studentGrid .student-card').every((c) => c.dataset.status === 'present' && /green/.test(c.className)),
+      Qa('#studentGrid .student-card').map((c) => c.dataset.status));
+    const eveBefore = await japi('/api/attendance/status?slot=evening&date=' + today() + '&classId=' + created.classId);
+    const eveSlot = ((eveBefore.data && eveBefore.data.autoSessions) || []).find((x) => x.slot === 'evening');
+    check('四) 晚自修服务端仍 0 条记录（两场各存各的）', !!eveSlot && Number(eveSlot.marked) === 0, eveSlot);
+    // 未保存时切回早自习 → 二次确认
+    clickCard('自签同学1');
+    await sleep(250);
+    Qa('#autoSlots .auto-slot-btn')[0].click();
+    await sleep(400);
+    check('四) 有未保存修改时切换场次 → 弹二次确认', !hidden('#confirmModal') || /放弃未保存/.test(txt('body')),
+      { confirm: !hidden('#confirmModal'), body: txt('body').slice(0, 80) });
+
+    // ============================================================
+    // 五、座位表模式 + 「全员到齐」：早/晚必须各写各的场次（2026-09-30 真实 BUG 的回归）
+    //   BUG 现象：座位表下选着「早自习」点卡片/全员到齐，记录却写进了「晚自修」
+    //     （早自习 已签 0/17、晚自修 已签 15/17 —— 因为批量接口当时没带 sessionId，
+    //       服务端只能挑"最新一场 active" = 晚自修）
+    // ============================================================
+    log('\n— 五) 座位表 + 全员到齐：早/晚各写各的 —');
+    await asUser(MON);
+    await loadList('/dashboard', '#autoBar');
+    await pickMorning();
+    await until(() => viewModeIs('seat') && Qa('#seatGrid .seat-card').length >= 3, 15000);
+    // 先把两场都清成"缺勤"（模拟"都还没登记"），再分别用「全员到齐」写入
+    check('五) 座位表已渲染（≥3 张座位卡）', Qa('#seatGrid .seat-card').length >= 3, Qa('#seatGrid .seat-card').length);
+    const allAbsent = created.students.filter(Boolean).map((sid) => ({ studentId: sid, status: 'absent' }));
+    for (const slot of ['morning', 'evening']) {
+      const st = await japi('/api/attendance/status?slot=' + slot + '&date=' + today() + '&classId=' + created.classId);
+      await japi('/api/attendance/session-save', { method: 'POST', body: { sessionId: st.data.session.id, records: allAbsent } });
+    }
+    await loadList('/dashboard', '#autoBar');
+    await pickMorning();
+    await until(() => viewModeIs('seat') && Qa('#seatGrid .seat-card').length >= 3, 15000);
+    await until(() => Qa('#autoSlots .auto-slot-btn').length === 2, 15000);
+    // 确保当前选中的是「早自习」
+    Qa('#autoSlots .auto-slot-btn')[0].click();
+    await until(() => /早自习/.test(txt('#startTime')), 15000);
+    await sleep(800);
+    check('五) 座位表下选中「早自习」（座位卡片显示缺勤=红）',
+      /早自习/.test(txt('#startTime')) && Qa('#seatGrid .seat-card').every((c) => /red/.test(c.className)),
+      Qa('#seatGrid .seat-card').map((c) => c.className.replace('seat-card', '').trim()));
+    // 点「全员到齐」→ 二次确认
+    Q('#btnBatchAll').click();
+    await until(() => !hidden('#confirmModal'), 8000);
+    Q('#confirmOk').click();
+    await until(() => /全员签到完成/.test(txt('#toast')), 15000);
+    await sleep(900);
+    const seen = (slot) => japi('/api/attendance/status?slot=' + slot + '&date=' + today() + '&classId=' + created.classId)
+      .then((r) => (r.data.autoSessions || []).find((x) => x.slot === slot) || {});
+    const mAfter = await seen('morning');
+    const eAfter = await seen('evening');
+    check('五) 「全员到齐」写进**早自习**（早自习 present=3，晚自修 present 仍为 0）',
+      Number(mAfter.present) === 3 && Number(eAfter.present) === 0,
+      { morning: mAfter, evening: eAfter });
+    // 切到晚自修 → 座位表卡片必须同步刷新（红色=该场是缺勤；若没刷新会残留绿色）
+    Qa('#autoSlots .auto-slot-btn')[1].click();
+    await until(() => /晚自修/.test(txt('#startTime')), 15000);
+    await sleep(1000);
+    check('五) 切到「晚自修」后座位表卡片同步刷新（变回缺勤=红，不是上一场的绿）',
+      Qa('#seatGrid .seat-card').length >= 3 && Qa('#seatGrid .seat-card').every((c) => /red/.test(c.className)),
+      Qa('#seatGrid .seat-card').map((c) => c.className.replace('seat-card', '').trim()));
+    // 晚自修也点「全员到齐」→ 只动晚自修
+    Q('#btnBatchAll').click();
+    await until(() => !hidden('#confirmModal'), 8000);
+    Q('#confirmOk').click();
+    await until(() => /全员签到完成/.test(txt('#toast')), 15000);
+    await sleep(900);
+    const mAfter2 = await seen('morning');
+    const eAfter2 = await seen('evening');
+    check('五) 「全员到齐」写进**晚自修**（晚自修 present=3、早自习 present 仍为 3）',
+      Number(eAfter2.present) === 3 && Number(mAfter2.present) === 3,
+      { morning: mAfter2, evening: eAfter2 });
+    check('五) 座位表统计条与当前场次一致（已签到 3）', /已签到\s*3/.test(txt('#seatStats')), txt('#seatStats'));
+
+    console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
+  } catch (e) {
+    console.error(e);
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    await hardCleanup().catch(() => {});
+    log('\n清理完成');
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

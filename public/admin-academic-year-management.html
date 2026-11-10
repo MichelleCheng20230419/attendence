@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>学年管理 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+      /* 页头与返回按钮样式统一由 style.css 提供（.page-head / .back-link） */
+      .action-bar { display: flex; gap: 10px; flex-wrap: wrap; }
+
+      /* 标签页 */
+      .admin-tabs {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 16px;
+        border-bottom: 2px solid var(--border);
+      }
+      .admin-tab {
+        padding: 10px 20px;
+        border: none;
+        background: none;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-light);
+        cursor: pointer;
+        border-bottom: 3px solid transparent;
+        margin-bottom: -2px;
+      }
+      .admin-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+      .admin-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 14px;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .admin-head .filters { display: flex; gap: 10px; flex-wrap: wrap; }
+      .admin-head select {
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        font-size: 13px;
+        background: #fff;
+        outline: none;
+      }
+      .admin-panel {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+        padding: 20px;
+      }
+      .admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+      .admin-table th {
+        background: var(--bg);
+        color: var(--text-light);
+        font-weight: 600;
+        font-size: 13px;
+        text-align: left;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        white-space: nowrap;
+      }
+      .admin-table td { padding: 12px 14px; border-bottom: 1px solid #F0F2F5; vertical-align: middle; }
+      .admin-table tbody tr:hover { background: #FAFCFE; }
+      .admin-table tbody tr:last-child td { border-bottom: none; }
+      .admin-table .td-actions { text-align: right; white-space: nowrap; }
+      .tag { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; color: #fff; }
+      .tag.active  { background: var(--success); }
+      .tag.archived { background: var(--pending); color: #666; }
+      /* 角色标签：管理员蓝 / 教师绿 / 学生紫 / 班长青 */
+      .tag.admin   { background: #2563eb; }
+      .tag.teacher { background: #10b981; }
+      .tag.student { background: #8b5cf6; }
+      .tag.monitor { background: #06b6d4; }
+      .btn-text {
+        background: none; border: none; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 4px;
+      }
+      .btn-text.edit { color: var(--primary); }
+      .btn-text.edit:hover { background: var(--primary-light); }
+      .btn-text.del { color: var(--danger); }
+      .btn-text.del:hover { background: #FFF1F0; }
+      .user-menu { position: relative; }
+
+      /* 学年管理 */
+      .year-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+        padding: 20px;
+        margin-bottom: 16px;
+      }
+      .year-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 12px; }
+      .year-current { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 14px; }
+      .year-current .val { font-size: 18px; font-weight: 700; color: var(--primary); }
+      .wizard-step { margin-bottom: 14px; font-size: 14px; color: var(--text); }
+      .wizard-step label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-light); }
+      .radio-row { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0; }
+      .radio-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text); }
+      .wizard-mode-desc { font-size: 12px; color: var(--text-light); margin: 6px 0 10px; }
+
+      /* 学期设置 */
+      .term-desc { font-size: 13px; color: var(--text-light); line-height: 1.8; margin-bottom: 10px; }
+      .term-status {
+        font-size: 13px; line-height: 1.6; padding: 9px 12px; border-radius: 8px;
+        background: #F7F9FC; border: 1px solid var(--border); color: var(--text); margin-bottom: 14px;
+      }
+      .term-status.warn { background: #FFF8E6; border-color: #FFE0A3; color: #8A6100; }
+      .term-status.ok { background: #EFFAF3; border-color: #B7E6C9; color: #14663C; }
+      .term-grid { display: flex; flex-direction: column; gap: 12px; }
+      .term-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+      .term-row > label { width: 72px; flex: 0 0 auto; font-size: 13px; color: var(--text-light); }
+      .term-row input[type="date"] {
+        padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+        background: #fff; outline: none; min-width: 150px;
+      }
+      .term-row select {
+        padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; background: #fff; outline: none;
+      }
+      .term-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    </style>
+</head>
+<body>
+
+<header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+    <!-- 统一页头：返回按钮在左上角、页面标题居中、功能按钮靠右 -->
+    <div class="page-head">
+      <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+      <h2 class="page-title">📆 学年管理</h2>
+    </div>
+
+    <!-- ================= 学年管理 ================= -->
+        <div id="tabYears" class="admin-tab-panel">
+          <div class="year-card">
+            <h3>当前学年</h3>
+            <div class="year-current">
+              <span>当前学年：</span><span class="val" id="currentYearVal">—</span>
+              <select id="switchYearSelect"></select>
+              <button id="btnSwitchYear" class="btn btn-secondary">切换</button>
+            </div>
+          </div>
+          <div class="year-card">
+            <h3>学期设置</h3>
+            <p class="term-desc">
+              各页面的「本学期」筛选（考勤分析 / 课堂表现 / 巡查面板）按这里配置的起止日期统计。
+              <b>只需先填「当前学期」的起止日期</b>，各页面的「本学期」立即按它统计（学期未结束则统计到当天）；另一个学期可以稍后补填。
+              当前学期起止日期留空时，按默认口径统计：上学期 9 月 1 日 ~ 次年 1 月 31 日，下学期 2 月 1 日 ~ 7 月 15 日。
+            </p>
+            <div id="termStatus" class="term-status">加载中…</div>
+            <div class="term-grid">
+              <div class="term-row">
+                <label>上学期</label>
+                <input type="date" id="termFirstStart" aria-label="上学期开始日期">
+                <span>~</span>
+                <input type="date" id="termFirstEnd" aria-label="上学期结束日期">
+              </div>
+              <div class="term-row">
+                <label>下学期</label>
+                <input type="date" id="termSecondStart" aria-label="下学期开始日期">
+                <span>~</span>
+                <input type="date" id="termSecondEnd" aria-label="下学期结束日期">
+              </div>
+              <div class="term-row">
+                <label>当前学期</label>
+                <select id="termCurrent">
+                  <option value="first">上学期</option>
+                  <option value="second">下学期</option>
+                </select>
+                <span class="hint">（决定「本学期」按哪一段统计）</span>
+              </div>
+            </div>
+            <div class="term-actions">
+              <button id="btnSaveTerm" class="btn btn-primary">保存学期设置</button>
+              <button id="btnTermDefault" class="btn btn-secondary">填入默认值</button>
+              <button id="btnTermClear" class="btn btn-secondary">清空（改为未配置）</button>
+              <span id="termMsg" class="hint"></span>
+            </div>
+          </div>
+          <div class="year-card">
+            <h3>学年切换向导</h3>
+            <div class="wizard-step">
+              <label>第一步：选择目标学年</label>
+              <input type="text" id="targetYearInput" placeholder="如 2027-2028" style="width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:8px">
+            </div>
+            <div class="wizard-step">
+              <label>第二步：选择操作方式</label>
+              <div class="radio-row">
+                <label><input type="radio" name="yearMode" value="A" checked> 方式A：一键升级（自动升级学生年级，保留班级结构）</label>
+                <label><input type="radio" name="yearMode" value="B"> 方式B：导入新结构（Excel 导入年级/班级/学生）</label>
+                <label><input type="radio" name="yearMode" value="C"> 方式C：组合导入（一次性导入年级+班级+学生+教师带班）</label>
+              </div>
+              <div class="wizard-mode-desc" id="modeDesc">A：一年级→二年级…六年级→毕业；新学年自动建立对应年级与班级，学生整体升级。</div>
+              <div id="yearImportRow" class="hidden" style="margin-top:8px">
+                <input type="file" id="yearImportFile" accept=".xlsx,.xls">
+                <span class="hint">Excel 需包含4个Sheet：年级 / 班级 / 学生 / 教师带班</span>
+              </div>
+            </div>
+            <div class="wizard-step">
+              <button id="btnExecYear" class="btn btn-primary">第三步：执行切换</button>
+              <span id="yearMsg" class="hint" style="margin-left:10px"></span>
+            </div>
+          </div>
+
+          <!-- 每日作业科目配置（系统每天 0 点自动为每个班发布当天各科条目；可全局默认，也可按班单独配置） -->
+          <div class="year-card">
+            <h3>📋 每日作业科目配置</h3>
+            <p class="hint" style="margin-bottom:8px">
+              <b>系统每天 0 点自动</b>为每个班发布当天的「每日作业」条目（标题「今日作业」、发布人=系统、状态=待提交），
+              科目 = 语文/数学/英语 + 该班选科科目（详见「班级管理 → 选科」）；
+              班长在「签到操作台 → 📝 作业统计」勾选未交学生；班主任在「作业管理」页查看各科已交/未交/提交率与未交名单。
+            </p>
+            <div class="dh-row">
+              <label>生效范围
+                <select id="dhScope"></select>
+              </label>
+              <label>截止时间
+                <input type="time" id="dhDeadline" step="60" title="每日作业当天的截止时间（默认 23:59）">
+              </label>
+              <span class="hint" id="dhScopeHint">—</span>
+            </div>
+            <div class="dh-subjects" id="dhSubjects"><span class="hint">加载中…</span></div>
+            <div class="dh-row">
+              <button id="btnDhSave" class="btn btn-primary">保存科目</button>
+              <button id="btnDhDefault" class="btn btn-secondary">填入默认 6 科</button>
+              <button id="btnDhResetClass" class="btn btn-secondary hidden">该班恢复全局默认</button>
+              <span id="dhMsg" class="dh-msg"></span>
+            </div>
+          </div>
+        </div>
+    </section><!-- /.page-card -->
+  </div>
+
+  
+
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-box confirm-box">
+      <h3 id="confirmTitle">提示</h3>
+      <p id="confirmMessage" class="confirm-message"></p>
+      <div class="modal-actions">
+        <button id="confirmCancel" class="btn btn-secondary">取消</button>
+        <button id="confirmOk" class="btn btn-danger">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script>window.ADMIN_PAGE = 'years';</script>
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/admin.js?v=3.17.0"></script>
+</body>
+</html>

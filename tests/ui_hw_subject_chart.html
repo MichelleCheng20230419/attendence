@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：作业统计「按学生查看」→ 各科作业提交情况图表
+  验证点：
+    ① 按学生查看弹窗内新增「📊 各科作业提交情况」区块（含图例）
+    ② 每个学科显示 应交次数 / 实交次数 / 提交率（与接口 bySubject 逐项一致）
+    ③ 提交率颜色标记：100% 绿（优秀）、80-99% 橙（需关注）、<80% 红（需改进）
+    ④ 柱状条宽度 = 提交率；时间范围切换后图表同步更新
+    ⑤ 作业明细列表保持不变（列与条数 = records）
+    ⑥ 区间内没有作业时显示占位文案
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_hw_subject_chart -AdminPw <管理员密码>
+  说明：只读驱动（不写夹具），学生/区间取自页面当前状态，避免污染真实库
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>作业统计：按学生查看 → 各科作业提交情况</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+const css = (el, prop) => { try { return W().getComputedStyle(el).getPropertyValue(prop).trim(); } catch (_) { return ''; } };
+async function loadPage(url, waitSel = 'body') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(1200);
+}
+function rateLevel(rate) {
+  if (rate >= 100) return 'ok';
+  if (rate >= 80) return 'warn';
+  return 'bad';
+}
+// 读取当前弹窗内的图表行
+function chartRows() {
+  return Qa('#stSubjects .hsc-row').map((r) => ({
+    subject: r.querySelector('.hsc-subj') ? r.querySelector('.hsc-subj').textContent.trim() : '',
+    count: r.querySelector('.hsc-count') ? r.querySelector('.hsc-count').textContent.trim() : '',
+    rate: r.querySelector('.hsc-rate') ? r.querySelector('.hsc-rate').textContent.trim() : '',
+    rateClass: r.querySelector('.hsc-rate') ? r.querySelector('.hsc-rate').className.replace('hsc-rate', '').trim() : '',
+    badge: r.querySelector('.hsc-badge') ? r.querySelector('.hsc-badge').textContent.trim() : '',
+    badgeClass: r.querySelector('.hsc-badge') ? r.querySelector('.hsc-badge').className.replace('hsc-badge', '').trim() : '',
+    fillClass: r.querySelector('.hsc-bar > i') ? r.querySelector('.hsc-bar > i').className : '',
+    width: r.querySelector('.hsc-bar > i') ? r.querySelector('.hsc-bar > i').style.width : '',
+    fillColor: r.querySelector('.hsc-bar > i') ? css(r.querySelector('.hsc-bar > i'), 'background-image') : '',
+  }));
+}
+async function expectFor() {
+  // 用页面自身的班级/区间/学生，向接口取同一份数据作为期望
+  const range = W().rangeDates();
+  const classId = W().scopeClassId();
+  const sid = Q('#stStudent').value;
+  const p = new URLSearchParams();
+  if (classId) p.set('classId', classId);
+  if (range.from) p.set('from', range.from);
+  if (range.to) p.set('to', range.to);
+  const d = await japi('/api/homework/student/' + sid + '?' + p.toString());
+  return { sid, range, data: d.data };
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备（登录 + 打开作业统计 → 按学生查看）…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    fr.style.width = '1500px'; fr.style.height = '1000px';
+    await loadPage('/homework', '#btnStudentView');
+    check('0) 作业统计页可用（有「按学生查看」按钮）', !!Q('#btnStudentView'));
+    Q('#btnStudentView').click();
+    await until(() => !hidden('#studentModal') && Qa('#stSubjects .hsc-row').length > 0, 15000);
+    await sleep(600);
+    const exp = await expectFor();
+    check('0) 弹窗打开且取到接口期望数据（学生 ' + exp.sid + '）',
+      !hidden('#studentModal') && !!exp.data && Array.isArray(exp.data.bySubject), { bySubject: exp.data && exp.data.bySubject });
+    if (!exp.data || !(exp.data.bySubject || []).length) {
+      skip('图表内容断言', '当前区间该学生没有作业数据（真实库为空）');
+      log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+      document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+      return;
+    }
+
+    // ---------- 1) 图表区块结构 ----------
+    log('\n— A) 图表区块 —');
+    check('① 弹窗内有「📊 各科作业提交情况」区块',
+      !!Q('.hw-subject-chart') && /各科作业提交情况/.test(txt('.hw-subject-chart .hsc-head h4')) && visible('.hw-subject-chart'),
+      { title: txt('.hw-subject-chart .hsc-head h4'), visible: visible('.hw-subject-chart') });
+    check('① 图例含 优秀 / 需关注 / 需改进 三种颜色',
+      /优秀/.test(txt('.hsc-legend')) && /需关注/.test(txt('.hsc-legend')) && /需改进/.test(txt('.hsc-legend')) &&
+      !!Q('.hsc-legend .lg-ok') && !!Q('.hsc-legend .lg-warn') && !!Q('.hsc-legend .lg-bad'));
+    check('① 图表区块位于「时间范围」与「作业明细列表」之间',
+      (() => {
+        const chart = Q('.hw-subject-chart'), quick = Q('.range-quick'), table = Q('#stBody');
+        if (!chart || !quick || !table) return false;
+        return chart.getBoundingClientRect().top > quick.getBoundingClientRect().bottom - 2 &&
+               chart.getBoundingClientRect().bottom <= table.getBoundingClientRect().top + 2;
+      })());
+
+    // ---------- 2) 每科应交/实交/提交率 ----------
+    log('\n— B) 各科数据（与接口逐项一致） —');
+    const rows = chartRows();
+    check('② 学科行数 = 接口 bySubject 条数（' + exp.data.bySubject.length + '）',
+      rows.length === exp.data.bySubject.length, { ui: rows.length, api: exp.data.bySubject.length });
+    const mismatch = rows.filter((r, i) => {
+      const a = exp.data.bySubject[i];
+      return !a || r.subject !== a.subject || r.count !== `${a.submitted}/${a.expected} 次` || r.rate !== `${a.rate}%`;
+    });
+    check('② 每行的 学科 / 实交-应交 / 提交率 全部与接口一致', mismatch.length === 0,
+      { mismatch, exp: exp.data.bySubject.map((x) => `${x.subject} ${x.submitted}/${x.expected} ${x.rate}%`), ui: rows.map((r) => `${r.subject} ${r.count} ${r.rate}`) });
+    check('② 提交率低的学科排在前面（与接口同序）',
+      JSON.stringify(rows.map((r) => r.subject)) === JSON.stringify(exp.data.bySubject.map((x) => x.subject)),
+      { ui: rows.map((r) => r.subject), api: exp.data.bySubject.map((x) => x.subject) });
+
+    // ---------- 3) 颜色标记 ----------
+    log('\n— C) 颜色标记 —');
+    const lvlBad = rows.filter((r, i) => rateLevel(Number(exp.data.bySubject[i].rate)) !== (r.badgeClass || '')).length;
+    check('③ 徽标等级与提交率匹配（100%→ok / 80-99%→warn / <80%→bad）', lvlBad === 0,
+      rows.map((r, i) => `${exp.data.bySubject[i].rate}%→${r.badgeClass || '(空)'}(${r.badge})`));
+    check('③ 徽标文案 = ✅ 优秀 / ⚠️ 需关注 / ❌ 需改进',
+      rows.every((r, i) => {
+        const lv = rateLevel(Number(exp.data.bySubject[i].rate));
+        const want = lv === 'ok' ? '优秀' : lv === 'warn' ? '需关注' : '需改进';
+        return r.badge.indexOf(want) >= 0;
+      }), rows.map((r) => r.badge));
+    check('③ 柱状条填充色与等级一致（fill-ok / fill-warn / fill-bad）',
+      rows.every((r, i) => r.fillClass.indexOf('fill-' + rateLevel(Number(exp.data.bySubject[i].rate))) >= 0),
+      rows.map((r) => `${r.rate}:${r.fillClass}`));
+    const okRow = rows.find((r, i) => rateLevel(Number(exp.data.bySubject[i].rate)) === 'ok');
+    const badRow = rows.find((r, i) => rateLevel(Number(exp.data.bySubject[i].rate)) === 'bad');
+    if (okRow) {
+      check('③ 100% 的学科显示绿色（rgba 含绿通道渐变）',
+        /rgb\(82, 196, 26\)|rgb\(149, 222, 100\)|95DE64|52C41A/i.test(okRow.fillColor) || okRow.fillColor.indexOf('gradient') >= 0,
+        { subject: okRow.subject, color: okRow.fillColor });
+    } else { skip('③ 绿色断言', '当前区间没有 100% 的学科'); }
+    if (badRow) {
+      check('③ <80% 的学科显示红色',
+        /rgb\(255, 77, 79\)|rgb\(255, 163, 158\)/i.test(badRow.fillColor) || badRow.fillColor.indexOf('gradient') >= 0,
+        { subject: badRow.subject, color: badRow.fillColor });
+    } else { skip('③ 红色断言', '当前区间没有 <80% 的学科'); }
+    check('④ 柱状条宽度 = 提交率（百分比）',
+      rows.every((r, i) => r.width === exp.data.bySubject[i].rate + '%'), rows.map((r) => r.width));
+
+    // ---------- 4) 时间范围切换 ----------
+    log('\n— D) 时间范围切换 —');
+    const beforeRange = txt('#stSummary');
+    Qa('.range-quick .btn').find((b) => b.dataset.range === 'week').click();
+    await sleep(1500);
+    const expWeek = await expectFor();
+    await until(() => {
+      const rr = chartRows();
+      if (!expWeek.data || !(expWeek.data.bySubject || []).length) return /暂无作业/.test(txt('#stSubjects'));
+      return rr.length === expWeek.data.bySubject.length &&
+        JSON.stringify(rr.map((x) => [x.subject, x.count, x.rate])) === JSON.stringify(expWeek.data.bySubject.map((x) => [x.subject, `${x.submitted}/${x.expected} 次`, `${x.rate}%`]));
+    }, 12000);
+    const weekRows = chartRows();
+    check('④ 切「本周」→ 图表按新区间刷新（与接口一致）',
+      !(expWeek.data.bySubject || []).length
+        ? /暂无作业/.test(txt('#stSubjects'))
+        : JSON.stringify(weekRows.map((x) => [x.subject, x.count, x.rate])) ===
+          JSON.stringify(expWeek.data.bySubject.map((x) => [x.subject, `${x.submitted}/${x.expected} 次`, `${x.rate}%`])),
+      { ui: weekRows.map((x) => `${x.subject} ${x.count} ${x.rate}`), api: expWeek.data.bySubject.map((x) => `${x.subject} ${x.submitted}/${x.expected} ${x.rate}%`) });
+    check('④ 切换区间后汇总行同步刷新', txt('#stSummary') !== '--' && txt('#stSummary').indexOf('提交率') >= 0, txt('#stSummary'));
+    // 回到本月
+    Qa('.range-quick .btn').find((b) => b.dataset.range === 'month').click();
+    await sleep(1500);
+    await until(() => chartRows().length === exp.data.bySubject.length, 12000);
+    check('④ 切回「本月」→ 图表恢复原区间数据',
+      JSON.stringify(chartRows().map((x) => [x.subject, x.rate])) === JSON.stringify(exp.data.bySubject.map((x) => [x.subject, `${x.rate}%`])),
+      { after: chartRows().map((x) => `${x.subject}:${x.rate}`) });
+
+    // 自定义空区间 → 占位文案
+    Qa('.range-quick .btn').find((b) => b.dataset.range === 'custom').click();
+    await sleep(300);
+    Q('#stFrom').value = '2020-01-01';
+    Q('#stTo').value = '2020-01-31';
+    Q('#stApply').click();
+    await until(() => /暂无作业/.test(txt('#stSubjects')), 12000);
+    check('⑥ 区间内没有作业 → 图表显示「该时间范围内暂无作业」，明细列表提示无记录',
+      /暂无作业/.test(txt('#stSubjects')) && /没有作业记录/.test(txt('#stBody')) && chartRows().length === 0,
+      { chart: txt('#stSubjects'), list: txt('#stBody').slice(0, 40) });
+
+    // 回到本月做明细列表校验
+    Qa('.range-quick .btn').find((b) => b.dataset.range === 'month').click();
+    await sleep(1500);
+    const exp2 = await expectFor();
+    await until(() => Qa('#stBody tr').length === (exp2.data.records || []).length, 12000);
+
+    // ---------- 5) 明细列表保持不变 ----------
+    log('\n— E) 明细列表 —');
+    check('⑤ 明细列表列不变（日期/学科/作业标题/是否提交/提交时间）',
+      JSON.stringify(Qa('#studentModal .admin-table thead th').map((t) => t.textContent.trim())) ===
+      JSON.stringify(['日期', '学科', '作业标题', '是否提交', '提交时间']),
+      Qa('#studentModal .admin-table thead th').map((t) => t.textContent.trim()));
+    check('⑤ 明细条数 = 接口 records 条数（' + (exp2.data.records || []).length + '）',
+      Qa('#stBody tr').length === (exp2.data.records || []).length, { ui: Qa('#stBody tr').length, api: (exp2.data.records || []).length });
+    check('⑤ 已交/未交标签仍正常显示',
+      Qa('#stBody tr').every((tr) => /已交|未交/.test(tr.textContent)), Qa('#stBody tr').length);
+    check('⑤ 图表与明细学科一致（图表学科 ⊆ 明细学科）',
+      chartRows().every((r) => (exp2.data.records || []).some((x) => (x.subject || '未标学科') === r.subject)),
+      { chart: chartRows().map((r) => r.subject), records: [...new Set((exp2.data.records || []).map((x) => x.subject))] });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

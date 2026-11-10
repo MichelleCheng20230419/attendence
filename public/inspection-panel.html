@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>巡查面板 - 武汉一中管理平台</title>
+  <link rel="stylesheet" href="/style.css?v=3.16.0">
+  <style>
+    /* 巡查面板：数据统计 → 巡查面板（统一卡片模板 + 统一导航栏） */
+    .pf-filters { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .pf-filters label { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-light); }
+    .pf-filters select, .pf-filters input[type="date"] {
+      font-size: 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+      background: #fff; font-family: inherit; color: var(--text);
+    }
+    .pf-filters #pRange { min-width: 120px; }
+    .pf-filter-note { margin-left: auto; font-size: 13px; color: var(--text-light); }
+    .pf-filter-note.warn { color: #A9700B; font-weight: 600; }
+
+    /* 统计卡片 */
+    .stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .stat-card {
+      background: #fff; border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 18px 20px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .stat-card .sc-label { font-size: 13px; color: var(--text-light); }
+    .stat-card .sc-value { font-size: 30px; font-weight: 800; line-height: 1.2; font-variant-numeric: tabular-nums; }
+    .stat-card.total .sc-value { color: var(--text); }
+    .stat-card.resolved .sc-value { color: #237804; }
+    .stat-card.processing .sc-value { color: #AD6800; }
+    .stat-card.pending .sc-value { color: #CF1322; }
+    .stat-card .sc-sub { font-size: 12px; color: var(--text-light); }
+
+    /* 区块 */
+    .panel-section { margin-top: 24px; }
+    .panel-section:first-of-type { margin-top: 0; }
+    .section-title { font-size: 15px; font-weight: 800; margin: 0 0 12px; }
+
+    /* 班级排行表 */
+    .rank-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .rank-table th {
+      background: var(--bg); color: var(--text-light); font-weight: 600; font-size: 13px;
+      text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    .rank-table th.sortable { cursor: pointer; user-select: none; }
+    .rank-table th.sortable:hover { color: var(--primary); }
+    .rank-table th .arrow { font-size: 11px; margin-left: 4px; color: var(--primary); }
+    .rank-table td { padding: 12px 14px; border-bottom: 1px solid #F0F2F5; font-variant-numeric: tabular-nums; }
+    .rank-table tbody tr:hover { background: #FAFCFE; }
+    .rank-table tbody tr:last-child td { border-bottom: none; }
+    .rate-bar { display: inline-block; min-width: 46px; }
+    .rank-empty { padding: 30px; text-align: center; color: var(--text-light); font-size: 14px; }
+
+    /* 图表 */
+    .chart-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 20px; }
+    .chart-card { border: 1px solid var(--border); border-radius: var(--radius-lg); background: #fff; padding: 16px 18px; }
+    .chart-card h4 { font-size: 14px; font-weight: 800; margin: 0 0 10px; color: var(--text); }
+    .chart-box { position: relative; height: 280px; }
+    .chart-box.pie { height: 280px; }
+    .chart-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-light); font-size: 13px; }
+
+    @media (max-width: 1100px) {
+      .chart-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 720px) {
+      .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .stat-card .sc-value { font-size: 24px; }
+      .rank-table { font-size: 13px; }
+      .rank-table th, .rank-table td { padding: 9px 10px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部导航栏：由统一组件 navbar.js 渲染（全站同一份） -->
+  <header class="navbar" id="navbarHost"></header>
+
+  <div class="container">
+    <section class="page-card">
+      <!-- 统一页头：返回(左) · 标题居中 · 导出(右) -->
+      <div class="page-head">
+        <button id="btnBack" class="back-link"><span class="back-arrow">←</span> 返回签到</button>
+        <h2 class="page-title">📊 巡查面板</h2>
+        <div class="action-bar">
+          <button id="btnExport" class="btn btn-primary">📤 导出 Excel</button>
+        </div>
+      </div>
+
+      <!-- 筛选 -->
+      <div class="pf-filters filter-bar">
+        <label>时间
+          <select id="pRange"></select>
+        </label>
+        <span id="customWrap" style="display:none">
+          <input type="date" id="pStart"> ~ <input type="date" id="pEnd">
+        </span>
+        <label>年级
+          <select id="pGrade"><option value="">全部</option></select>
+        </label>
+        <button id="btnApply" class="btn btn-secondary">查询</button>
+        <span class="pf-filter-note" id="filterNote">--</span>
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="stat-grid">
+        <div class="stat-card total">
+          <span class="sc-label">问题总数</span>
+          <span class="sc-value" id="scTotal">0</span>
+          <span class="sc-sub" id="scTotalSub">涉及 0 个班级</span>
+        </div>
+        <div class="stat-card resolved">
+          <span class="sc-label">已解决</span>
+          <span class="sc-value" id="scResolved">0</span>
+          <span class="sc-sub" id="scResolvedSub">解决率 0%</span>
+        </div>
+        <div class="stat-card processing">
+          <span class="sc-label">处理中</span>
+          <span class="sc-value" id="scProcessing">0</span>
+          <span class="sc-sub">整改中</span>
+        </div>
+        <div class="stat-card pending">
+          <span class="sc-label">待处理</span>
+          <span class="sc-value" id="scPending">0</span>
+          <span class="sc-sub">待跟进</span>
+        </div>
+      </div>
+
+      <!-- 班级问题排行 -->
+      <div class="panel-section">
+        <div class="section-title">📊 班级问题排行（默认问题数从少到多，点击表头可排序）</div>
+        <div class="plan-table-wrap">
+          <table class="rank-table">
+            <thead>
+              <tr>
+                <th style="width:70px">排名</th>
+                <th class="sortable" data-sort="className">班级<span class="arrow"></span></th>
+                <th class="sortable" data-sort="total">问题数<span class="arrow"></span></th>
+                <th class="sortable" data-sort="resolved">已解决<span class="arrow"></span></th>
+                <th class="sortable" data-sort="pending">待处理<span class="arrow"></span></th>
+                <th class="sortable" data-sort="rate">解决率<span class="arrow"></span></th>
+              </tr>
+            </thead>
+            <tbody id="rankBody"></tbody>
+          </table>
+        </div>
+        <div id="rankEmpty" class="rank-empty hidden">当前筛选条件下暂无巡堂问题</div>
+      </div>
+
+      <!-- 图表 -->
+      <div class="panel-section">
+        <div class="chart-grid">
+          <div class="chart-card">
+            <h4>📈 问题趋势（按周）</h4>
+            <div class="chart-box"><canvas id="trendChart"></canvas><div id="trendEmpty" class="chart-empty hidden">暂无数据</div></div>
+          </div>
+          <div class="chart-card">
+            <h4>🥧 问题类型分布</h4>
+            <div class="chart-box pie"><canvas id="typeChart"></canvas><div id="typeEmpty" class="chart-empty hidden">暂无数据</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/vendor/chart.umd.min.js"></script>
+  <script src="/inspection-common.js?v=3.13.0"></script>
+  <script src="/navbar.js?v=3.20.0"></script>
+  <script src="/inspection-panel.js?v=3.13.2"></script>
+</body>
+</html>

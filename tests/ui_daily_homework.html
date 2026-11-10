@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：每日固定 6 科作业（班长端录入 / 班主任端只看交没交 / 科目可配置）
+    ① 班长端「作业统计」Tab：进入"今天"自动出现 6 科「今日作业」条目（无需老师先发布）+「每日作业」标签
+    ② 点某科「录入」→ 已交默认勾选 → 取消勾选=未交 → 保存 → 列表显示 已交 x/总数、状态"已收"
+    ③ 班主任端「今日各科提交情况」表格：科目 / 已交·总数 / 提交率 / 未交名单（未录入显示"未录入"）
+    ④ 科目可配置：管理员在 系统管理 → 学年管理 的「每日作业科目配置」里给某班单独配置 → 该班班长端只生成这些科目
+    ⑤ 与"老师发布的具体作业"共存：同一天的发布作业与 6 科每日作业同时出现在班长端列表
+    ⑥ 签到操作台的「作业统计」Tab **仅班长可见**（班主任/任课老师/管理员都没有，作业走「作业管理」页）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_daily_homework -AdminPw <管理员密码>
+  夹具：1 年级 + 2 班（甲 3 人 / 乙 3 人）+ 甲乙班长 + 甲班班主任 + 管理员；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>每日固定 6 科作业（班长端录入 · 班主任端查看 · 科目可配置）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const fire = (el, type) => el.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(1000);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+// 班长端「作业统计」Tab 的行：[科目, 标题, 发布老师, 截止, 已交/未交, 收作业状态, 操作]
+const hwRows = () => Qa('#hwTaskList tr').map((tr) => {
+  const td = [...tr.querySelectorAll('td')].map((x) => x.textContent.replace(/\s+/g, ' ').trim());
+  const btn = tr.querySelector('.hw-entry');
+  const raw = td[0] || '';
+  return {
+    cells: td,
+    subject: raw.replace(/每日作业/g, '').trim(),   // 去掉「每日作业」标签文字
+    raw,
+    title: td[1] || '',
+    daily: /每日作业/.test(raw),
+    id: btn ? Number(btn.dataset.id) : null,
+    btn: btn ? btn.textContent.trim() : '',
+  };
+});
+const DEFAULTS = ['语文', '数学', '英语', '物理', '化学', '生物'];
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '日作UI年级' + stamp;
+const CA = '日作UI甲班' + stamp, CB = '日作UI乙班' + stamp;
+const MONA = 'dhu_mona_' + stamp, MONB = 'dhu_monb_' + stamp, HEAD = 'dhu_head_' + stamp, SUBJ = 'dhu_subj_' + stamp;
+const created = { gradeId: null, classIds: [], students: [], users: [] };
+
+async function hardCleanup() {
+  await asUser('admin');
+  // 清掉夹具班级的作业（含每日作业与提交情况）+ 还原全局默认科目
+  for (const c of created.classIds) {
+    const d = await japi('/api/homework/tasks?classIds=' + c + '&from=2020-01-01&to=2099-12-31');
+    for (const t of ((d.data && d.data.tasks) || [])) await japi('/api/homework/tasks/' + t.id, { method: 'DELETE' });
+    await japi('/api/homework/daily-subjects', { method: 'PUT', body: { classId: c, subjects: [] } });
+  }
+  await japi('/api/homework/daily-subjects', { method: 'PUT', body: { classId: null, subjects: DEFAULTS } });
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^日作UI[甲乙]班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^dhu_/.test(x.username))) await japi('/api/users/' + u.id, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^日作UI年级/.test(x.grade_name || x.gradeName || ''))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'DHU', academicYear: year } })).data.id;
+    const mkClass = async (name) => (await japi('/api/classes', { method: 'POST', body: { className: name, gradeName: GRADE, academicYear: year } })).data.id;
+    const ca = await mkClass(CA), cb = await mkClass(CB);
+    created.classIds = [ca, cb];
+    const mkStu = async (classId, prefix) => {
+      for (let i = 1; i <= 3; i += 1) {
+        const r = await japi('/api/students', { method: 'POST', body: { studentNo: prefix + stamp + String(i).padStart(2, '0'), name: prefix + '同学' + i, classId, status: '在读' } });
+        created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+      }
+    };
+    await mkStu(ca, 'DHUA'); await mkStu(cb, 'DHUB');
+    for (const [u, role, name, cid] of [[MONA, 'monitor', '日作UI甲班长', ca], [MONB, 'monitor', '日作UI乙班长', cb], [HEAD, 'teacher', '日作UI班主任', ca]]) {
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role, realName: name, classId: cid, subject: role === 'teacher' ? '语文' : null, mustChangePassword: false, profileLocked: true, force: true, teachingClasses: role === 'teacher' ? [{ classId: cid, roleInClass: 'head_teacher' }] : undefined } });
+      created.users.push(r.data.user.id);
+    }
+    // 纯任课老师（无班主任班级）：用于验证"签到操作台作业统计 Tab 仅班长可见"的角色矩阵
+    {
+      const r = await japi('/api/users', { method: 'POST', body: { username: SUBJ, password: '123456', role: 'teacher', realName: '日作UI任课', classId: ca, subject: '数学', mustChangePassword: false, profileLocked: true, force: true, teachingClasses: [{ classId: ca, roleInClass: 'subject_teacher' }] } });
+      created.users.push(r.data.user.id);
+    }
+    check('0) 夹具就绪（2 班各 3 人 + 甲乙班长 + 甲班班主任 + 纯任课老师）',
+      created.classIds.every(Boolean) && created.students.filter(Boolean).length === 6 && created.users.length === 4);
+
+    // ============================================================
+    // 一、班长端：进入"今天"自动生成 6 科每日作业
+    // ============================================================
+    log('\n— 一) 班长端自动生成 6 科 —');
+    fr.style.width = '1500px'; fr.style.height = '1100px';
+    await asUser(MONA);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6, 20000);
+    await sleep(600);
+    let rows = hwRows();
+    if (rows.length === 0) {
+      check('诊断（班长端作业列表为空时输出上下文）', false, {
+        viewHidden: hidden('#homeworkView'),
+        btnHidden: hidden('#btnViewHomework'),
+        count: txt('#hwTaskCount'),
+        empty: txt('#hwTaskEmpty'),
+        tip: txt('#hwReadonlyTip'),
+        listHtml: Q('#hwTaskList') ? Q('#hwTaskList').innerHTML.replace(/\s+/g, ' ').slice(0, 150) : 'no-el',
+        bodyHead: txt('body').slice(0, 120),
+      });
+    }
+    check('一) 班长端「作业统计」Tab 自动出现 6 条「今日作业」（无需老师先发布）',
+      rows.length >= 6 && rows.filter((r) => r.daily).length === 6, { rows: rows.length, daily: rows.filter((r) => r.daily).length });
+    check('一) 科目 = 语文/数学/英语/物理/化学/生物（按配置顺序）',
+      JSON.stringify(rows.filter((r) => r.daily).map((r) => r.subject.trim())) === JSON.stringify(DEFAULTS),
+      rows.filter((r) => r.daily).map((r) => r.subject));
+    check('一) 标题固定「今日作业」、发布老师显示「系统」',
+      rows.filter((r) => r.daily).every((r) => r.title === '今日作业' && /系统/.test(r.cells[2] || '')),
+      rows[0] && rows[0].cells);
+    check('一) 每条 已交 0（未录入），收作业状态「待收」',
+      rows.filter((r) => r.daily).every((r) => /^0 \/ 3$/.test(r.cells[4] || '') && /待收/.test(r.cells[5] || '')),
+      rows[0] && rows[0].cells);
+    check('一) 每行有「录入」按钮', rows.filter((r) => r.daily).every((r) => r.btn === '录入'));
+
+    // ============================================================
+    // 二、录入：已交默认勾选 → 取消 2 人 = 未交 → 保存
+    // ============================================================
+    log('\n— 二) 班长录入提交情况 —');
+    const mathRow = hwRows().find((r) => r.daily && r.subject.trim() === '数学');
+    Qa('#hwTaskList .hw-entry').find((b) => Number(b.dataset.id) === mathRow.id).click();
+    await until(() => !hidden('#hwEntryView') && Qa('#hwSeatGrid .hw-card').length >= 3, 20000);
+    check('二) 点「录入」→ 进入录入界面（标题含数学/今日作业 + "已交默认勾选"提示）',
+      /数学/.test(txt('#hwEntryTitle')) && /今日作业/.test(txt('#hwEntryTitle')) && /已交默认勾选/.test(txt('#hwEntryTitle')),
+      txt('#hwEntryTitle'));
+    const cards = () => Qa('#hwSeatGrid .hw-card');
+    check('二) 卡片默认全部"已交"（3/3）', cards().length === 3 && /已交 3/.test(txt('#hwEntryStats')), txt('#hwEntryStats'));
+    // 取消 2 人（点卡片切换；每次重新查询节点——切换后座位表会重渲染）
+    cards()[0].click();
+    await sleep(250);
+    cards()[1].click();
+    await sleep(250);
+    check('二) 取消勾选 2 人 → 统计变 已交 1 / 未交 2', /已交 1/.test(txt('#hwEntryStats')) && /未交 2/.test(txt('#hwEntryStats')), txt('#hwEntryStats'));
+    check('二) 出现"有未保存修改"提示', !hidden('#hwDirty'), txt('#hwDirty'));
+    Q('#hwEntrySave').click();
+    // 等保存真正完成（toast 出现 / "有未保存修改"提示消失），否则点"返回列表"会弹"放弃修改"确认框
+    await until(() => /已保存|保存失败/.test(txt('#toast')) || hidden('#hwDirty'), 15000);
+    if (!hidden('#confirmModal')) {           // 兜底：若弹出确认框就选"确定"（放弃提示不影响正确性）
+      const ok = Q('#confirmOk');
+      if (ok) ok.click();
+      await sleep(300);
+    }
+    Q('#hwBackList').click();
+    await until(() => !hidden('#hwListView') && Qa('#hwTaskList tr').length >= 6, 15000);
+    await until(() => {
+      const r2 = hwRows().find((r) => r.daily && r.subject === '数学');
+      return r2 && /^1 \/ 2$/.test(r2.cells[4] || '');
+    }, 15000);
+    rows = hwRows();
+    const mathAfter = rows.find((r) => r.daily && r.subject === '数学');
+    const detailAfter = (await japi('/api/homework/tasks/' + mathRow.id)).data || {};
+    check('二) 保存后列表显示 已交 1 / 未交 2，状态「已收」，按钮变「修改」',
+      mathAfter && /^1 \/ 2$/.test(mathAfter.cells[4]) && /已收/.test(mathAfter.cells[5]) && mathAfter.btn === '修改',
+      { row: mathAfter && mathAfter.cells, submissions: detailAfter.submissions, toast: txt('#toast') });
+    check('二) 其他科目仍未录入（待收，已交 0）',
+      rows.filter((r) => r.daily && r.subject !== '数学').every((r) => /^0 \/ 3$/.test(r.cells[4]) && /待收/.test(r.cells[5])),
+      rows.filter((r) => r.daily).map((r) => [r.subject, r.cells[4], r.cells[5]]));
+
+    // ============================================================
+    // 三、班主任端：今日各科提交情况（只看交没交）
+    // ============================================================
+    log('\n— 三) 班主任端查看 —');
+    await asUser(HEAD);
+    await load('/homework', '#dailyHwBody');
+    await until(() => Qa('#dailyHwBody tr').length >= 6, 20000);
+    await sleep(600);
+    check('三) 作业统计页出现「今日各科提交情况」表格（表头：科目/已交·总数/提交率/未交名单）',
+      /科目/.test(txt('#dailyHwHead')) && /已交/.test(txt('#dailyHwHead')) && /提交率/.test(txt('#dailyHwHead')) && /未交名单/.test(txt('#dailyHwHead')),
+      txt('#dailyHwHead'));
+    check('三) 卡片标题明确写「每日作业」，并说明提交情况由班长录入（老师端只读）',
+      /每日作业/.test(txt('#dailyHwCard h3')) && /班长/.test(txt('#dailyHwTip')) && /只读/.test(txt('#dailyHwTip')),
+      { h3: txt('#dailyHwCard h3'), tip: txt('#dailyHwTip') });
+    const dailyRows = Qa('#dailyHwBody tr').map((tr) => [...tr.querySelectorAll('td')].map((x) => x.textContent.replace(/\s+/g, ' ').trim()));
+    check('三) 表格 6 行（6 科）', dailyRows.length === 6, dailyRows.length);
+    const mathTr = dailyRows.find((r) => r[0].trim() === '数学');
+    check('三) 数学行：已交 1 / 总数 3、提交率 33.3%、未交名单含 2 名学生',
+      mathTr && /^1 \/ 3$/.test(mathTr[1]) && mathTr[2] === '33.3%' && (mathTr[3].match(/同学/g) || []).length === 2,
+      mathTr);
+    check('三) 未录入的科目显示「未录入」（而不是 0%）',
+      dailyRows.filter((r) => r[0].trim() !== '数学').every((r) => /未录入/.test(r[3]) && r[2] === '—'),
+      dailyRows.map((r) => [r[0], r[2], r[3].slice(0, 6)]));
+    check('三) 班主任端不需要看到具体作业内容（表头无"标题"列）', !/标题/.test(txt('#dailyHwHead')));
+
+    // ============================================================
+    // 三b、签到操作台「作业统计」Tab 的角色矩阵：**仅班长**
+    //   2026-09-29 修正：上一版曾把该 Tab 对班主任/任课老师/管理员开放为"只读"入口，
+    //   但同一件事在「签到操作台」和「作业管理」两处各有一套口径，班主任反而困惑。
+    //   现在统一：签到台只给**班长**（录入台）；老师端作业一律看「教学工具 → 📚 作业管理」。
+    // ============================================================
+    log('\n— 三b) 签到操作台 Tab 角色矩阵（仅班长有「作业统计」） —');
+    const tabTexts = () => Qa('.view-toggle-btn')
+      .filter((b) => !b.classList.contains('hidden'))
+      .map((b) => b.textContent.replace(/\s+/g, ' ').trim());
+    // 班主任：没有作业统计 Tab，只剩列表/座位表；作业走「作业管理」页
+    await asUser(HEAD);
+    await load('/dashboard', '#studentGrid');
+    check('三b) 班主任：签到操作台没有「📝 作业统计」Tab', hidden('#btnViewHomework'),
+      { btn: txt('#btnViewHomework'), tabs: tabTexts() });
+    // 需求 2026-09-30：签到台只有座位表模式 —— 列表/座位表切换按钮已移除，老师端连按钮都没有
+    check('三b) 班主任：签到操作台没有任何视图切换按钮（只有座位表模式）',
+      tabTexts().length === 0 && !tabTexts().some((t) => /作业/.test(t)),
+      tabTexts());
+    check('三b) 班主任：「作业统计」Tab 隐藏时不会停在作业视图（仍在列表/座位表）',
+      hidden('#homeworkView'), { homeworkViewHidden: hidden('#homeworkView') });
+    check('三b) 班主任：导航栏有「📚 作业管理」入口（教学工具）',
+      !hidden('#btnHomeworkManage') && /作业管理/.test(txt('#btnHomeworkManage')),
+      { btn: txt('#btnHomeworkManage') });
+    // 班主任在「作业管理」页看到本班当天 6 科每日作业（这就是"查看作业"的正路）
+    await load('/homework-manage', '#taskBody');
+    await until(() => Qa('#taskBody tr').length > 0, 20000);
+    await sleep(600);
+    const mgRows = () => Qa('#taskBody tr').map((tr) => [...tr.querySelectorAll('td')].map((x) => x.textContent.replace(/\s+/g, ' ').trim()));
+    let mgr = mgRows();
+    check('三b) 班主任：「作业管理」页出现当天各科「每日作业」（6 科）',
+      mgr.filter((c) => /每日作业/.test(c.join(' '))).length === 6,
+      mgr.map((c) => c.slice(0, 3).join('/')));
+    const mgHead = Q('#taskBody').closest('table').querySelector('thead').textContent.replace(/\s+/g, ' ').trim();
+    check('三b) 班主任：「作业管理」页列有 学科 / 已交 / 未交 / 提交率（表头 + 数据）',
+      /学科/.test(mgHead) && /已交/.test(mgHead) && /未交/.test(mgHead) && /提交率/.test(mgHead) &&
+      mgr.every((c) => /%|—/.test(c.join(' '))),
+      { head: mgHead, row0: mgr[0] });
+    // 任课老师（纯任课）：同样没有作业统计 Tab
+    await asUser(SUBJ);
+    await load('/dashboard', '#studentGrid');
+    check('三b) 任课老师：签到操作台没有作业统计入口、也没有视图切换按钮',
+      hidden('#btnViewHomework') && tabTexts().length === 0, tabTexts());
+    // 管理员：同样没有
+    await asUser('admin');
+    await load('/dashboard', '#studentGrid');
+    check('三b) 管理员：签到操作台同样没有作业统计入口与视图切换按钮',
+      hidden('#btnViewHomework') && tabTexts().length === 0, { tabs: tabTexts(), btn: txt('#btnViewHomework') });
+    // 班长：签到操作台上的「作业」按钮也已按需求移除（作业入口统一走导航栏）；录入台用 URL 直达
+    await asUser(MONA);
+    await load('/dashboard', '#seatGrid');
+    check('三b) 班长：签到操作台右上角**没有**「📝 作业」按钮（入口统一走导航栏 → 作业统计）',
+      hidden('#btnViewHomework') && tabTexts().length === 0,
+      { tabs: tabTexts(), btn: txt('#btnViewHomework') });
+    check('三b) 班长：导航栏有顶层「📝 作业统计」菜单（签到操作旁边）',
+      !hidden('#btnHomework') && /作业统计/.test(txt('#btnHomework')),
+      { nav: txt('#btnHomework'), top: Qa('#navbarMenus > .nav-item').filter((b) => !b.classList.contains('hidden')).map((b) => b.id) });
+    // 作业录入台仍可用：URL 直达 /dashboard?view=homework（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6, 20000);
+    check('三b) 班长：URL 直达作业录入台仍能进入（本班作业列表可见，功能未丢失）',
+      !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6,
+      { hidden: hidden('#homeworkView'), rows: Qa('#hwTaskList tr').length });
+
+    // 班长点导航栏「作业统计」→ 必须进入**录入台**（不是统计汇总页）
+    //   2026-09-30 需求：班长要的是"当天 6 科 + 录入/修改 → 座位表默认全交 → 点卡片取消 → 保存"；
+    //   总作业数/平均提交率/按学科提交率图表是班主任/管理员看的
+    await asUser(MONA);
+    await load('/homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6, 20000);
+    await sleep(600);
+    const monRows = Qa('#hwTaskList tr').map((tr) => tr.textContent.replace(/\s+/g, ' ').trim());
+    check('三c) 班长打开「作业统计」→ 落到**作业录入台**（不是统计汇总页）',
+      F().location.pathname === '/dashboard' && !hidden('#homeworkView'),
+      { path: F().location.pathname, search: F().location.search, hwView: !hidden('#homeworkView') });
+    check('三c) 录入台列出当天 6 科作业（语文…生物）', monRows.length >= 6, monRows.slice(0, 3));
+    check('三c) 每科都有「录入/修改」按钮（班长可直接录入）',
+      Qa('#hwTaskList tr .hw-entry').length >= 6, Qa('#hwTaskList tr .hw-entry').length);
+    check('三c) 班长**看不到**统计汇总与图表（统计卡/按学科提交率图都不在页面里）',
+      !Q('#scTasks') && !Q('#subjectBars') && !Q('#dailyHwCard'),
+      { scTasks: !!Q('#scTasks'), bars: !!Q('#subjectBars'), dailyCard: !!Q('#dailyHwCard') });
+    // 点「录入」→ 进入录入界面，默认全员已交（绿）
+    Qa('#hwTaskList tr .hw-entry')[0].click();
+    await until(() => !hidden('#hwEntryView') && Qa('#hwSeatGrid .hw-card').length > 0, 20000);
+    await sleep(500);
+    const hwCards = Qa('#hwSeatGrid .hw-card');
+    check('三c) 点「录入」进入录入界面：默认**全员已交**（卡片为已交态 done）',
+      hwCards.length > 0 && hwCards.every((c) => c.classList.contains('done')),
+      { n: hwCards.length, cls: hwCards.slice(0, 3).map((c) => c.className) });
+
+    // ============================================================
+    // 四、科目可配置（管理员 · 学年管理页）
+    // ============================================================
+    log('\n— 四) 管理员配置科目 —');
+    await asUser('admin');
+    await load('/admin/academic-year-management', '#dhSubjects');
+    await until(() => Qa('#dhSubjects .dh-subject-chip').length >= 6, 20000);
+    check('四) 学年管理页有「每日作业科目配置」卡片（列出可选科目 + 生效范围）',
+      Qa('#dhSubjects .dh-subject-chip').length >= 6 && !!Q('#dhScope') && /全局默认/.test(txt('#dhScope')),
+      { chips: Qa('#dhSubjects .dh-subject-chip').length, scope: txt('#dhScope') });
+    check('四) 全局默认当前勾选默认 6 科',
+      Qa('#dhSubjects .dh-subject-chip').filter((c) => c.querySelector('input').checked)
+        .map((c) => c.dataset.subject).join(',') === DEFAULTS.join(','),
+      Qa('#dhSubjects .dh-subject-chip').filter((c) => c.querySelector('input').checked).map((c) => c.dataset.subject));
+    // 给乙班单独配置 4 个"非默认"科目（顺序按可选科目清单：政治/历史/地理 在 其他 之前）
+    const custom = ['历史', '政治', '地理', '其他'];
+    const sorted = (arr) => JSON.stringify([...arr].sort());
+    Q('#dhScope').value = String(created.classIds[1]);
+    fire(Q('#dhScope'), 'change');
+    await until(() => /单独配置|未单独配置/.test(txt('#dhScopeHint')), 15000);
+    Qa('#dhSubjects .dh-subject-chip').forEach((c) => {
+      const on = custom.includes(c.dataset.subject);
+      const cb = c.querySelector('input');
+      if (cb.checked !== on) { cb.checked = on; fire(cb, 'change'); }
+    });
+    Q('#btnDhSave').click();
+    await until(() => /已保存/.test(txt('#dhMsg')), 15000);
+    check('四) 给乙班保存自定义科目（历史/政治/地理/其他）→ 提示已保存',
+      /已保存/.test(txt('#dhMsg')), txt('#dhMsg'));
+    const cfgB = (await japi('/api/homework/daily-subjects?classId=' + created.classIds[1])).data;
+    check('四) 接口确认乙班已单独配置（source=class，4 科）',
+      cfgB.source === 'class' && sorted(cfgB.classSubjects) === sorted(custom), cfgB.classSubjects);
+    // 乙班班长端：只生成这 4 科
+    await asUser(MONB);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 4, 20000);
+    await sleep(600);
+    const rowsB = hwRows().filter((r) => r.daily);
+    check('四) 乙班班长端按"单独配置"生成 4 科（历史/政治/地理/其他）',
+      sorted(rowsB.map((r) => r.subject)) === sorted(custom), rowsB.map((r) => r.subject));
+    // 甲班不受影响（仍是默认 6 科）—— 用甲班班长自己的页面核对
+    await asUser(MONA);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && Qa('#hwTaskList tr').length >= 6, 20000);
+    await sleep(600);
+    check('四) 甲班不受影响（仍是默认 6 科）',
+      JSON.stringify(hwRows().filter((r) => r.daily).map((r) => r.subject)) === JSON.stringify(DEFAULTS),
+      hwRows().filter((r) => r.daily).map((r) => r.subject));
+    // 清除乙班配置 → 恢复全局默认
+    await asUser('admin');
+    await load('/admin/academic-year-management', '#dhSubjects');
+    Q('#dhScope').value = String(created.classIds[1]);
+    fire(Q('#dhScope'), 'change');
+    await until(() => !hidden('#btnDhResetClass'), 15000);
+    check('四) 已单独配置的班级显示「该班恢复全局默认」按钮', !hidden('#btnDhResetClass'));
+    Q('#btnDhResetClass').click();
+    await until(() => /已恢复使用全局默认/.test(txt('#dhMsg')) || /恢复/.test(txt('#dhMsg')), 15000);
+    check('四) 点「该班恢复全局默认」→ 提示恢复成功',
+      /恢复/.test(txt('#dhMsg')), txt('#dhMsg'));
+
+    // ============================================================
+    // 五、与"老师发布的具体作业"共存
+    // ============================================================
+    log('\n— 五) 与老师发布共存 —');
+    const today = (await japi('/api/settings')).data && new Date().toISOString().slice(0, 10);
+    const pub = await japi('/api/homework/tasks', {
+      method: 'POST', body: { classIds: [created.classIds[0]], subject: '英语', title: '【UI】默写 Unit 3', deadline: today + ' 22:00' },
+    });
+    check('五) 管理员发布一条具体作业（英语）→ 201', pub.status === 201, pub.data);
+    await asUser(MONA);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => Qa('#hwTaskList tr').length >= 7, 20000);
+    await sleep(600);
+    const rows5 = hwRows();
+    check('五) 班长端列表同时显示 6 条每日作业 + 1 条老师发布的作业',
+      rows5.filter((r) => r.daily).length === 6 && rows5.some((r) => /默写 Unit 3/.test(r.title)),
+      rows5.map((r) => [r.subject.trim(), r.title, r.daily]));
+    check('五) 老师发布的作业没有「每日作业」标签',
+      rows5.find((r) => /默写 Unit 3/.test(r.title)).daily === false);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^日作UI[甲乙]班/.test(c.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^dhu_/.test(u.username));
+    const leftDaily = ((await japi('/api/homework/daily-subjects')).data || {}).global;
+    check('清理：夹具班级/学生/账号已清除，全局默认科目已还原',
+      leftCls.length === 0 && leftUsers.length === 0 && JSON.stringify(leftDaily) === JSON.stringify(DEFAULTS),
+      { classes: leftCls.length, users: leftUsers.length, global: leftDaily });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

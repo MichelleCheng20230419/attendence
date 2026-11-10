@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：班级「选科组合 + 选科科目」（迁移 v34）
+    需求：不同班级选科不同（理科/文科/小理/小文/综合）→ 各班开设学科不同；
+          语文/数学/英语 所有班级默认都有；物理/化学/生物/政治/历史/地理 由选科决定；
+          班级绑定选科后，该班每天自动生成对应学科的「今日作业」条目（数量不再固定 6 科）。
+    验证点：
+      A) 班级管理页：表格新增「选科」列；添加/编辑班级弹窗有 选科组合 下拉 + 选科科目 多选框 + "该班开设学科"提示
+         · 理科 → 自动勾选 物理/化学/生物（6 科）  · 文科 → 自动勾选 政治/历史/地理
+         · 小理/小文/综合 → 手动勾选（切组合不清空已勾选）  · 手动取消一科 → 提示科数随之变化
+         · 保存后列表显示「组合 + 选科科目」；再次编辑能正确回显
+      B) 导入：弹窗说明含 选科组合/选科科目/班主任，且「下载模板」指向 /api/classes/import-template
+      C) 班长端「作业统计」：每日作业按该班实际开设学科生成
+         · 理科班 → 语文/数学/英语/物理/化学/生物（6 科）
+         · 小理班（物理+地理）→ 语文/数学/英语/物理/地理（5 科，少于 6 科也能正常生成）
+      D) 管理端「每日作业科目配置」：选中班级时说明"为什么是这几科"（按班级选科推导 / 未设置选科走全局默认）
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_class_stream -AdminPw <管理员密码>
+  夹具：1 个临时年级 + 2 个临时班级（理科 / 小理）+ 2 个班长账号；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>班级选科组合 / 选科科目（v34）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', redirect: 'manual',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(900);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+function setSelect(sel, val) {
+  const e = typeof sel === 'string' ? Q(sel) : sel;
+  if (!e) return false;
+  e.value = val;
+  e.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+  return true;
+}
+function clickChipByText(subject) {
+  const chip = Qa('#cElectives .dh-subject-chip').find((c) => (c.dataset.subject || '') === subject);
+  if (!chip) return false;
+  const input = chip.querySelector('input');
+  input.checked = !input.checked;
+  input.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+  return true;
+}
+const checkedElectives = () => Qa('#cElectives input.c-elective').filter((i) => i.checked).map((i) => i.value);
+// 把选科科目勾选状态设成期望值（逐个 set checked + 派发 change，避免"点一下切反"的歧义）
+function setChecked(want) {
+  const set = new Set(want);
+  Qa('#cElectives input.c-elective').forEach((i) => {
+    const to = set.has(i.value);
+    if (i.checked !== to) {
+      i.checked = to;
+      i.dispatchEvent(new (W().Event)('change', { bubbles: true }));
+    }
+  });
+}
+// 页面脚本（admin.js）在 iframe 内运行 → 必须在 iframe 的 window 上拦截 open 才能断言下载地址
+function stubFrameOpen() {
+  const list = opened;
+  try { W().open = (url) => { list.push(String(url)); return null; }; } catch (_) {}
+}
+// 班长端「作业统计」的行 → 每日作业科目列表（去掉「每日作业」标签文字）
+const dailySubjects = () => Qa('#hwTaskList tr')
+  .filter((tr) => /每日作业/.test(tr.textContent))
+  .map((tr) => { const td = tr.querySelector('td'); return td ? td.textContent.replace(/每日作业/g, '').replace(/\s+/g, '').trim() : ''; });
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '选科UI年级' + stamp;
+const CSCI = '选科UI理科班' + stamp, CSMALL = '选科UI小理班' + stamp;
+const MONSCI = 'csu_monsci_' + stamp, MONSMALL = 'csu_monsmall_' + stamp;
+const created = { gradeId: null, classIds: [], users: [] };
+const opened = [];
+
+async function hardCleanup() {
+  await asUser('admin');
+  // 夹具班级的作业（含每日作业）与其提交情况
+  for (const c of created.classIds.filter(Boolean)) {
+    const d = await japi('/api/homework/tasks?classIds=' + c + '&from=2020-01-01&to=2099-12-31');
+    for (const t of ((d.data && d.data.tasks) || [])) await japi('/api/homework/tasks/' + t.id, { method: 'DELETE' });
+  }
+  // 先按 id（含本驱动在页面上新建的班），再按名字兜底；名字前缀统一 选科UI 避免漏删
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^选科UI/.test(x.className))) {
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^csu_/.test(x.username))) {
+    await japi('/api/users/' + u.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^选科UI年级/.test(x.grade_name || x.gradeName || ''))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'CSU', academicYear: year } })).data.id;
+    // 理科班（自动 物化生 → 6 科）与小理班（手动 物理+地理 → 5 科，验证"不固定 6 科"）
+    const mkClass = async (name, stream, electives) => {
+      const r = await japi('/api/classes', { method: 'POST', body: { className: name, gradeId: created.gradeId, academicYear: year, stream, electiveSubjects: electives } });
+      if (r.status !== 201) throw new Error('建班失败 ' + name + '：' + JSON.stringify(r.data));
+      created.classIds.push(r.data.id);
+      return r.data;
+    };
+    const sci = await mkClass(CSCI, '理科', []);
+    const small = await mkClass(CSMALL, '小理', ['物理', '地理']);
+    check('0) 夹具班级就绪（理科班 6 科 / 小理班 5 科）',
+      sci.effectiveSubjects.length === 6 && small.effectiveSubjects.length === 5, { sci: sci.effectiveSubjects, small: small.effectiveSubjects });
+    for (const [u, cid] of [[MONSCI, sci.id], [MONSMALL, small.id]]) {
+      const r = await japi('/api/users', { method: 'POST', body: { username: u, password: '123456', role: 'monitor', realName: '选科UI班长', classId: cid, mustChangePassword: false, profileLocked: true, force: true } });
+      if (!r.data || !r.data.user) throw new Error('建班长账号失败：' + JSON.stringify(r.data));
+      created.users.push(r.data.user.id);
+    }
+    // 拦截 window.open（导入模板下载断言用）
+    const realOpen = window.open;
+    window.open = (url) => { opened.push(String(url)); return null; };
+
+    // ============================================================
+    // A) 班级管理页：选科组合 + 选科科目（联动）
+    // ============================================================
+    log('\n— A) 班级管理：选科组合与选科科目 —');
+    await asUser('admin');
+    await load('/admin/class-management', '#classList');
+    const heads = Qa('.admin-table thead th').map((t) => t.textContent.replace(/\s+/g, ' ').trim());
+    check('A) 班级表格新增「选科（组合 / 选科科目）」列', heads.some((h) => /选科/.test(h)), heads);
+    Q('#btnAddClass').click();
+    await until(() => !hidden('#classModal'), 8000);
+    check('A) 添加班级弹窗有：选科组合下拉 + 选科科目多选框 + "该班开设学科"提示',
+      !!Q('#cStream') && Qa('#cElectives input.c-elective').length === 6 && !!Q('#cEffectiveSubjects'),
+      { stream: !!Q('#cStream'), electives: Qa('#cElectives input.c-elective').length, hint: !!Q('#cEffectiveSubjects') });
+    check('A) 选科组合可选：理科 / 文科 / 小理 / 小文 / 综合',
+      Qa('#cStream option').map((o) => o.value).join(',') === '综合,理科,文科,小理,小文',
+      Qa('#cStream option').map((o) => o.value));
+    check('A) 选科科目多选框 = 物理/化学/生物/政治/历史/地理（语文数学英语默认都有，不在勾选项里）',
+      Qa('#cElectives input.c-elective').map((i) => i.value).join(',') === '物理,化学,生物,政治,历史,地理',
+      Qa('#cElectives input.c-elective').map((i) => i.value));
+
+    // 理科 → 自动勾选 物化生
+    setSelect('#cStream', '理科');
+    await sleep(300);
+    check('A) 选「理科」→ 自动勾选 物理/化学/生物',
+      checkedElectives().join(',') === '物理,化学,生物', checkedElectives());
+    check('A) 提示"该班开设学科"= 6 科（含语文/数学/英语）',
+      /6\s*科/.test(txt('#cEffectiveSubjects')) && /语文、数学、英语、物理、化学、生物/.test(txt('#cEffectiveSubjects')),
+      txt('#cEffectiveSubjects'));
+    // 手动取消 化学 → 5 科
+    clickChipByText('化学');
+    await sleep(200);
+    check('A) 手动取消一科 → 提示变为 5 科且不含化学',
+      checkedElectives().join(',') === '物理,生物' && /5\s*科/.test(txt('#cEffectiveSubjects')) && !/化学/.test(txt('#cEffectiveSubjects')),
+      { checked: checkedElectives(), hint: txt('#cEffectiveSubjects') });
+    // 文科 → 政史地
+    setSelect('#cStream', '文科');
+    await sleep(300);
+    check('A) 切「文科」→ 自动勾选 政治/历史/地理',
+      checkedElectives().join(',') === '政治,历史,地理', checkedElectives());
+    // 小理 → 保留当前勾选（不自动改）
+    setSelect('#cStream', '小理');
+    await sleep(300);
+    check('A) 切「小理」→ 保留当前勾选（手动模式，不清空）',
+      checkedElectives().join(',') === '政治,历史,地理', checkedElectives());
+
+    // 保存（小理 + 物理/地理）→ 列表显示
+    Q('#cName').value = '选科UI新建班' + stamp;
+    setSelect('#cGrade', GRADE);
+    await sleep(200);
+    if (Q('#cYear') && !Q('#cYearRow').classList.contains('hidden')) Q('#cYear').value = year;
+    setSelect('#cStream', '小理');
+    await sleep(200);
+    setChecked(['物理', '地理']);          // 小理：手动勾选
+    await sleep(200);
+    check('A) 手动勾选结果为 物理 + 地理（小理）', checkedElectives().join(',') === '物理,地理', checkedElectives());
+    Q('#cSubmit').click();
+    const saved = await until(() => /选科UI新建班/.test(txt('#classList')), 15000);
+    check('A) 保存成功且列表出现该班', saved, txt('#classList').slice(0, 120));
+    const rowText = Qa('#classList tr').find((tr) => /选科UI新建班/.test(tr.textContent));
+    check('A) 列表「选科」列显示 组合 + 选科科目（小理 / 物理、地理）',
+      !!rowText && /小理/.test(rowText.textContent) && /物理/.test(rowText.textContent) && /地理/.test(rowText.textContent),
+      rowText && rowText.textContent.replace(/\s+/g, ' ').trim());
+    const newRow = Qa('#classList tr').find((tr) => /选科UI新建班/.test(tr.textContent));
+    const newId = newRow ? Number((newRow.querySelector('[data-act="cedit"]') || {}).dataset.id) : null;
+    if (Number.isInteger(newId)) created.classIds.push(newId);
+    // 编辑回显
+    if (newRow) newRow.querySelector('[data-act="cedit"]').click();
+    await until(() => !hidden('#classModal') && /选科UI新建班/.test(txt('#classModalTitle')), 10000);
+    check('A) 再次编辑 → 组合与选科科目正确回显（小理 + 物理/地理）',
+      (Q('#cStream') || {}).value === '小理' && checkedElectives().join(',') === '物理,地理',
+      { stream: (Q('#cStream') || {}).value, electives: checkedElectives() });
+    check('A) 编辑弹窗的"开设学科"提示 = 5 科', /5\s*科/.test(txt('#cEffectiveSubjects')), txt('#cEffectiveSubjects'));
+    Q('#cCancel').click();
+    await sleep(200);
+
+    // ============================================================
+    // B) 导入：说明 + 模板下载
+    // ============================================================
+    log('\n— B) 导入班级（含选科列） —');
+    Q('#btnImportClass').click();
+    await until(() => !hidden('#classImportModal'), 8000);
+    const impText = txt('#classImportModal');
+    check('B) 导入说明含「班级名称/年级/学年/选科组合/选科科目/班主任」',
+      /选科组合/.test(impText) && /选科科目/.test(impText) && /班主任/.test(impText) && /语文、数学、英语/.test(impText),
+      impText.slice(0, 160));
+    check('B) 弹窗有「下载模板」按钮', !!Q('#btnClassTemplate'), !!Q('#btnClassTemplate'));
+    stubFrameOpen();
+    Q('#btnClassTemplate').click();
+    await sleep(500);
+    check('B) 点「下载模板」→ 打开 /api/classes/import-template', opened.some((u) => u.indexOf('/api/classes/import-template') >= 0), opened);
+    Q('#classImportCancel').click();
+    await sleep(200);
+
+    // ============================================================
+    // C) 班长端「作业统计」：每日作业按班级选科生成
+    // ============================================================
+    log('\n— C) 班长端每日作业按选科生成 —');
+    await asUser(MONSCI);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && dailySubjects().length > 0, 25000);
+    const sciSubs = dailySubjects();
+    check('C) 理科班班长：每日作业 = 语文/数学/英语/物理/化学/生物（6 科）',
+      sciSubs.join(',') === '语文,数学,英语,物理,化学,生物', sciSubs);
+    await asUser(MONSMALL);
+    // 需求 2026-09-30：右上角「作业」按钮已移除 → 作业录入台用 URL 直达（班长端）
+    await load('/dashboard?view=homework', '#hwTaskList');
+    await until(() => !hidden('#homeworkView') && dailySubjects().length > 0, 25000);
+    const smallSubs = dailySubjects();
+    check('C) 小理班班长（物理+地理）：每日作业 = 语文/数学/英语/物理/地理（5 科，不固定 6 科）',
+      smallSubs.join(',') === '语文,数学,英语,物理,地理', smallSubs);
+    check('C) 小理班不含 化学/生物/政治/历史（科目随选科变化）',
+      !smallSubs.some((s) => ['化学', '生物', '政治', '历史'].includes(s)), smallSubs);
+
+    // ============================================================
+    // D) 管理端「每日作业科目配置」：说明来源
+    // ============================================================
+    log('\n— D) 每日作业科目配置（来源说明） —');
+    await asUser('admin');
+    await load('/admin/academic-year-management', '#dhScope');
+    await until(() => Qa('#dhScope option').length > 1, 20000);
+    const sciClassId = String(sci.id);
+    setSelect('#dhScope', sciClassId);
+    await until(() => /按班级选科推导/.test(txt('#dhScopeHint')), 15000);
+    check('D) 选中理科班 → 提示「按班级选科推导：理科（物理、化学、生物）→ … 6 科」',
+      /按班级选科推导/.test(txt('#dhScopeHint')) && /6\s*科/.test(txt('#dhScopeHint')), txt('#dhScopeHint'));
+    check('D) 该班生效科目已勾选 6 科（语文/数学/英语/物理/化学/生物）',
+      Qa('#dhSubjects .dh-subject-chip.on').map((c) => c.dataset.subject).join(',') === '语文,数学,英语,物理,化学,生物',
+      Qa('#dhSubjects .dh-subject-chip.on').map((c) => c.dataset.subject));
+    // 未设选科的班（用真实「综合」班：任选一个没有选科的班级）
+    const allCls = ((await japi('/api/classes')).data.classes || []);
+    const noStream = allCls.find((c) => !created.classIds.includes(c.id) && (!c.electiveSubjects || !c.electiveSubjects.length));
+    if (noStream) {
+      const optExists = Qa('#dhScope option').some((o) => String(o.value) === String(noStream.id));
+      const sel = Q('#dhScope');
+      const before = sel ? sel.value : null;
+      setSelect('#dhScope', String(noStream.id));
+      const afterSet = sel ? sel.value : null;
+      // 注意：这里等「使用全局默认」这一句（只有"未设选科"的班才会出现），
+      // 不能等 "未单独配置"（理科提示里也有类似字样 → 会假通过）
+      const ok = await until(() => /使用全局默认/.test(txt('#dhScopeHint')), 15000);
+      check('D) 选中未设选科的班 → 提示「该班未单独配置 → 使用全局默认」并引导去班级管理设置选科',
+        ok && /未单独配置/.test(txt('#dhScopeHint')),
+        { hint: txt('#dhScopeHint'), picked: noStream.id, optExists, before, afterSet,
+          dhScopeCount: Qa('#dhScope').length,
+          apiHint: (await japi('/api/homework/daily-subjects?classId=' + noStream.id)).data.sourceDetail });
+    } else {
+      skip('D) 未设选科班级的提示', '库里没有"未设选科"的其它班级');
+    }
+    window.open = realOpen;
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^选科UI/.test(x.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^csu_/.test(u.username));
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^选科UI年级/.test(g.grade_name || g.gradeName || ''));
+    check('清理：夹具班级/账号/年级已清除',
+      leftCls.length === 0 && leftUsers.length === 0 && leftGrades.length === 0,
+      { classes: leftCls.map((c) => c.className), users: leftUsers.length, grades: leftGrades.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

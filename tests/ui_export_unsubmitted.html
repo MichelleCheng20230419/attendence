@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：班主任端「📊 导出未交统计」（某学科 × 日期范围 → Excel）
+    ① 作业统计页页头有「📊 导出未交统计」按钮
+    ② 点击弹窗：学科（含每日作业科目）/ 班级（班主任默认本班）/ 日期范围（默认近 7 天）
+       以及「近 7 天 / 近 30 天」快捷
+    ③ 校验：缺日期/起止颠倒 → 就地提示错误、不发起下载
+    ④ 点「导出 Excel」→ 打开 /api/homework/export-unsubmitted，参数 = 所选的 班级/学科/起止
+       （弹窗自动关闭 + 提示"正在导出"）
+    ⑤ 服务端返回的 xlsx 文件名符合 班级-学科-未交统计-起至止.xlsx
+    ⑥ 管理员登录时班级下拉可选多个班；班主任登录时只有本班
+  用法（需先启动服务，默认 http://localhost:3000）：
+    推荐：.\tests\run-ui.ps1 -Name ui_export_unsubmitted -AdminPw <管理员密码>
+  夹具：1 年级 + 1 班（4 学生）+ 班主任(数学) + 今天一条数学每日作业（2 交 2 未交）；测完自愈清理
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; width: 1500px; height: 1100px; }
+</style>
+</head>
+<body>
+<h3>班主任端：导出未交统计（学科 × 日期范围）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 20000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(150); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const fire = (el, type) => el.dispatchEvent(new (W().Event)(type, { bubbles: true }));
+async function load(url, waitSel) {
+  fr.src = 'about:blank'; await sleep(200);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && (!waitSel || Q(waitSel)), 25000);
+  await sleep(1000);
+}
+async function asUser(u, p = '123456') {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const r = await japi('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
+  if (r.status !== 200) throw new Error('登录失败 ' + u + '：' + r.status);
+  return r.data && r.data.user;
+}
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '未交UI年级' + stamp;
+const CLASS = '未交UI班' + stamp;
+const HEAD = 'unsu_head_' + stamp;
+const now = new Date();
+const pad = (n) => String(n).padStart(2, '0');
+const dstr = (off) => { const d = new Date(now.getTime() + off * 86400000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const TODAY = dstr(0), WEEK_AGO = dstr(-6), MONTH_AGO = dstr(-29);
+const created = { gradeId: null, classId: null, students: [], users: [], taskId: null };
+
+async function hardCleanup() {
+  await asUser('admin');
+  for (const c of ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((x) => /^未交UI班/.test(x.className))) {
+    const d = await japi('/api/homework/tasks?classIds=' + c.id + '&from=2020-01-01&to=2099-12-31');
+    for (const t of ((d.data && d.data.tasks) || [])) await japi('/api/homework/tasks/' + t.id, { method: 'DELETE' });
+    await japi('/api/homework/daily-subjects', { method: 'PUT', body: { classId: c.id, subjects: [] } });
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id + '?force=1', { method: 'DELETE' });
+  }
+  for (const u of ((await japi('/api/users')).data.users || []).filter((x) => /^unsu_/.test(x.username))) await japi('/api/users/' + u.id, { method: 'DELETE' });
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^未交UI年级/.test(x.grade_name || x.gradeName || ''))) await japi('/api/grades/' + g.id, { method: 'DELETE' });
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    if (lg.status !== 200) throw new Error('管理员登录失败：' + lg.status);
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'UNSU', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    for (let i = 1; i <= 4; i += 1) {
+      const r = await japi('/api/students', { method: 'POST', body: { studentNo: 'UNSU' + stamp + String(i).padStart(2, '0'), name: '未交同学' + i, classId: created.classId, status: '在读' } });
+      created.students.push(r.data && (r.data.student ? r.data.student.id : r.data.id));
+    }
+    const ur = await japi('/api/users', { method: 'POST', body: { username: HEAD, password: '123456', role: 'teacher', realName: '未交UI班主任', classId: created.classId, subject: '数学', mustChangePassword: false, profileLocked: true, force: true, teachingClasses: [{ classId: created.classId, roleInClass: 'head_teacher' }] } });
+    created.users.push(ur.data.user.id);
+    // 今天一条数学「每日作业」+ 2 人已交 2 人未交（保证导出表里有内容）
+    const ens = await japi('/api/homework/daily/ensure', { method: 'POST', body: { classId: created.classId } });
+    const mathTask = ((ens.data && ens.data.tasks) || []).find((t) => t.subject === '数学');
+    created.taskId = mathTask && mathTask.id;
+    if (created.taskId) {
+      await japi('/api/homework/submissions/batch', {
+        method: 'POST',
+        body: { taskId: created.taskId, updates: created.students.map((id, i) => ({ studentId: id, isSubmitted: i < 2 })) },
+      });
+    }
+    check('0) 夹具就绪（1 班 4 人 + 班主任(数学) + 今天数学每日作业 2 交 2 未交）',
+      !!created.classId && created.students.filter(Boolean).length === 4 && !!created.taskId, created.taskId);
+
+    // ============================================================
+    // 一、入口按钮
+    // ============================================================
+    log('\n— 一) 入口按钮 —');
+    await asUser(HEAD);
+    await load('/homework', '#btnExportUnsub');
+    check('一) 作业统计页页头有「📊 导出未交统计」按钮',
+      !!Q('#btnExportUnsub') && /导出未交统计/.test(txt('#btnExportUnsub')), txt('#btnExportUnsub'));
+
+    // ============================================================
+    // 二、弹窗控件与默认值
+    // ============================================================
+    log('\n— 二) 弹窗 —');
+    Q('#btnExportUnsub').click();
+    await until(() => !hidden('#unsubModal') && Qa('#unsubSubject option').length > 0, 15000);
+    check('二) 弹出「📊 导出未交统计」弹窗', !hidden('#unsubModal') && /导出未交统计/.test(txt('#unsubModal h3')), txt('#unsubModal h3'));
+    const subjects = Qa('#unsubSubject option').map((o) => o.value);
+    check('二) 学科下拉含每日作业科目（数学等）', subjects.includes('数学') && subjects.length >= 6, subjects);
+    const classOpts = Qa('#unsubClass option').map((o) => o.value);
+    check('二) 班级下拉：班主任只有本班（默认=本班）',
+      classOpts.length === 1 && classOpts[0] === String(created.classId) && Q('#unsubClass').value === String(created.classId), classOpts);
+    check('二) 日期范围默认近 7 天（' + WEEK_AGO + ' ~ ' + TODAY + '）',
+      Q('#unsubFrom').value === WEEK_AGO && Q('#unsubTo').value === TODAY,
+      { from: Q('#unsubFrom').value, to: Q('#unsubTo').value });
+
+    // ============================================================
+    // 三、校验
+    // ============================================================
+    log('\n— 三) 参数校验 —');
+    const opened = [];
+    const realOpen = W().open;
+    W().open = (u, t) => { opened.push({ u, t }); return null; };
+    Q('#unsubFrom').value = '';
+    Q('#unsubOk').click();
+    await sleep(300);
+    check('三) 缺少日期 → 就地提示错误、不发起下载',
+      /请选择日期范围/.test(txt('#unsubMsg')) && opened.length === 0 && !hidden('#unsubModal'),
+      { msg: txt('#unsubMsg'), opened: opened.length });
+    Q('#unsubFrom').value = TODAY;
+    Q('#unsubTo').value = WEEK_AGO;
+    Q('#unsubOk').click();
+    await sleep(300);
+    check('三) 开始日期晚于结束日期 → 提示错误', /不能晚于/.test(txt('#unsubMsg')) && opened.length === 0, txt('#unsubMsg'));
+
+    // ============================================================
+    // 四、快捷范围 + 正常导出
+    // ============================================================
+    log('\n— 四) 导出 —');
+    Q('.unsub-box [data-days="30"]').click();
+    await sleep(200);
+    check('四) 点「近 30 天」→ 日期变为 ' + MONTH_AGO + ' ~ ' + TODAY,
+      Q('#unsubFrom').value === MONTH_AGO && Q('#unsubTo').value === TODAY,
+      { from: Q('#unsubFrom').value, to: Q('#unsubTo').value });
+    Q('#unsubSubject').value = '数学';
+    Q('#unsubFrom').value = dstr(-2);
+    Q('#unsubTo').value = TODAY;
+    Q('#unsubOk').click();
+    await sleep(400);
+    check('四) 点「导出 Excel」→ 打开导出接口，参数 = 班级/数学/所选起止',
+      opened.length === 1 && opened[0].t === '_blank' &&
+      /^\/api\/homework\/export-unsubmitted\?/.test(opened[0].u) &&
+      opened[0].u.includes('classId=' + created.classId) &&
+      opened[0].u.includes('subject=' + encodeURIComponent('数学')) &&
+      opened[0].u.includes('from=' + dstr(-2)) && opened[0].u.includes('to=' + TODAY),
+      opened);
+    check('四) 导出后弹窗关闭 + 提示已开始导出', hidden('#unsubModal') && /正在导出/.test(txt('#toast')), { hidden: hidden('#unsubModal'), toast: txt('#toast') });
+
+    // 服务端返回：xlsx + 文件名（班级-学科-未交统计-起至止.xlsx）
+    const res = await fetch('/api/homework/export-unsubmitted?classId=' + created.classId + '&subject=' + encodeURIComponent('数学') + '&from=' + dstr(-2) + '&to=' + TODAY, { credentials: 'same-origin' });
+    const ctype = res.headers.get('content-type') || '';
+    const cd = res.headers.get('content-disposition') || '';
+    const wantName = `${CLASS}-数学-未交统计-${dstr(-2)}至${TODAY}.xlsx`;
+    check('四) 接口返回 xlsx（真下载）', res.status === 200 && ctype.includes('spreadsheet'), { status: res.status, ctype });
+    check('四) 文件名 = 班级-学科-未交统计-起至止.xlsx',
+      decodeURIComponent(cd).includes(wantName), cd);
+    W().open = realOpen;
+
+    // ============================================================
+    // 五、管理员：班级下拉可选多个班
+    // ============================================================
+    log('\n— 五) 管理员视角 —');
+    await asUser('admin');
+    await load('/homework', '#btnExportUnsub');
+    Q('#btnExportUnsub').click();
+    await until(() => !hidden('#unsubModal') && Qa('#unsubClass option').length > 1, 15000);
+    check('五) 管理员：班级下拉包含多个班级可选', Qa('#unsubClass option').length > 1, Qa('#unsubClass option').length);
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  } finally {
+    log('\n— 清理 —');
+    try { await hardCleanup(); } catch (e) { log('  · 清理异常：' + e.message); }
+    const leftCls = ((await japi('/api/classes?includeArchived=1')).data.classes || []).filter((c) => /^未交UI班/.test(c.className));
+    const leftUsers = ((await japi('/api/users')).data.users || []).filter((u) => /^unsu_/.test(u.username));
+    check('清理：夹具班级/学生/账号已清除', leftCls.length === 0 && leftUsers.length === 0, { classes: leftCls.length, users: leftUsers.length });
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败' + (skipped ? ' / ' + skipped + ' 跳过' : ''));
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

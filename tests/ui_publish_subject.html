@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证脚本：作业发布弹窗「学科自动带出且只读、班级默认全选」
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) 复制到 public/：Copy-Item tests/ui_publish_subject.html public/_ui_publish_subject.html
+    2) 运行无头 Chrome 并读取 <title> / <pre id="out">：
+       & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiPub --virtual-time-budget=45000 --dump-dom `
+         "http://localhost:3000/_ui_publish_subject.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；验证结束后删除 public/_ui_publish_subject.html
+  说明：脚本创建临时年级/班级/教师，验证发布弹窗后自动清理（含发布出来的临时作业）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  iframe { width: 1100px; height: 640px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h3>作业发布：学科自动带出且只读 / 班级默认全选</h3>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 12000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin',
+  });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const visible = (s) => {
+  const d = F(); const e = d && d.querySelector(s);
+  if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1 && n !== d.body) {
+    if (fr.contentWindow.getComputedStyle(n).display === 'none') return false;
+    n = n.parentElement;
+  }
+  return true;
+};
+function setVal(sel, val) {
+  const d = F(); const e = d && d.querySelector(sel); if (!e) return false;
+  e.value = val;
+  e.dispatchEvent(new fr.contentWindow.Event('input', { bubbles: true }));
+  e.dispatchEvent(new fr.contentWindow.Event('change', { bubbles: true }));
+  return true;
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const stamp = Date.now().toString().slice(-6);
+const GRADE = 'PubUI年级' + stamp, C1 = 'PubUI甲班' + stamp, C2 = 'PubUI乙班' + stamp;
+const T_YES = 'pubui_yes_' + stamp, T_NO = 'pubui_no_' + stamp;
+const TITLE = 'PUBUI作业标题' + stamp;
+const created = { gradeId: null, classIds: [], userIds: [], taskIds: [] };
+const today = new Date();
+const DL_DATE = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
+
+async function openPublishAs(user) {
+  await japi('/api/auth/logout', { method: 'POST' });
+  await japi('/api/auth/login', { method: 'POST', body: { username: user, password: '123456' } });
+  fr.src = 'about:blank'; await sleep(120);
+  fr.src = '/homework-manage';
+  await until(() => fr.contentDocument && fr.contentDocument.readyState === 'complete' && Q('#btnPublish'), 15000);
+  await sleep(700);
+  Q('#btnPublish').click();
+  await until(() => visible('#pubModal'), 8000);
+  await sleep(1000);
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 管理员准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'PU' + stamp, academicYear: year } })).data.id;
+    const c1 = (await japi('/api/classes', { method: 'POST', body: { className: C1, gradeName: GRADE, academicYear: year } })).data.id;
+    const c2 = (await japi('/api/classes', { method: 'POST', body: { className: C2, gradeName: GRADE, academicYear: year } })).data.id;
+    created.classIds = [c1, c2];
+    let r = await japi('/api/users', { method: 'POST', body: { username: T_YES, password: '123456', role: 'teacher', realName: '发布UI甲', subject: '物理', teachingClasses: [{ classId: c1, roleInClass: 'subject_teacher' }, { classId: c2, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    r = await japi('/api/users', { method: 'POST', body: { username: T_NO, password: '123456', role: 'teacher', realName: '发布UI乙', teachingClasses: [{ classId: c1, roleInClass: 'subject_teacher' }] } });
+    created.userIds.push(r.data.user.id);
+    check('0) 夹具就绪（2 班级 + 2 教师：物理 / 未绑定学科）', !!(created.gradeId && c1 && c2));
+
+    // ---------- A) 已绑定学科（物理）的教师 ----------
+    await openPublishAs(T_YES);
+    check('A) 发布弹窗打开', visible('#pubModal'));
+    const sub = Q('#pubSubject');
+    check('A) 学科字段为只读（readonly 属性 + readOnly=true，且不是可选项下拉）',
+      !!sub && sub.tagName === 'INPUT' && sub.hasAttribute('readonly') && sub.readOnly === true &&
+      Qa('#pubModal select#pubSubject').length === 0, sub ? { tag: sub.tagName, ro: sub.readOnly } : null);
+    check('A) 学科自动带出绑定的「物理」', sub && sub.value === '物理', sub && sub.value);
+    check('A) 学科字段下方提示"已绑定：物理"',
+      txt('#pubSubjectHint').indexOf('已绑定：物理') >= 0, txt('#pubSubjectHint'));
+    const cbs = Qa('#pubClasses .pub-class-cb');
+    check('A) 班级默认全部勾选（2/2）', cbs.length === 2 && cbs.every((x) => x.checked), cbs.map((x) => x.checked));
+    check('A) 班级选项显示两个所带班级',
+      txt('#pubClasses').includes(C1) && txt('#pubClasses').includes(C2), txt('#pubClasses'));
+    check('A) 发布按钮可用（学科/班级已就绪）', Q('#pubSubmit').disabled === false);
+    check('A) 需教师填写的字段只有 标题 / 截止时间 / 备注（其余为只读学科与班级勾选）',
+      (() => {
+        // 注意：#pubSubjectSel（管理员模式下的学科下拉）对教师是隐藏的，统计"可编辑字段"时排除
+        const editable = Qa('#pubModal input:not([readonly]):not([type="checkbox"]), #pubModal select:not(.hidden), #pubModal textarea')
+          .map((e) => e.id).sort().join(',');
+        const cbs2 = Qa('#pubModal input[type="checkbox"]');
+        return editable === 'pubDeadlineDate,pubDeadlineTime,pubHomeworkTitle,pubRemark' &&
+          cbs2.length > 0 && cbs2.every((x) => x.closest('#pubClasses'));
+      })(),
+      { editable: Qa('#pubModal input:not([readonly])').map((e) => e.id || e.type) });
+
+    // 实际发布一次：只用填标题 + 截止时间
+    setVal('#pubHomeworkTitle', TITLE);
+    setVal('#pubDeadlineDate', DL_DATE);
+    setVal('#pubDeadlineTime', '23:59');
+    Q('#pubSubmit').click();
+    const published = await until(async () => {
+      const d = await japi('/api/homework/tasks?mine=1&date=' + DL_DATE);
+      const list = (d.data.tasks || []).filter((t) => t.title === TITLE);
+      return list.length === 2;
+    }, 12000);
+    check('A) 只填标题+截止时间即可发布 → 两个班级各生成 1 条作业', published);
+    const mine = ((await japi('/api/homework/tasks?mine=1&date=' + DL_DATE)).data.tasks || []).filter((t) => t.title === TITLE);
+    mine.forEach((t) => created.taskIds.push(t.id));
+    check('A) 服务端记录学科=物理（自动带出的学科生效）',
+      mine.length === 2 && mine.every((t) => t.subject === '物理'), mine.map((t) => t.subject));
+    check('A) 发布后列表可见该作业', await until(() => txt('#taskBody').includes(TITLE), 8000), txt('#taskBody').slice(0, 80));
+
+    // ---------- B) 未绑定学科的教师 ----------
+    await openPublishAs(T_NO);
+    check('B) 未绑定学科：发布弹窗仍打开', visible('#pubModal'));
+    check('B) 学科字段为空且只读', Q('#pubSubject').value === '' && Q('#pubSubject').readOnly === true, Q('#pubSubject').value);
+    check('B) 提示"请先到个人中心绑定所教学科"',
+      (txt('#pubSubjectHint') + ' ' + txt('#pubClasses')).indexOf('请先到个人中心绑定所教学科') >= 0,
+      { hint: txt('#pubSubjectHint'), box: txt('#pubClasses') });
+    check('B) 发布按钮被禁用', Q('#pubSubmit').disabled === true);
+    check('B) 提供"去个人中心绑定"链接', Qa('#pubClasses a[href="/profile"]').length === 1);
+
+    // ---------- 清理 ----------
+    await japi('/api/auth/logout', { method: 'POST' });
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    for (const id of created.taskIds) await japi('/api/homework/tasks/' + id, { method: 'DELETE' });
+    for (const id of created.userIds) await japi('/api/users/' + id, { method: 'DELETE' });
+    for (const id of created.classIds) await japi('/api/classes/' + id, { method: 'DELETE' });
+    if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+    const left = await japi('/api/homework/tasks?date=' + DL_DATE);
+    check('清理：临时作业已删除', !(left.data.tasks || []).some((t) => t.title === TITLE));
+    const leftUsers = await japi('/api/users');
+    check('清理：临时教师已删除',
+      !(leftUsers.data.users || []).some((u) => u.username === T_YES || u.username === T_NO));
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<!--
+  无头 Chrome UI 验证：导航"系统管理▾"的 4 个入口 → 4 个独立页面
+    /admin/account-management        账号管理
+    /admin/grade-management          年级管理
+    /admin/class-management          班级管理
+    /admin/academic-year-management  学年管理
+  验证点：① 每个入口都是独立页面（各自 URL，不再是同页 Tab 切换）
+         ② 每个页面有独立的「← 返回签到」页头（模板统一：返回左 / 标题居中）
+         ③ 页面数据真实加载（表格有数据行 / 学年版显示当前学年），且无加载失败提示
+         ④ 弹窗（增删改）在独立页内可用
+         ⑤ 点「← 返回签到」回到 /dashboard
+  用法（需先启动服务，默认 http://localhost:3000）：
+    1) Copy-Item tests/ui_admin_pages.html public/_ui_admin_pages.html
+    2) & "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+         --user-data-dir=$env:TEMP\uiAdmin --virtual-time-budget=300000 --dump-dom `
+         "http://localhost:3000/_ui_admin_pages.html"
+    3) 结果：title = "PASS n/n" 或 "FAIL x/n"；用后删除 public/_ui_admin_pages.html
+  夹具：临时年级 + 1 班 + 1 学生（管理员会话）；测完清理（自愈式）。
+-->
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>RUNNING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; padding: 16px; }
+  #out { white-space: pre-wrap; }
+  #frHost { position: absolute; left: -13000px; top: 0; }
+  iframe { border: 0; display: block; }
+</style>
+</head>
+<body>
+<h3>系统管理 4 个独立页面（账号/年级/班级/学年管理）</h3>
+<pre id="out">running…</pre>
+<div id="frHost"><iframe id="fr"></iframe></div>
+<script>
+const out = document.getElementById('out');
+const fr = document.getElementById('fr');
+const log = (s) => { out.textContent += '\n' + s; };
+let pass = 0, fail = 0, skipped = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; log('  ✔ ' + name); }
+  else { fail++; log('  ✘ ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function skip(name, why) { skipped++; log('  · 跳过 ' + name + '（' + why + '）'); }
+async function until(fn, ms = 15000) {
+  const t0 = Date.now();
+  for (;;) { try { if (await fn()) return true; } catch (_) {} if (Date.now() - t0 > ms) return false; await sleep(120); }
+}
+async function japi(path, { method = 'GET', body } = {}) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { status: res.status, data };
+}
+const F = () => fr.contentDocument;
+const W = () => fr.contentWindow;
+const Q = (s) => { const d = F(); return d ? d.querySelector(s) : null; };
+const Qa = (s) => { const d = F(); return d ? [...d.querySelectorAll(s)] : []; };
+const cs = (s, prop) => { const e = Q(s); return e ? W().getComputedStyle(e).getPropertyValue(prop).trim() : null; };
+const txt = (s) => { const e = Q(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+const rect = (s) => { const e = Q(s); return e ? e.getBoundingClientRect() : null; };
+const hidden = (s) => { const e = Q(s); return !e || e.classList.contains('hidden'); };
+const visible = (s) => {
+  const e = Q(s); if (!e) return false;
+  let n = e;
+  while (n && n.nodeType === 1) {
+    const st = W().getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+async function loadPage(url, waitSel = '#btnBack') {
+  fr.src = 'about:blank'; await sleep(150);
+  fr.src = url;
+  await until(() => F() && F().readyState === 'complete' && F().body && Q(waitSel), 20000);
+  await sleep(900);
+}
+const themeColor = () => {
+  const hex = W().getComputedStyle(F().documentElement).getPropertyValue('--primary').trim() || '#4A90D9';
+  const m = hex.replace('#', '');
+  const n = parseInt(m.length === 3 ? m.split('').map((c) => c + c).join('') : m, 16);
+  return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`;
+};
+
+const stamp = Date.now().toString().slice(-6);
+const GRADE = '后台页年级' + stamp, CLASS = '后台页班' + stamp;
+const created = { gradeId: null, classId: null, studentId: null };
+
+async function hardCleanup() {
+  await japi('/api/auth/logout', { method: 'POST' });
+  const lg = await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+  if (lg.status !== 200) return;
+  if (created.studentId) await japi('/api/students/' + created.studentId, { method: 'DELETE' });
+  if (created.classId) await japi('/api/classes/' + created.classId, { method: 'DELETE' });
+  if (created.gradeId) await japi('/api/grades/' + created.gradeId, { method: 'DELETE' });
+  for (const c of ((await japi('/api/classes')).data.classes || []).filter((x) => /^后台页班/.test(x.className))) {
+    for (const s of ((await japi('/api/students?classId=' + c.id)).data.students || [])) await japi('/api/students/' + s.id, { method: 'DELETE' });
+    await japi('/api/classes/' + c.id, { method: 'DELETE' });
+  }
+  for (const g of ((await japi('/api/grades')).data.grades || []).filter((x) => /^后台页年级/.test(x.grade_name || x.gradeName))) {
+    await japi('/api/grades/' + g.id, { method: 'DELETE' });
+  }
+}
+
+(async () => {
+  try {
+    out.textContent = '0) 准备夹具…';
+    await japi('/api/auth/login', { method: 'POST', body: { username: 'admin', password: '123456' } });
+    const year = (await japi('/api/settings')).data.currentAcademicYear;
+    created.gradeId = (await japi('/api/grades', { method: 'POST', body: { gradeName: GRADE, gradeCode: 'ADM', academicYear: year } })).data.id;
+    created.classId = (await japi('/api/classes', { method: 'POST', body: { className: CLASS, gradeName: GRADE, academicYear: year } })).data.id;
+    const st = await japi('/api/students', { method: 'POST', body: { studentNo: 'ADM' + stamp, name: '后台页同学', classId: created.classId, status: '在读' } });
+    created.studentId = (st.data && (st.data.id || (st.data.student && st.data.student.id))) || null;
+    check('0) 夹具就绪（1 年级 + 1 班 + 1 学生）', !!created.gradeId && !!created.classId && !!created.studentId, { created, studentStatus: st.status, studentResp: st.data });
+
+    fr.style.width = '1500px'; fr.style.height = '900px';
+
+    const cases = [
+      { url: '/admin/account-management', title: '账号管理', panel: '#tabUsers',
+        loaded: () => Qa('#userList tr').length > 0, rows: () => Qa('#userList tr').length,
+        addBtn: '#btnAddUser', modal: '#userModal', cancel: '#uCancel', marker: null },
+      { url: '/admin/grade-management', title: '年级管理', panel: '#tabGrades',
+        loaded: () => txt('#gradeList').includes(GRADE), rows: () => Qa('#gradeList tr').length,
+        addBtn: '#btnAddGrade', modal: '#gradeModal', cancel: '#gCancel', marker: GRADE },
+      { url: '/admin/class-management', title: '班级管理', panel: '#tabClasses',
+        loaded: () => txt('#classList').includes(CLASS), rows: () => Qa('#classList tr').length,
+        addBtn: '#btnAddClass', modal: '#classModal', cancel: '#cCancel', marker: CLASS },
+      { url: '/admin/academic-year-management', title: '学年管理', panel: '#tabYears',
+        loaded: () => txt('#currentYearVal').includes(year), rows: () => (txt('#currentYearVal') ? 1 : 0),
+        addBtn: null, modal: null, cancel: null, marker: year },
+    ];
+
+    for (const c of cases) {
+      log('\n— ' + c.url + ' —');
+      await loadPage(c.url);
+      check(`① ${c.url} 是独立页面（URL 保持本页地址）`, W().location.pathname === c.url, W().location.pathname);
+      check(`① ${c.url} 页内没有 Tab 切换（无 .admin-tabs / .admin-tab 元素）`,
+        !Q('.admin-tabs') && !Q('.admin-tab') && Qa('.admin-tab-panel').length === 1,
+        { tabs: Qa('.admin-tab').length, panels: Qa('.admin-tab-panel').map((p) => p.id) });
+      check(`① ${c.url} 只呈现本页面板 ${c.panel}（默认可见）`, !hidden(c.panel) && visible(c.panel));
+      check(`② ${c.url} 有独立「← 返回签到」按钮（含 ← 箭头）`,
+        !!Q('#btnBack') && /返回签到/.test(txt('#btnBack')) && !!Q('#btnBack .back-arrow'), txt('#btnBack'));
+      check(`② ${c.url} 返回按钮在左上、标题「${c.title}」居中`,
+        (() => { const b = rect('#btnBack'); const t = rect('.page-title'); const h = rect('.page-head');
+          return !!b && !!t && !!h && b.left < t.left && Math.abs((t.left + t.right) / 2 - (h.left + h.right) / 2) <= 2; })(),
+        { back: rect('#btnBack') && Math.round(rect('#btnBack').left), titleMid: rect('.page-title') && Math.round((rect('.page-title').left + rect('.page-title').right) / 2), headMid: rect('.page-head') && Math.round((rect('.page-head').left + rect('.page-head').right) / 2) });
+      check(`② ${c.url} 标题文字为「${c.title}」`, txt('.page-title').includes(c.title), txt('.page-title'));
+      const ok = await until(c.loaded, 15000);
+      check(`③ ${c.url} 数据真实加载（行数/值非空）`, ok, { rows: c.rows() });
+      check(`③ ${c.url} 未出现「加载失败」提示`, !/加载失败/.test(txt('#toast')), txt('#toast'));
+      check(`③ ${c.url} 顶栏用户名为当前登录账号（初始化跑完）`, !/^--$/.test(txt('#userInfo')) && txt('#userInfo').length > 0, txt('#userInfo'));
+      if (c.addBtn) {
+        Q(c.addBtn).click();
+        await sleep(300);
+        check(`④ ${c.url} 点「新增」按钮 → 弹窗 ${c.modal} 打开`, !hidden(c.modal) && visible(c.modal));
+        Q(c.cancel).click();
+        await sleep(300);
+        check(`④ ${c.url} 点「取消」→ 弹窗关闭`, hidden(c.modal));
+      } else {
+        skip(`④ ${c.url} 弹窗开关`, '学年管理无新增弹窗（走向导按钮）');
+      }
+      Q('#btnBack').click();
+      const back = await until(() => W().location.pathname === '/dashboard', 12000);
+      check(`⑤ ${c.url} 点「← 返回签到」→ 回到 /dashboard`, back, W().location.pathname);
+    }
+
+    log('\n— 导航入口 → 独立页面（管理员） —');
+    await loadPage('/dashboard', '#navbarMenus');
+    W().__nav.openGroup('navGroupSystem');
+    await sleep(200);
+    const items = Qa('#navSystemMenu .nav-dropdown-item').filter((i) => !i.classList.contains('hidden')).map((i) => i.id);
+    check('① 系统管理下拉 = 账号/年级/班级/学年/小组 5 项',
+      JSON.stringify(items) === JSON.stringify(['btnAdminUsers', 'btnAdminGrades', 'btnAdminClasses', 'btnAdminYears', 'btnAdminGroups']), items);
+    const paths = Qa('#navSystemMenu .nav-dropdown-item').map((i) => i.dataset.path);
+    check('① 5 项各自指向独立页面路径',
+      JSON.stringify(paths) === JSON.stringify(['/admin/account-management', '/admin/grade-management', '/admin/class-management', '/admin/academic-year-management', '/admin/group-management']), paths);
+    // 逐个点击：URL 必须变成对应独立页面，且页面出现自己的「返回签到」
+    for (const [id, url, title] of [['btnAdminUsers', '/admin/account-management', '账号管理'],
+      ['btnAdminGrades', '/admin/grade-management', '年级管理'],
+      ['btnAdminClasses', '/admin/class-management', '班级管理'],
+      ['btnAdminYears', '/admin/academic-year-management', '学年管理'],
+      ['btnAdminGroups', '/admin/group-management', '小组管理']]) {
+      await loadPage('/dashboard', '#navbarMenus');
+      W().__nav.openGroup('navGroupSystem');
+      await sleep(200);
+      Q('#' + id).click();
+      const jumped = await until(() => W().location.pathname === url, 12000);
+      await until(() => Q('#btnBack') && Q('.page-title'), 12000);
+      check(`① 点「${title}」→ 跳转到独立页面 ${url}`,
+        jumped && /返回签到/.test(txt('#btnBack')) && txt('.page-title').includes(title),
+        { path: W().location.pathname, back: txt('#btnBack'), title: txt('.page-title') });
+    }
+
+    // ---------- 清理 ----------
+    await hardCleanup();
+    const leftGrades = ((await japi('/api/grades')).data.grades || []).filter((g) => /^后台页年级/.test(g.grade_name || g.gradeName));
+    const leftClasses = ((await japi('/api/classes')).data.classes || []).filter((c) => /^后台页班/.test(c.className));
+    check('清理：临时年级/班级已删除', leftGrades.length === 0 && leftClasses.length === 0,
+      { g: leftGrades.length, c: leftClasses.length });
+  } catch (e) {
+    fail++;
+    log('  ✘ 异常：' + (e && e.message));
+    try { await hardCleanup(); log('  · 已执行自愈式清理'); } catch (_) {}
+  }
+  log('\n结果：' + pass + ' 通过 / ' + fail + ' 失败 / ' + skipped + ' 跳过');
+  document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + pass + '/' + (pass + fail);
+})();
+</script>
+</body>
+</html>
